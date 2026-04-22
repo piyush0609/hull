@@ -24,6 +24,19 @@ The installer detects your OS/arch, downloads the latest binary from [GitHub Rel
 
 > **Note:** `hull deploy` calls Wrangler, which requires Node.js. The hull binary itself has no runtime dependencies.
 
+## Before You Start
+
+If you already have a Cloudflare account with a workers.dev subdomain, skip to [Quick Start](#quick-start).
+
+**New to Cloudflare? Do this first (in a browser tab):**
+
+1. **Sign up** at https://dash.cloudflare.com/sign-up
+2. **Verify your email** (check inbox for confirmation)
+3. **Complete onboarding** — accept terms of service in the dashboard
+4. **Register a workers.dev subdomain** at https://dash.cloudflare.com/workers/onboarding
+
+> ⚠️ `hull setup` will fail if you haven't completed Cloudflare onboarding. The OAuth flow requires an active, verified account.
+
 ## Quick Start
 
 ### 1. Set up prerequisites
