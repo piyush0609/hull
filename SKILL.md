@@ -51,10 +51,6 @@ Don't use when:
 curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
 ```
 
-Or via npm fallback:
-```bash
-npm install -g toss-cli
-```
 
 ## Quick Start
 
