@@ -120,18 +120,49 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
 export async function deployCommand() {
   console.log('Setting up your hull on Cloudflare...\n');
 
+  // Check wrangler — offer to install if missing
+  let wranglerVersion = '';
   try {
-    await execAsync('wrangler --version');
+    const { stdout } = await execAsync('wrangler --version');
+    wranglerVersion = stdout.trim();
   } catch {
-    console.error('Error: wrangler is not installed. Run: npm install -g wrangler');
-    process.exit(1);
+    const answer = await prompt('Wrangler not found. Install now? (y/n): ');
+    if (answer.toLowerCase() !== 'y') {
+      console.error('Please install Wrangler: npm install -g wrangler');
+      process.exit(1);
+    }
+    console.log('Installing wrangler...');
+    try {
+      await execAsync('npm install -g wrangler');
+      const { stdout } = await execAsync('wrangler --version');
+      wranglerVersion = stdout.trim();
+      console.log(`✓ Wrangler ${wranglerVersion} installed`);
+    } catch (err: any) {
+      console.error('Failed to install wrangler:', err.stderr || err.message);
+      process.exit(1);
+    }
   }
 
+  // Check auth — run login if needed
+  let authOk = false;
   try {
     await execAsync('wrangler whoami');
+    authOk = true;
   } catch {
-    console.error('Error: Not authenticated with Cloudflare. Run: wrangler login');
-    process.exit(1);
+    console.log('Not authenticated with Cloudflare.');
+    const answer = await prompt('Run wrangler login now? (y/n): ');
+    if (answer.toLowerCase() !== 'y') {
+      console.error('Please run: wrangler login');
+      process.exit(1);
+    }
+    console.log('Opening browser for Cloudflare login...');
+    try {
+      await execAsync('wrangler login');
+      authOk = true;
+    } catch (err: any) {
+      console.error('Login failed:', err.stderr || err.message);
+      process.exit(1);
+    }
   }
 
   const subdomain = process.env.HULL_SUBDOMAIN || await prompt('Choose a subdomain (e.g., yourname): ');
@@ -193,8 +224,13 @@ database_id = "${databaseId}"
   } catch {}
 
   if (!workersDevSubdomain) {
-    console.error('Could not determine workers.dev subdomain. Is it registered?');
-    console.error('Visit: https://dash.cloudflare.com/workers/onboarding');
+    console.error('\n❌ No workers.dev subdomain found.');
+    console.error('You need to register one before deploying.');
+    console.error('');
+    console.error('Two options:');
+    console.error('  1. Visit https://dash.cloudflare.com/workers/onboarding');
+    console.error('  2. Or run: wrangler subdomain <name>');
+    console.error('');
     process.exit(1);
   }
 
