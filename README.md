@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/piyush0609/hull/main/install.sh | s
 
 The installer detects your OS/arch, downloads the latest binary from [GitHub Releases](https://github.com/piyush0609/hull/releases), and installs it to `/usr/local/bin` (or `~/.local/bin` with PATH auto-configured).
 
-**Fallback:** If the binary download fails, it falls back to `npm install -g hull-cli`.
+**Note:** `npm install -g hull-cli` is not yet available. Use the install script or build from source.
 
 **Requirements for deploy:**
 - Node.js 18+ (for Wrangler CLI)
