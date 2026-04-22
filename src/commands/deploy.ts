@@ -156,8 +156,9 @@ export async function deployCommand() {
       process.exit(1);
     }
     console.log('Opening browser for Cloudflare login...');
+    console.log('(Scopes: account:read, workers_scripts:write, workers_kv:write, d1:write, zone:read)');
     try {
-      await execAsync('wrangler login');
+      await execAsync('wrangler login --scopes account:read workers_scripts:write workers_kv:write d1:write zone:read');
       authOk = true;
     } catch (err: any) {
       console.error('Login failed:', err.stderr || err.message);
