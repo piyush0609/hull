@@ -97,6 +97,17 @@ toss info          # Show endpoint, subdomain, artifact count
 toss destroy       # Tear down everything
 ```
 
+### 6. Install AI assistant skill (optional)
+
+```bash
+toss skill install --all        # Auto-detect and install to all editors
+toss skill install claude-code  # Or install for a specific tool
+toss skill list                 # Check what's installed
+toss skill update               # Update to latest
+```
+
+Supported: `claude-code`, `cursor`, `codex`, `kimi`, `opencode`, `cline`, `gemini`, `agents`. The `agents` path is cross-compatible — Kimi, Gemini CLI, and Codex all read it.
+
 ## How It Works
 
 | Component | Purpose |
@@ -134,6 +145,7 @@ Static assets get `Cache-Control: public, max-age=86400, immutable`.
 | `toss info` | Show endpoint, subdomain, KV ID, artifact count |
 | `toss destroy` | Delete worker, D1, KV, and local config |
 | `toss doctor` | Check prerequisites (read-only diagnostic) |
+| `toss skill install [tool]` | Install AI assistant skill for editor integration |
 
 ## Configuration
 

@@ -10,7 +10,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && rm -rf dist/templates && cp -r src/templates dist/templates",
+    "build": "tsc && rm -rf dist/templates && cp -r src/templates dist/templates && cp SKILL.md dist/SKILL.md",
     "build:bin": "./build.sh",
     "dev": "tsx src/index.ts",
     "test": "vitest run",

@@ -8,6 +8,7 @@ import { destroyCommand } from './commands/destroy.js';
 import { doctorCommand } from './commands/doctor.js';
 import { infoCommand } from './commands/info.js';
 import { setupCommand } from './commands/setup.js';
+import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
 
 const program = new Command();
 
@@ -58,5 +59,32 @@ program
   .command('info')
   .description('Show toss configuration and artifact count')
   .action(infoCommand);
+
+const skill = program
+  .command('skill')
+  .description('Install toss skills for AI assistants');
+
+skill
+  .command('install [tool]')
+  .description('Install skill for an AI tool (or --all for all detected)')
+  .option('-a, --all', 'Install to all detected tools')
+  .option('-l, --level <level>', 'Install level: user (default) or project', 'user')
+  .action(skillInstallCommand);
+
+skill
+  .command('uninstall <tool>')
+  .description('Remove toss skill from an AI tool')
+  .option('-l, --level <level>', 'Uninstall level: user (default) or project', 'user')
+  .action(skillUninstallCommand);
+
+skill
+  .command('list')
+  .description('Show skill installation status across tools')
+  .action(skillListCommand);
+
+skill
+  .command('update [tool]')
+  .description('Update outdated skills (or all if no tool specified)')
+  .action(skillUpdateCommand);
 
 program.parse();
