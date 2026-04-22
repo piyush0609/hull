@@ -12,13 +12,13 @@ import { setupCommand } from './commands/setup.js';
 const program = new Command();
 
 program
-  .name('hull')
+  .name('toss')
   .description('Share HTML artifacts with access-controlled links')
   .version('0.1.0');
 
 program
   .command('deploy')
-  .description('Deploy your hull infrastructure to Cloudflare')
+  .description('Deploy your toss infrastructure to Cloudflare')
   .action(deployCommand);
 
 program
@@ -41,7 +41,7 @@ program
 
 program
   .command('destroy')
-  .description('Destroy your hull infrastructure')
+  .description('Destroy your toss infrastructure')
   .action(destroyCommand);
 
 program
@@ -51,12 +51,12 @@ program
 
 program
   .command('doctor')
-  .description('Check prerequisites for hull')
+  .description('Check prerequisites for toss')
   .action(doctorCommand);
 
 program
   .command('info')
-  .description('Show hull configuration and artifact count')
+  .description('Show toss configuration and artifact count')
   .action(infoCommand);
 
 program.parse();

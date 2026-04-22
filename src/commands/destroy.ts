@@ -9,14 +9,14 @@ const execAsync = promisify(exec);
 export async function destroyCommand() {
   const config = await loadConfig();
   if (!config) {
-    console.error('Error: No hull found. Nothing to destroy.');
+    console.error('Error: No toss found. Nothing to destroy.');
     process.exit(1);
   }
 
-  console.log(`Destroying hull (${config.subdomain})...\n`);
+  console.log(`Destroying toss (${config.subdomain})...\n`);
 
-  const workerDir = join(process.env.HOME || '.', '.hull', 'worker');
-  const dbName = `hull-db-${config.subdomain}`;
+  const workerDir = join(process.env.HOME || '.', '.toss', 'worker');
+  const dbName = `toss-db-${config.subdomain}`;
 
   // Delete worker
   try {
@@ -45,8 +45,8 @@ export async function destroyCommand() {
   }
 
   // Remove local config
-  const configFile = join(process.env.HOME || '.', '.hull', 'config.json');
+  const configFile = join(process.env.HOME || '.', '.toss', 'config.json');
   await rm(configFile, { force: true });
 
-  console.log('\nHull destroyed.');
+  console.log('\nToss destroyed.');
 }

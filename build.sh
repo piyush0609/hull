@@ -8,7 +8,7 @@ VERSION=${1:-$(node -p "require('./package.json').version")}
 OUTDIR="./dist-bin"
 mkdir -p "$OUTDIR"
 
-echo "Building hull v$VERSION..."
+echo "Building toss v$VERSION..."
 
 build() {
   local target=$1
@@ -17,11 +17,11 @@ build() {
   bun build --compile src/index.ts --target=$target --outfile "$OUTDIR/$outfile" 2>&1 | tail -1
 }
 
-build bun-darwin-arm64 "hull-$VERSION-darwin-arm64"
-build bun-darwin-x64   "hull-$VERSION-darwin-x64"
-build bun-linux-x64    "hull-$VERSION-linux-x64"
-build bun-linux-arm64  "hull-$VERSION-linux-arm64"
-build bun-windows-x64  "hull-$VERSION-windows-x64.exe"
+build bun-darwin-arm64 "toss-$VERSION-darwin-arm64"
+build bun-darwin-x64   "toss-$VERSION-darwin-x64"
+build bun-linux-x64    "toss-$VERSION-linux-x64"
+build bun-linux-arm64  "toss-$VERSION-linux-arm64"
+build bun-windows-x64  "toss-$VERSION-windows-x64.exe"
 
 echo ""
 echo "Done. Binaries in $OUTDIR:"

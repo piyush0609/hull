@@ -118,13 +118,13 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
 }
 
 export async function deployCommand() {
-  console.log('Setting up your hull on Cloudflare...\n');
+  console.log('Setting up your toss on Cloudflare...\n');
 
   // Quick prereq check — direct to setup if anything is missing
   try {
     await execAsync('wrangler --version');
   } catch {
-    console.error('❌ Wrangler not found. Run: hull setup');
+    console.error('❌ Wrangler not found. Run: toss setup');
     process.exit(1);
   }
 
@@ -133,26 +133,26 @@ export async function deployCommand() {
   try {
     const { stdout } = await execAsync('wrangler whoami');
     if (stdout.includes('not authenticated')) {
-      console.error('❌ Not authenticated with Cloudflare. Run: hull setup');
+      console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
       process.exit(1);
     }
     const match = stdout.match(/([a-f0-9]{32})/);
     if (match) accountId = match[1];
   } catch {
-    console.error('❌ Not authenticated with Cloudflare. Run: hull setup');
+    console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
     process.exit(1);
   }
 
-  const subdomain = process.env.HULL_SUBDOMAIN || await prompt('Choose a subdomain (e.g., yourname): ');
+  const subdomain = process.env.TOSS_SUBDOMAIN || await prompt('Choose a subdomain (e.g., yourname): ');
   if (!subdomain || !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
 
-  const workerName = `hull-${subdomain}`;
-  const dbName = `hull-db-${subdomain}`;
-  const kvTitle = `hull-kv-${subdomain}`;
-  const workerDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.hull', 'worker');
+  const workerName = `toss-${subdomain}`;
+  const dbName = `toss-db-${subdomain}`;
+  const kvTitle = `toss-kv-${subdomain}`;
+  const workerDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'worker');
   const ownerToken = generateToken();
   const jwtSecret = generateToken();
 
@@ -182,11 +182,11 @@ main = "src/index.ts"
 compatibility_date = "2024-05-01"
 ${accountId ? `account_id = "${accountId}"\n` : ''}
 [[kv_namespaces]]
-binding = "HULL_KV"
+binding = "TOSS_KV"
 id = "${kvId}"
 
 [[d1_databases]]
-binding = "HULL_DB"
+binding = "TOSS_DB"
 database_name = "${dbName}"
 database_id = "${databaseId}"
 `
@@ -243,8 +243,8 @@ database_id = "${databaseId}"
 
   await saveConfig({ endpoint: workerUrl, ownerToken, subdomain, kvId });
 
-  console.log('\n✅ Your hull is ready.');
+  console.log('\n✅ Your toss is ready.');
   console.log(`   Endpoint: ${workerUrl}`);
-  console.log(`   Upload:   hull share ./file.html --expires 24h`);
-  console.log(`   Manage:   hull list`);
+  console.log(`   Upload:   toss share ./file.html --expires 24h`);
+  console.log(`   Manage:   toss list`);
 }

@@ -19,27 +19,27 @@ describe('CLI Commands', () => {
     vi.restoreAllMocks();
   });
 
-  it('share should exit when no hull is deployed', async () => {
+  it('share should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(shareCommand('test.html', { expires: '24h' })).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No hull found. Run "hull deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
   });
 
-  it('list should exit when no hull is deployed', async () => {
+  it('list should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(listCommand()).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No hull found. Run "hull deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
   });
 
-  it('revoke should exit when no hull is deployed', async () => {
+  it('revoke should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(revokeCommand('abc123')).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No hull found. Run "hull deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
   });
 
-  it('destroy should exit when no hull is deployed', async () => {
+  it('destroy should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(destroyCommand()).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No hull found. Nothing to destroy.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Nothing to destroy.');
   });
 });

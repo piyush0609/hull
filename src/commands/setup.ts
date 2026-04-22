@@ -57,7 +57,7 @@ function getEmailFromWhoami(stdout: string): string | null {
 }
 
 export async function setupCommand() {
-  console.log('Hull Setup\n==========\n');
+  console.log('Toss Setup\n==========\n');
 
   // Check Node.js
   const nodeVersion = process.version;
@@ -236,5 +236,5 @@ export async function setupCommand() {
   }
 
   console.log('\n✅ Setup complete. You can now run:');
-  console.log('   hull deploy');
+  console.log('   toss deploy');
 }

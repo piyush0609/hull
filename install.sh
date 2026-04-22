@@ -1,5 +1,5 @@
 #!/bin/sh
-# hull installer — prefers source install (88KB) when Node.js is available.
+# toss installer — prefers source install (88KB) when Node.js is available.
 # Falls back to 57MB standalone binary only if Node.js is missing.
 # Usage: curl -fsSL https://raw.githubusercontent.com/piyush0609/hull/main/install.sh | sh
 
@@ -29,7 +29,7 @@ esac
 EXT=""
 [ "$OS" = "windows" ] && EXT=".exe"
 
-echo "Installing hull..."
+echo "Installing toss..."
 
 # Prefer source install when Node.js is available — much smaller than binary
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
@@ -37,7 +37,7 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   if [ "$NODE_MAJOR" -ge 18 ]; then
     echo "Node.js $(node -v) found. Installing from source (fast, ~100KB)..."
 
-    SRC_DIR="${HOME}/.hull/src"
+    SRC_DIR="${HOME}/.toss/src"
     rm -rf "$SRC_DIR"
     mkdir -p "$SRC_DIR"
 
@@ -64,11 +64,11 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     BIN_DIR="${HOME}/.local/bin"
     mkdir -p "$BIN_DIR"
 
-    cat > "$BIN_DIR/hull" << 'EOF'
+    cat > "$BIN_DIR/toss" << 'EOF'
 #!/bin/sh
-exec node "${HOME}/.hull/src/dist/index.js" "$@"
+exec node "${HOME}/.toss/src/dist/index.js" "$@"
 EOF
-    chmod +x "$BIN_DIR/hull"
+    chmod +x "$BIN_DIR/toss"
 
     # Add to PATH if needed
     SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
@@ -81,16 +81,16 @@ EOF
 
     if [ -f "$PROFILE" ] && ! grep -q "$BIN_DIR" "$PROFILE" 2>/dev/null; then
       echo "" >> "$PROFILE"
-      echo "# Added by hull installer" >> "$PROFILE"
+      echo "# Added by toss installer" >> "$PROFILE"
       echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$PROFILE"
       echo "✅ Added $BIN_DIR to PATH in $PROFILE"
       echo "   Restart your terminal or run: source $PROFILE"
     fi
 
     echo ""
-    echo "✅ hull installed from source (~100KB download)"
-    echo "   hull doctor    # Check prerequisites"
-    echo "   hull deploy    # Deploy your hull"
+    echo "✅ toss installed from source (~100KB download)"
+    echo "   toss doctor    # Check prerequisites"
+    echo "   toss deploy    # Deploy your toss"
     exit 0
   fi
 fi
@@ -111,20 +111,20 @@ LATEST_URL="https://api.github.com/repos/$REPO/releases/latest"
 VERSION=$($FETCH "$LATEST_URL" 2>/dev/null | grep '"tag_name":' | head -1 | sed -E 's/.*"v?([^"]+)".*/\1/')
 
 if [ -n "$VERSION" ]; then
-  BINARY="hull-${VERSION}-${OS}-${ARCH}${EXT}"
+  BINARY="toss-${VERSION}-${OS}-${ARCH}${EXT}"
   DOWNLOAD_URL="https://github.com/$REPO/releases/download/v$VERSION/$BINARY"
 
-  echo "Downloading hull v$VERSION..."
-  if $FETCH "$DOWNLOAD_URL" > "/tmp/hull${EXT}" 2>/dev/null; then
-    chmod +x "/tmp/hull${EXT}"
+  echo "Downloading toss v$VERSION..."
+  if $FETCH "$DOWNLOAD_URL" > "/tmp/toss${EXT}" 2>/dev/null; then
+    chmod +x "/tmp/toss${EXT}"
 
-    if mv "/tmp/hull${EXT}" "$INSTALL_DIR/hull" 2>/dev/null; then
-      echo "✅ hull installed to $INSTALL_DIR/hull"
+    if mv "/tmp/toss${EXT}" "$INSTALL_DIR/toss" 2>/dev/null; then
+      echo "✅ toss installed to $INSTALL_DIR/toss"
     else
       USER_BIN="$HOME/.local/bin"
       mkdir -p "$USER_BIN"
-      mv "/tmp/hull${EXT}" "$USER_BIN/hull"
-      echo "✅ hull installed to $USER_BIN/hull"
+      mv "/tmp/toss${EXT}" "$USER_BIN/toss"
+      echo "✅ toss installed to $USER_BIN/toss"
 
       SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
       case "$SHELL_NAME" in
@@ -136,7 +136,7 @@ if [ -n "$VERSION" ]; then
 
       if [ -f "$PROFILE" ] && ! grep -q "$USER_BIN" "$PROFILE" 2>/dev/null; then
         echo "" >> "$PROFILE"
-        echo "# Added by hull installer" >> "$PROFILE"
+        echo "# Added by toss installer" >> "$PROFILE"
         echo "export PATH=\"$USER_BIN:\$PATH\"" >> "$PROFILE"
         echo "✅ Added $USER_BIN to PATH in $PROFILE"
         echo "   Restart your terminal or run: source $PROFILE"
@@ -145,8 +145,8 @@ if [ -n "$VERSION" ]; then
 
     echo ""
     echo "Next steps:"
-    echo "  hull doctor    # Check prerequisites"
-    echo "  hull deploy    # Deploy your hull"
+    echo "  toss doctor    # Check prerequisites"
+    echo "  toss deploy    # Deploy your toss"
     exit 0
   fi
 fi

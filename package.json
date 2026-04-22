@@ -1,10 +1,10 @@
 {
-  "name": "hull-cli",
+  "name": "toss-cli",
   "version": "0.1.0",
   "description": "Share HTML artifacts with access-controlled links",
   "type": "module",
   "bin": {
-    "hull": "./dist/index.js"
+    "toss": "./dist/index.js"
   },
   "files": [
     "dist"

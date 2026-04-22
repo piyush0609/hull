@@ -14,7 +14,7 @@ function check(label: string, pass: boolean, fix?: string) {
 export async function doctorCommand() {
   let ok = true;
 
-  console.log('Checking hull prerequisites...\n');
+  console.log('Checking toss prerequisites...\n');
 
   // Node version
   const nodeVersion = process.version;
@@ -91,15 +91,15 @@ export async function doctorCommand() {
   // Config
   const config = await loadConfig();
   if (config) {
-    console.log(`✅ Hull config found (${config.subdomain})`);
+    console.log(`✅ Toss config found (${config.subdomain})`);
   } else {
-    console.log(`ℹ️  No hull config found — run 'hull deploy' when ready`);
+    console.log(`ℹ️  No toss config found — run 'toss deploy' when ready`);
   }
 
   console.log();
   if (ok) {
     console.log('All checks passed. Ready to deploy!');
-    console.log('   hull deploy');
+    console.log('   toss deploy');
   } else {
     console.log('Some checks failed. Fix the issues above, then try again.');
     process.exit(1);

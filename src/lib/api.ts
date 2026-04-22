@@ -1,15 +1,15 @@
-import type { HullConfig } from './config.js';
+import type { TossConfig } from './config.js';
 
 async function safeFetch(url: string, init: RequestInit): Promise<Response> {
   try {
     return await fetch(url, init);
   } catch {
-    throw new Error(`Could not reach ${url}. Is your hull deployed and reachable?`);
+    throw new Error(`Could not reach ${url}. Is your toss deployed and reachable?`);
   }
 }
 
-export class HullAPI {
-  constructor(private config: HullConfig) {}
+export class TossAPI {
+  constructor(private config: TossConfig) {}
 
   async upload(html: Buffer, name: string, expiresSeconds: number): Promise<{ id: string; url: string }> {
     const url = new URL('/artifacts', this.config.endpoint);

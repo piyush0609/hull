@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { loadConfig, saveConfig, type HullConfig } from '../../src/lib/config.js';
+import { loadConfig, saveConfig, type TossConfig } from '../../src/lib/config.js';
 
 let tempDir: string;
 
@@ -11,7 +11,7 @@ const originalHomedir = process.env.HOME;
 
 describe('Config', () => {
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'hull-test-'));
+    tempDir = await mkdtemp(join(tmpdir(), 'toss-test-'));
     process.env.HOME = tempDir;
   });
 
@@ -26,8 +26,8 @@ describe('Config', () => {
   });
 
   it('should save and load config', async () => {
-    const testConfig: HullConfig = {
-      endpoint: 'https://hull-test.workers.dev',
+    const testConfig: TossConfig = {
+      endpoint: 'https://toss-test.workers.dev',
       ownerToken: 'deadbeef0123456789abcdef01234567',
       subdomain: 'test',
     };

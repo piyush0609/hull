@@ -56,8 +56,8 @@ export const OWNER = 'deadbeef0123456789abcdef01234567';
 
 export function createEnv(kv: MockKV, db: MockD1) {
   return {
-    HULL_KV: kv as unknown as KVNamespace,
-    HULL_DB: db as unknown as D1Database,
+    TOSS_KV: kv as unknown as KVNamespace,
+    TOSS_DB: db as unknown as D1Database,
     JWT_SECRET: SECRET,
     OWNER_TOKEN: OWNER,
   };

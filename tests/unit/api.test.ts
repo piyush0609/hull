@@ -1,17 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { HullAPI } from '../../src/lib/api.js';
+import { TossAPI } from '../../src/lib/api.js';
 
 const TEST_CONFIG = {
-  endpoint: 'https://hull-test.workers.dev',
+  endpoint: 'https://toss-test.workers.dev',
   ownerToken: 'deadbeef0123456789abcdef01234567',
   subdomain: 'test',
 };
 
-describe('HullAPI', () => {
-  let api: HullAPI;
+describe('TossAPI', () => {
+  let api: TossAPI;
 
   beforeEach(() => {
-    api = new HullAPI(TEST_CONFIG);
+    api = new TossAPI(TEST_CONFIG);
   });
 
   afterEach(() => {
@@ -19,7 +19,7 @@ describe('HullAPI', () => {
   });
 
   it('should upload HTML and return share data', async () => {
-    const mockResponse = { id: 'abc123', url: 'https://hull-test.workers.dev/a/abc123?t=xyz' };
+    const mockResponse = { id: 'abc123', url: 'https://toss-test.workers.dev/a/abc123?t=xyz' };
 
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -66,7 +66,7 @@ describe('HullAPI', () => {
     const result = await api.list();
     expect(result).toEqual(mockArtifacts);
     expect(fetch).toHaveBeenCalledWith(
-      'https://hull-test.workers.dev/artifacts',
+      'https://toss-test.workers.dev/artifacts',
       expect.objectContaining({
         headers: { Authorization: `Bearer ${TEST_CONFIG.ownerToken}` },
       })
@@ -80,7 +80,7 @@ describe('HullAPI', () => {
 
     await api.revoke('abc123');
     expect(fetch).toHaveBeenCalledWith(
-      'https://hull-test.workers.dev/artifacts/abc123',
+      'https://toss-test.workers.dev/artifacts/abc123',
       expect.objectContaining({
         method: 'DELETE',
         headers: { Authorization: `Bearer ${TEST_CONFIG.ownerToken}` },

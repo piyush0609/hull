@@ -3,17 +3,17 @@ import { join } from 'path';
 
 function configFile(): string {
   const home = process.env.HOME || process.env.USERPROFILE || '.';
-  return join(home, '.hull', 'config.json');
+  return join(home, '.toss', 'config.json');
 }
 
-export interface HullConfig {
+export interface TossConfig {
   endpoint: string;
   ownerToken: string;
   subdomain: string;
   kvId?: string;
 }
 
-export async function loadConfig(): Promise<HullConfig | null> {
+export async function loadConfig(): Promise<TossConfig | null> {
   try {
     const raw = await readFile(configFile(), 'utf-8');
     return JSON.parse(raw);
@@ -22,7 +22,7 @@ export async function loadConfig(): Promise<HullConfig | null> {
   }
 }
 
-export async function saveConfig(config: HullConfig): Promise<void> {
+export async function saveConfig(config: TossConfig): Promise<void> {
   const file = configFile();
   const dir = file.slice(0, file.lastIndexOf('/'));
   await mkdir(dir, { recursive: true });

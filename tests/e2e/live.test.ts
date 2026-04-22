@@ -13,7 +13,7 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
   const subdomain = `e2e-${Date.now()}`;
 
   beforeAll(async () => {
-    tempHome = await mkdtemp(join(tmpdir(), 'hull-e2e-'));
+    tempHome = await mkdtemp(join(tmpdir(), 'toss-e2e-'));
 
     // Ensure built
     execSync('npm run build', { cwd: projectRoot, stdio: 'ignore' });
@@ -25,7 +25,7 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
       stdio: 'pipe',
     });
 
-    const raw = await readFile(join(tempHome, '.hull', 'config.json'), 'utf-8');
+    const raw = await readFile(join(tempHome, '.toss', 'config.json'), 'utf-8');
     config = JSON.parse(raw);
     console.log(`Deployed to ${config.endpoint}`);
   }, 120000);

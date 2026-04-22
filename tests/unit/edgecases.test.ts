@@ -9,7 +9,7 @@ describe('Edge Cases & Failure Modes', () => {
   let tempHome: string;
 
   beforeEach(async () => {
-    tempHome = await mkdtemp(join(tmpdir(), 'hull-edge-'));
+    tempHome = await mkdtemp(join(tmpdir(), 'toss-edge-'));
     process.env.HOME = tempHome;
   });
 
@@ -19,7 +19,7 @@ describe('Edge Cases & Failure Modes', () => {
 
   describe('Config', () => {
     it('should handle malformed JSON gracefully', async () => {
-      const configDir = join(tempHome, '.hull');
+      const configDir = join(tempHome, '.toss');
       await mkdir(configDir, { recursive: true });
       await writeFile(join(configDir, 'config.json'), '{ invalid json');
       const config = await loadConfig();

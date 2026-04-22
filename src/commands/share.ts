@@ -2,7 +2,7 @@ import { readFile, stat, readdir, lstat } from 'fs/promises';
 import { spawn } from 'child_process';
 import { join, relative } from 'path';
 import { loadConfig } from '../lib/config.js';
-import { HullAPI } from '../lib/api.js';
+import { TossAPI } from '../lib/api.js';
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB KV limit
 const SKIP_DIRS = new Set(['node_modules', '__pycache__', 'dist', 'build', 'target', '.next', '.vercel', '.turbo', '.cache', 'out']);
@@ -69,11 +69,11 @@ async function walkDir(dir: string): Promise<string[]> {
 export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean }) {
   const config = await loadConfig();
   if (!config) {
-    console.error('Error: No hull found. Run "hull deploy" first.');
+    console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
   }
 
-  const api = new HullAPI(config);
+  const api = new TossAPI(config);
   const expires = parseDuration(options.expires);
 
   let result: { id: string; url: string };
@@ -164,6 +164,6 @@ export async function shareCommand(file: string, options: { expires: string; cli
     console.log(`\nLink:     ${result.url}`);
     console.log(`Expires:  ${options.expires}`);
     if (options.clipboard) console.log('Copied to clipboard.');
-    console.log(`Revoke:   hull revoke ${result.id}\n`);
+    console.log(`Revoke:   toss revoke ${result.id}\n`);
   }
 }

@@ -1,8 +1,8 @@
 import { signJWT, verifyJWT } from './jwt.js';
 
 export interface Env {
-  HULL_KV: KVNamespace;
-  HULL_DB: D1Database;
+  TOSS_KV: KVNamespace;
+  TOSS_DB: D1Database;
   JWT_SECRET: string;
   OWNER_TOKEN: string;
 }
@@ -79,10 +79,10 @@ export default {
         const id = generateId();
         const html = await request.text();
 
-        await env.HULL_KV.put(`artifacts/${id}/files/index.html`, html);
+        await env.TOSS_KV.put(`artifacts/${id}/files/index.html`, html);
 
         const now = Math.floor(Date.now() / 1000);
-        await env.HULL_DB.prepare(
+        await env.TOSS_DB.prepare(
           'INSERT INTO artifacts (id, name, size_bytes, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'
         )
           .bind(id, name, html.length, now, now + expiresSeconds)
@@ -114,7 +114,7 @@ export default {
         filePath = parts.join('/');
 
         const body = await request.arrayBuffer();
-        await env.HULL_KV.put(`artifacts/${id}/files/${filePath}`, body);
+        await env.TOSS_KV.put(`artifacts/${id}/files/${filePath}`, body);
 
         return new Response(JSON.stringify({ uploaded: filePath }), {
           headers: { 'Content-Type': 'application/json' },
@@ -126,7 +126,7 @@ export default {
         const authErr = requireOwner(request, env);
         if (authErr) return authErr;
 
-        const { results } = await env.HULL_DB.prepare(
+        const { results } = await env.TOSS_DB.prepare(
           'SELECT id, name, size_bytes, created_at, expires_at FROM artifacts ORDER BY created_at DESC'
         ).all();
 
@@ -143,13 +143,13 @@ export default {
         const id = url.pathname.split('/')[2];
         let cursor: string | undefined;
         do {
-          const list = await env.HULL_KV.list({ prefix: `artifacts/${id}/`, cursor });
+          const list = await env.TOSS_KV.list({ prefix: `artifacts/${id}/`, cursor });
           for (const key of list.keys) {
-            await env.HULL_KV.delete(key.name);
+            await env.TOSS_KV.delete(key.name);
           }
           cursor = list.list_complete ? undefined : list.cursor;
         } while (cursor);
-        await env.HULL_DB.prepare('DELETE FROM artifacts WHERE id = ?').bind(id).run();
+        await env.TOSS_DB.prepare('DELETE FROM artifacts WHERE id = ?').bind(id).run();
 
         return new Response(JSON.stringify({ revoked: id }), {
           headers: { 'Content-Type': 'application/json' },
@@ -171,7 +171,7 @@ export default {
         if (!token) {
           const cookie = request.headers.get('Cookie');
           if (cookie) {
-            const match = cookie.match(/hull_tok=([^;]+)/);
+            const match = cookie.match(/toss_tok=([^;]+)/);
             if (match) token = match[1];
           }
         }
@@ -191,10 +191,10 @@ export default {
         let filePath = serveMatch[2] || 'index.html';
         if (filePath.endsWith('/')) filePath += 'index.html';
 
-        const obj = await env.HULL_KV.get(`artifacts/${id}/files/${filePath}`, 'arrayBuffer');
+        const obj = await env.TOSS_KV.get(`artifacts/${id}/files/${filePath}`, 'arrayBuffer');
         if (!obj) {
           if (!filePath.endsWith('.html')) {
-            const indexObj = await env.HULL_KV.get(`artifacts/${id}/files/${filePath}/index.html`, 'arrayBuffer');
+            const indexObj = await env.TOSS_KV.get(`artifacts/${id}/files/${filePath}/index.html`, 'arrayBuffer');
             if (indexObj) {
               return new Response(indexObj, {
                 status: 200,
@@ -213,7 +213,7 @@ export default {
 
         if (filePath.endsWith('.html')) {
           const maxAge = Math.max(0, (payload.exp as number) - Math.floor(Date.now() / 1000));
-          headers['Set-Cookie'] = `hull_tok=${token}; Path=/a/${id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+          headers['Set-Cookie'] = `toss_tok=${token}; Path=/a/${id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
           headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
           // Auth-gated HTML: never cache
           headers['Cache-Control'] = 'private, no-store, max-age=0';

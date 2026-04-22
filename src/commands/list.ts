@@ -1,5 +1,5 @@
 import { loadConfig } from '../lib/config.js';
-import { HullAPI } from '../lib/api.js';
+import { TossAPI } from '../lib/api.js';
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
@@ -18,11 +18,11 @@ function fmtExpiry(msLeft: number): string {
 export async function listCommand() {
   const config = await loadConfig();
   if (!config) {
-    console.error('Error: No hull found. Run "hull deploy" first.');
+    console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
   }
 
-  const api = new HullAPI(config);
+  const api = new TossAPI(config);
   let artifacts: Awaited<ReturnType<typeof api.list>>;
   try {
     artifacts = await api.list();
