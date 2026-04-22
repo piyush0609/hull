@@ -153,8 +153,26 @@ export async function setupCommand() {
       try {
         await execAsync('wrangler login --scopes account:read workers_scripts:write workers_kv:write d1:write zone:read');
       } catch (err: any) {
-        console.error('Login failed:', err.stderr || err.message);
-        process.exit(1);
+        const errMsg = err.stderr || err.message || '';
+        if (errMsg.includes('authorization') || errMsg.includes('OAuth')) {
+          console.error('\n❌ OAuth authorization failed.');
+          console.error('This can happen with new Cloudflare accounts that need onboarding first.');
+          const retry = await prompt('Retry with full scopes? (y/n): ');
+          if (retry.toLowerCase() === 'y') {
+            try {
+              await execAsync('wrangler login');
+            } catch (err2: any) {
+              console.error('Login failed:', err2.stderr || err2.message);
+              process.exit(1);
+            }
+          } else {
+            console.error('Please visit https://dash.cloudflare.com and complete onboarding first.');
+            process.exit(1);
+          }
+        } else {
+          console.error('Login failed:', errMsg);
+          process.exit(1);
+        }
       }
     }
   }
