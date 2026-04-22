@@ -13,23 +13,36 @@ hull share ./report.html --expires 24h
 curl -fsSL https://raw.githubusercontent.com/piyush0609/hull/main/install.sh | sh
 ```
 
-The installer detects your OS/arch, downloads the latest binary from [GitHub Releases](https://github.com/piyush0609/hull/releases), and installs it to `/usr/local/bin` (or `~/.local/bin`).
+The installer detects your OS/arch, downloads the latest binary from [GitHub Releases](https://github.com/piyush0609/hull/releases), and installs it to `/usr/local/bin` (or `~/.local/bin` with PATH auto-configured).
 
 **Fallback:** If the binary download fails, it falls back to `npm install -g hull-cli`.
 
 **Requirements for deploy:**
-- [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (`npm install -g wrangler`)
+- Node.js 18+ (for Wrangler CLI)
+- [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (installed automatically by `hull setup`)
 - A Cloudflare account with a [workers.dev subdomain](https://dash.cloudflare.com/workers/onboarding)
 
 > **Note:** `hull deploy` calls Wrangler, which requires Node.js. The hull binary itself has no runtime dependencies.
 
 ## Quick Start
 
-### 1. Check your setup
+### 1. Set up prerequisites
 
 ```bash
-hull doctor
+hull setup
 ```
+
+This interactive command:
+- Checks Node.js version
+- Installs Wrangler if missing
+- Authenticates with Cloudflare (browser OAuth or API token)
+- Verifies your workers.dev subdomain
+
+**Multi-account users:** If you have multiple Cloudflare accounts, `hull setup` handles them automatically — it extracts the account ID and passes it to all Wrangler commands.
+
+**Login options:**
+- **Browser login** — Opens Cloudflare OAuth with minimal scopes. Use incognito/private mode to switch accounts.
+- **API token** — Paste a token from https://dash.cloudflare.com/profile/api-tokens. Best for CI and account switching.
 
 ### 2. Deploy your hull
 
@@ -100,13 +113,14 @@ Static assets get `Cache-Control: public, max-age=86400, immutable`.
 
 | Command | Description |
 |---------|-------------|
+| `hull setup` | One-time setup: install wrangler, login, verify subdomain |
 | `hull deploy` | Deploy infrastructure to Cloudflare |
 | `hull share <file> --expires <duration>` | Share an HTML file or folder |
 | `hull list` | List all artifacts with expiry status |
 | `hull revoke <id>` | Permanently delete an artifact |
 | `hull info` | Show endpoint, subdomain, KV ID, artifact count |
 | `hull destroy` | Delete worker, D1, KV, and local config |
-| `hull doctor` | Check prerequisites |
+| `hull doctor` | Check prerequisites (read-only diagnostic) |
 
 ## Configuration
 
@@ -126,20 +140,6 @@ Stored in `~/.hull/config.json`:
 - **25MB total per upload** (Cloudflare KV limit)
 - **KV eventual consistency** — newly shared links may 404 for 1–60 seconds in some regions
 - **No background cleanup** — expired artifacts stay in KV/D1 until revoked or destroyed
-
-## Rate Limiting
-
-The upload endpoint has no built-in rate limiting. For production use, consider adding Cloudflare Rate Limiting rules or a D1-backed IP throttle.
-
-## Generating a Skill
-
-If you want to turn a shared HTML artifact into a reusable [Claude skill](https://docs.anthropic.com/en/docs/skills), save the artifact's source as a self-contained HTML file and share it:
-
-```bash
-hull share ./skill-dashboard.html --expires 30d
-```
-
-The link can then be referenced in a skill's `SKILL.md` as a live demo or embedded tool. For fully offline skills, copy the HTML into the skill directory instead.
 
 ## Development
 
