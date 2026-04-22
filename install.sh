@@ -63,7 +63,27 @@ if [ -n "$VERSION" ]; then
       mkdir -p "$USER_BIN"
       mv "/tmp/hull$EXT" "$USER_BIN/hull"
       echo "✅ hull installed to $USER_BIN/hull"
-      echo "   Add to PATH: export PATH=\"$USER_BIN:\$PATH\""
+
+      # Auto-add to PATH if not already there
+      SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
+      case "$SHELL_NAME" in
+        bash)  PROFILE="$HOME/.bashrc" ;;
+        zsh)   PROFILE="$HOME/.zshrc" ;;
+        fish)  PROFILE="$HOME/.config/fish/config.fish" ;;
+        *)     PROFILE="$HOME/.profile" ;;
+      esac
+
+      if [ -f "$PROFILE" ]; then
+        if ! grep -q "$USER_BIN" "$PROFILE" 2>/dev/null; then
+          echo "" >> "$PROFILE"
+          echo "# Added by hull installer" >> "$PROFILE"
+          echo "export PATH=\"$USER_BIN:\$PATH\"" >> "$PROFILE"
+          echo "✅ Added $USER_BIN to PATH in $PROFILE"
+          echo "   Restart your terminal or run: source $PROFILE"
+        fi
+      else
+        echo "   Add to PATH: export PATH=\"$USER_BIN:\$PATH\""
+      fi
     fi
 
     echo ""
