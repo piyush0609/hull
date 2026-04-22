@@ -55,10 +55,14 @@ export async function setupCommand() {
   // Check / run auth
   let authOk = false;
   try {
-    await execAsync('wrangler whoami');
-    authOk = true;
-    console.log('✅ Authenticated with Cloudflare');
-  } catch {
+    const { stdout } = await execAsync('wrangler whoami');
+    if (!stdout.includes('not authenticated')) {
+      authOk = true;
+      console.log('✅ Authenticated with Cloudflare');
+    }
+  } catch {}
+
+  if (!authOk) {
     console.log('❌ Not authenticated with Cloudflare.');
     const answer = await prompt('Run wrangler login now? (y/n): ');
     if (answer.toLowerCase() !== 'y') {

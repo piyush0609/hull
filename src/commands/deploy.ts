@@ -129,7 +129,11 @@ export async function deployCommand() {
   }
 
   try {
-    await execAsync('wrangler whoami');
+    const { stdout } = await execAsync('wrangler whoami');
+    if (stdout.includes('not authenticated')) {
+      console.error('❌ Not authenticated with Cloudflare. Run: hull setup');
+      process.exit(1);
+    }
   } catch {
     console.error('❌ Not authenticated with Cloudflare. Run: hull setup');
     process.exit(1);
