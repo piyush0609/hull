@@ -1,11 +1,11 @@
 #!/bin/sh
 # hull installer — downloads prebuilt binary from GitHub Releases
 # Fallback: installs via npm if binary download fails
-# Usage: curl -fsSL https://raw.githubusercontent.com/YOURUSER/hull-cli/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/piyush0609/hull/main/install.sh | sh
 
 set -e
 
-REPO="YOURUSER/hull-cli"
+REPO="piyush0609/hull"
 NPM_PKG="hull-cli"
 MIN_NODE=18
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
