@@ -1,6 +1,9 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { createInterface } from 'readline';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
+import { homedir } from 'os';
 
 const execAsync = promisify(exec);
 
@@ -12,6 +15,35 @@ function prompt(q: string): Promise<string> {
       resolve(ans.trim());
     })
   );
+}
+
+async function getWranglerToken(): Promise<string | null> {
+  const paths = [
+    join(homedir(), '.config/.wrangler/config/default.toml'),
+    join(homedir(), 'Library/Preferences/.wrangler/config/default.toml'),
+  ];
+  for (const p of paths) {
+    try {
+      const toml = await readFile(p, 'utf-8');
+      const match = toml.match(/oauth_token\s*=\s*"([^"]+)"/);
+      if (match) return match[1];
+    } catch {}
+  }
+  return null;
+}
+
+async function getWorkersDevSubdomain(accountId: string, token: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const data = await res.json();
+    if (data.success && data.result?.subdomain) {
+      return data.result.subdomain;
+    }
+  } catch {}
+  return null;
 }
 
 export async function setupCommand() {
@@ -87,15 +119,19 @@ export async function setupCommand() {
   try {
     const { stdout } = await execAsync('wrangler whoami');
     const accountMatch = stdout.match(/([a-f0-9]{32})/);
-    if (accountMatch) {
-      const tokenRes = await execAsync('grep oauth_token ~/.config/.wrangler/config/default.toml 2>/dev/null || grep oauth_token ~/Library/Preferences/.wrangler/config/default.toml 2>/dev/null').catch(() => null);
-      // Best-effort subdomain check via API would go here
-      // For now just trust wrangler whoami working means they're set up
-      console.log('✅ Account connected');
+    const token = await getWranglerToken();
+    if (accountMatch && token) {
+      subdomain = (await getWorkersDevSubdomain(accountMatch[1], token)) || '';
     }
-  } catch {
-    console.log('⚠️  Could not verify subdomain. You may need to register one.');
+  } catch {}
+
+  if (subdomain) {
+    console.log(`✅ workers.dev subdomain: ${subdomain}`);
+  } else {
+    console.log('❌ No workers.dev subdomain registered.');
     console.log('   Visit: https://dash.cloudflare.com/workers/onboarding');
+    console.log('   Or run: wrangler subdomain <name>');
+    process.exit(1);
   }
 
   console.log('\n✅ Setup complete. You can now run:');
