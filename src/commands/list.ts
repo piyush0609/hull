@@ -15,8 +15,8 @@ function fmtExpiry(msLeft: number): string {
   return `${Math.floor(msLeft / 86400000)}d left`;
 }
 
-export async function listCommand() {
-  const config = await loadConfig();
+export async function listCommand(options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);

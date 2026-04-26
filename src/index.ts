@@ -11,6 +11,7 @@ import { setupCommand } from './commands/setup.js';
 import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
 import { tokenCreateCommand, tokenListCommand, tokenRevokeCommand, tokenRotateCommand } from './commands/token.js';
 import { joinCommand } from './commands/join.js';
+import { profileListCommand, profileSwitchCommand, profileShowCommand, profileDeleteCommand } from './commands/profile.js';
 
 const program = new Command();
 
@@ -33,21 +34,25 @@ program
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password <password>', 'Password-protect this share')
+  .option('--profile <name>', 'Use a specific profile')
   .action(shareCommand);
 
 program
   .command('list')
   .description('List your shared artifacts')
+  .option('--profile <name>', 'Use a specific profile')
   .action(listCommand);
 
 program
   .command('revoke <id>')
   .description('Revoke access to an artifact')
+  .option('--profile <name>', 'Use a specific profile')
   .action(revokeCommand);
 
 program
   .command('destroy')
   .description('Destroy your toss infrastructure')
+  .option('--profile <name>', 'Use a specific profile')
   .action(destroyCommand);
 
 program
@@ -63,6 +68,7 @@ program
 program
   .command('info')
   .description('Show toss configuration and artifact count')
+  .option('--profile <name>', 'Use a specific profile')
   .action(infoCommand);
 
 const skill = program
@@ -121,6 +127,7 @@ program
   .command('join <endpoint>')
   .description('Join a shared toss instance (one-line setup)')
   .requiredOption('-t, --token <token>', 'Your upload token')
+  .option('-p, --profile <name>', 'Save as named profile')
   .action(joinCommand);
 
 program.parse();

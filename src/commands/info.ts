@@ -1,8 +1,8 @@
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
-export async function infoCommand() {
-  const config = await loadConfig();
+export async function infoCommand(options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);

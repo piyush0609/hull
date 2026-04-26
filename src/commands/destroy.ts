@@ -6,8 +6,8 @@ import { join } from 'path';
 
 const execAsync = promisify(exec);
 
-export async function destroyCommand() {
-  const config = await loadConfig();
+export async function destroyCommand(options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Nothing to destroy.');
     process.exit(1);

@@ -1,6 +1,6 @@
 import { saveConfig } from '../lib/config.js';
 
-export async function joinCommand(endpoint: string, options: { token: string }) {
+export async function joinCommand(endpoint: string, options: { token: string; profile?: string }) {
   // Normalize endpoint
   let url = endpoint;
   if (!url.startsWith('http')) url = `https://${url}`;
@@ -31,9 +31,10 @@ export async function joinCommand(endpoint: string, options: { token: string }) 
     endpoint: url,
     ownerToken: options.token,
     subdomain,
-  });
+  }, options.profile);
 
-  console.log(`✓ Connected to ${url}`);
+  const profileLabel = options.profile ? ` (${options.profile})` : '';
+  console.log(`✓ Connected to ${url}${profileLabel}`);
   console.log('  toss share ./file.html --expires 24h');
   console.log('  toss list');
 }

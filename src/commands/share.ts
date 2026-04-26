@@ -66,8 +66,8 @@ async function walkDir(dir: string): Promise<string[]> {
   return files;
 }
 
-export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean; password?: string }) {
-  const config = await loadConfig();
+export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean; password?: string; profile?: string } = { expires: '24h' }) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);

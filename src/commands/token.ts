@@ -1,8 +1,8 @@
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
-export async function tokenCreateCommand(options: { label: string }) {
-  const config = await loadConfig();
+export async function tokenCreateCommand(options: { label: string; profile?: string } = { label: '' }) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
@@ -35,8 +35,8 @@ export async function tokenCreateCommand(options: { label: string }) {
   }
 }
 
-export async function tokenListCommand() {
-  const config = await loadConfig();
+export async function tokenListCommand(options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
@@ -73,8 +73,8 @@ export async function tokenListCommand() {
   }
 }
 
-export async function tokenRevokeCommand(hash: string) {
-  const config = await loadConfig();
+export async function tokenRevokeCommand(hash: string, options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
@@ -99,8 +99,8 @@ export async function tokenRevokeCommand(hash: string) {
   }
 }
 
-export async function tokenRotateCommand() {
-  const config = await loadConfig();
+export async function tokenRotateCommand(options: { profile?: string } = {}) {
+  const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
     process.exit(1);
