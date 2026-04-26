@@ -117,7 +117,7 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
   });
 }
 
-export async function deployCommand(options: { domain?: string; multiTenant?: boolean }) {
+export async function deployCommand(options: { domain?: string; multiTenant?: boolean; profile?: string }) {
   console.log('Setting up your toss on Cloudflare...\n');
 
   // Quick prereq check — direct to setup if anything is missing
@@ -128,19 +128,56 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     process.exit(1);
   }
 
-  // Check auth and extract account ID for multi-account users
-  let accountId = '';
-  try {
-    const { stdout } = await execAsync('wrangler whoami');
-    if (stdout.includes('not authenticated')) {
+  // Load profile if specified
+  let profileConfig = null;
+  if (options.profile) {
+    const { loadConfig } = await import('../lib/config.js');
+    profileConfig = await loadConfig(options.profile);
+  }
+
+  // Build wrangler environment: support API token per profile
+  let apiToken = profileConfig?.apiToken || process.env.CLOUDFLARE_API_TOKEN || '';
+  let accountId = profileConfig?.accountId || '';
+
+  if (apiToken) {
+    // Verify API token
+    try {
+      const res = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
+        headers: { Authorization: `Bearer ${apiToken}` },
+      });
+      const data = await res.json() as { success: boolean };
+      if (!data.success) throw new Error('Invalid token');
+      console.log('✅ Using profile API token');
+    } catch {
+      console.error('❌ API token verification failed. Check your token.');
+      process.exit(1);
+    }
+    // Fetch account ID if not stored
+    if (!accountId) {
+      try {
+        const res = await fetch('https://api.cloudflare.com/client/v4/accounts', {
+          headers: { Authorization: `Bearer ${apiToken}` },
+        });
+        const data = await res.json() as { success: boolean; result?: Array<{ id: string }> };
+        if (data.success && data.result && data.result.length > 0) {
+          accountId = data.result[0].id;
+        }
+      } catch {}
+    }
+  } else {
+    // Fall back to wrangler OAuth
+    try {
+      const { stdout } = await execAsync('wrangler whoami');
+      if (stdout.includes('not authenticated')) {
+        console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
+        process.exit(1);
+      }
+      const match = stdout.match(/([a-f0-9]{32})/);
+      if (match) accountId = match[1];
+    } catch {
       console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
       process.exit(1);
     }
-    const match = stdout.match(/([a-f0-9]{32})/);
-    if (match) accountId = match[1];
-  } catch {
-    console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
-    process.exit(1);
   }
 
   const subdomain = process.env.TOSS_SUBDOMAIN || await prompt('Choose a subdomain (e.g., yourname): ');
@@ -165,7 +202,10 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
   const ownerToken = generateToken();
   const jwtSecret = generateToken();
 
-  const wranglerEnv = accountId ? { env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId } } : undefined;
+  const wranglerEnvBase: NodeJS.ProcessEnv = { ...process.env };
+  if (accountId) wranglerEnvBase.CLOUDFLARE_ACCOUNT_ID = accountId;
+  if (apiToken) wranglerEnvBase.CLOUDFLARE_API_TOKEN = apiToken;
+  const wranglerEnv = Object.keys(wranglerEnvBase).length > 0 ? { env: wranglerEnvBase } : undefined;
 
   console.log(`Creating KV namespace ${kvTitle}...`);
   const kvId = await createKV(kvTitle, wranglerEnv).catch((err) => {
@@ -212,11 +252,15 @@ database_id = "${databaseId}"
   console.log('Verifying workers.dev subdomain...');
   let workersDevSubdomain = '';
   try {
-    const { stdout: whoami } = await execAsync('wrangler whoami');
-    const accountMatch = whoami.match(/([a-f0-9]{32})/);
-    const token = await getWranglerToken();
-    if (accountMatch && token) {
-      workersDevSubdomain = (await getWorkersDevSubdomain(accountMatch[1], token)) || '';
+    if (apiToken && accountId) {
+      workersDevSubdomain = (await getWorkersDevSubdomain(accountId, apiToken)) || '';
+    } else {
+      const { stdout: whoami } = await execAsync('wrangler whoami');
+      const accountMatch = whoami.match(/([a-f0-9]{32})/);
+      const token = await getWranglerToken();
+      if (accountMatch && token) {
+        workersDevSubdomain = (await getWorkersDevSubdomain(accountMatch[1], token)) || '';
+      }
     }
   } catch {}
 
@@ -260,7 +304,7 @@ database_id = "${databaseId}"
     process.exit(1);
   }
 
-  await saveConfig({ endpoint: workerUrl, ownerToken, subdomain, kvId });
+  await saveConfig({ endpoint: workerUrl, ownerToken, subdomain, kvId, accountId, apiToken }, options.profile);
 
   console.log('\n✅ Your toss is ready.');
   console.log(`   Endpoint: ${workerUrl}`);

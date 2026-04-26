@@ -19,6 +19,8 @@ export interface TossConfig {
   ownerToken: string;
   subdomain: string;
   kvId?: string;
+  accountId?: string;
+  apiToken?: string;
 }
 
 interface ProfilesData {

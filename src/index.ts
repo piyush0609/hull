@@ -25,6 +25,7 @@ program
   .description('Deploy your toss infrastructure to Cloudflare')
   .option('-d, --domain <domain>', 'Custom domain (must be on Cloudflare)')
   .option('--multi-tenant', 'Enable multi-user team mode')
+  .option('--profile <name>', 'Deploy to a specific profile (uses stored API token)')
   .action(deployCommand);
 
 program

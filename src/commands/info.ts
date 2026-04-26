@@ -12,6 +12,9 @@ export async function infoCommand(options: { profile?: string } = {}) {
   console.log('=========');
   console.log(`Endpoint:  ${config.endpoint}`);
   console.log(`Subdomain: ${config.subdomain}`);
+  if (config.accountId) {
+    console.log(`Account:   ${config.accountId}`);
+  }
   if (config.kvId) {
     console.log(`KV ID:     ${config.kvId}`);
   }
