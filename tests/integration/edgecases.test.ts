@@ -158,4 +158,56 @@ describe('Worker Edge Cases', () => {
       expect(res.status).toBe(200);
     });
   });
+
+  describe('Password Protection', () => {
+    it('should require password for protected shares', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      const slug = 'secret-ABCD';
+      const now = Math.floor(Date.now() / 1000);
+      const enc = new TextEncoder();
+      const digest = await crypto.subtle.digest('SHA-256', enc.encode('mypassword' + id));
+      const passwordHash = Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+
+      // Seed artifact in mock DB
+      db.setRows([{
+        id,
+        slug,
+        name: 'secret.html',
+        size_bytes: 100,
+        created_at: now,
+        expires_at: now + 3600,
+        token_hash: 'any',
+        password_hash: passwordHash,
+      }]);
+      await kv.put(`artifacts/${id}/files/index.html`, '<html>secret</html>');
+
+      // GET without password should show form
+      const getReq = new Request(`http://localhost/s/${slug}/`);
+      const getRes = await worker.fetch(getReq, createEnv(kv, db));
+      expect(getRes.status).toBe(200);
+      const body = await getRes.text();
+      expect(body).toContain('Password Required');
+
+      // POST with wrong password should show error
+      const wrongReq = new Request(`http://localhost/s/${slug}/`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'wrong' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      const wrongRes = await worker.fetch(wrongReq, createEnv(kv, db));
+      expect(wrongRes.status).toBe(401);
+
+      // POST with correct password should redirect with cookie
+      const correctReq = new Request(`http://localhost/s/${slug}/`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'mypassword' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      const correctRes = await worker.fetch(correctReq, createEnv(kv, db));
+      expect(correctRes.status).toBe(302);
+      expect(correctRes.headers.get('Set-Cookie')).toContain(`toss_pwd_${slug}=1`);
+    });
+  });
 });

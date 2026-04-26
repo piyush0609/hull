@@ -22,10 +22,14 @@ export class MockKV {
 }
 
 class MockD1Statement {
-  constructor(private query: string, private values: unknown[] = []) {}
+  constructor(
+    private query: string,
+    private values: unknown[] = [],
+    private parentRows: Array<Record<string, unknown>> = []
+  ) {}
 
   bind(...values: unknown[]) {
-    return new MockD1Statement(this.query, values);
+    return new MockD1Statement(this.query, values, this.parentRows);
   }
 
   async run() {
@@ -33,7 +37,11 @@ class MockD1Statement {
   }
 
   async all() {
-    return { results: [] };
+    return { results: this.parentRows };
+  }
+
+  async first<T = Record<string, unknown>>(): Promise<T | null> {
+    return (this.parentRows[0] as T | null) ?? null;
   }
 }
 
@@ -41,9 +49,7 @@ export class MockD1 {
   private rows: Array<Record<string, unknown>> = [];
 
   prepare(query: string) {
-    const stmt = new MockD1Statement(query);
-    (stmt as any).all = async () => ({ results: this.rows });
-    return stmt;
+    return new MockD1Statement(query, [], this.rows);
   }
 
   setRows(rows: Array<Record<string, unknown>>) {

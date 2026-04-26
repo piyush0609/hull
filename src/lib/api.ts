@@ -11,10 +11,11 @@ async function safeFetch(url: string, init: RequestInit): Promise<Response> {
 export class TossAPI {
   constructor(private config: TossConfig) {}
 
-  async upload(html: Buffer, name: string, expiresSeconds: number): Promise<{ id: string; slug: string; url: string; legacyUrl: string }> {
+  async upload(html: Buffer, name: string, expiresSeconds: number, password?: string): Promise<{ id: string; slug: string; url: string; legacyUrl: string }> {
     const url = new URL('/artifacts', this.config.endpoint);
     url.searchParams.set('expires', String(expiresSeconds));
     url.searchParams.set('name', name);
+    if (password) url.searchParams.set('password', password);
 
     const res = await safeFetch(url.href, {
       method: 'POST',

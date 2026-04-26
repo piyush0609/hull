@@ -66,7 +66,7 @@ async function walkDir(dir: string): Promise<string[]> {
   return files;
 }
 
-export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean }) {
+export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean; password?: string }) {
   const config = await loadConfig();
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
@@ -112,7 +112,7 @@ export async function shareCommand(file: string, options: { expires: string; cli
     const entryName = relative(file, entryFile).replace(/^\.\//, '');
     const entryHtml = await readFile(entryFile);
     try {
-      result = await api.upload(entryHtml, entryName, expires);
+      result = await api.upload(entryHtml, entryName, expires, options.password);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -147,7 +147,7 @@ export async function shareCommand(file: string, options: { expires: string; cli
     }
     const name = file.replace(/^\.\//, '');
     try {
-      result = await api.upload(html, name, expires);
+      result = await api.upload(html, name, expires, options.password);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -163,6 +163,7 @@ export async function shareCommand(file: string, options: { expires: string; cli
   } else {
     console.log(`\nLink:     ${result.url}`);
     if (result.legacyUrl) console.log(`Legacy:   ${result.legacyUrl}`);
+    if (options.password) console.log(`Password: ${options.password}`);
     console.log(`Expires:  ${options.expires}`);
     if (options.clipboard) console.log('Copied to clipboard.');
     console.log(`Revoke:   toss revoke ${result.slug || result.id}\n`);

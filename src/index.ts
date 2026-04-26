@@ -32,6 +32,7 @@ program
   .requiredOption('-e, --expires <duration>', 'Link lifetime: 1h, 24h, 7d, 30d')
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
+  .option('-p, --password <password>', 'Password-protect this share')
   .action(shareCommand);
 
 program

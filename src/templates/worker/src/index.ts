@@ -94,6 +94,39 @@ function generateSlug(name: string): string {
 
 // --- MIME ---
 
+function passwordForm(slug: string, error: boolean): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Password Required</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .box { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 360px; }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; color: #333; }
+    p { color: #666; margin: 0 0 1.5rem; font-size: 0.875rem; }
+    input[type="password"] { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; box-sizing: border-box; margin-bottom: 0.75rem; }
+    input[type="password"]:focus { outline: none; border-color: #0066ff; }
+    button { width: 100%; padding: 0.75rem; background: #0066ff; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #0052cc; }
+    .error { color: #d32f2f; font-size: 0.875rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>🔒 Password Required</h1>
+    <p>This link is password-protected.</p>
+    ${error ? '<div class="error">Incorrect password. Please try again.</div>' : ''}
+    <form method="POST" action="/s/${slug}">
+      <input type="password" name="password" placeholder="Enter password" autofocus required />
+      <button type="submit">View Content</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
 function mimeType(path: string): string {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const map: Record<string, string> = {
@@ -220,13 +253,16 @@ export default {
         const slug = generateSlug(name);
         const html = await request.text();
 
+        const passwordParam = url.searchParams.get('password');
+        const passwordHash = passwordParam ? await sha256(passwordParam + id) : null;
+
         await env.TOSS_KV.put(`artifacts/${id}/files/index.html`, html);
 
         const now = Math.floor(Date.now() / 1000);
         await env.TOSS_DB.prepare(
-          'INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         )
-          .bind(id, slug, name, html.length, now, now + expiresSeconds, auth.tokenHash)
+          .bind(id, slug, name, html.length, now, now + expiresSeconds, auth.tokenHash, passwordHash)
           .run();
 
         const jwt = await signJWT({ sub: id, iat: now, exp: now + expiresSeconds }, env.JWT_SECRET);
@@ -386,15 +422,60 @@ export default {
       }
 
       // ===== SERVE by slug (/s/:slug) =====
-      const slugMatch = url.pathname.match(/^\/s\/([a-z0-9-]+)(?:\/(.*))?$/);
+      const slugMatch = url.pathname.match(/^\/s\/([a-zA-Z0-9-]+)(?:\/(.*))?$/);
       if (slugMatch) {
         const slug = slugMatch[1];
         const row = await env.TOSS_DB.prepare(
-          'SELECT id, expires_at FROM artifacts WHERE slug = ?'
-        ).bind(slug).first<{ id: string; expires_at: number }>();
+          'SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?'
+        ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null }>();
 
         if (!row) return new Response('Not found', { status: 404 });
 
+        // Check expiry first
+        if (row.expires_at < Math.floor(Date.now() / 1000)) {
+          return new Response('Link expired', { status: 410 });
+        }
+
+        // Password check
+        if (row.password_hash) {
+          const cookieName = `toss_pwd_${slug}`;
+          const cookies = request.headers.get('Cookie') || '';
+          const hasSession = cookies.includes(`${cookieName}=1`);
+
+          if (!hasSession) {
+            if (request.method === 'POST') {
+              const formData = await request.formData();
+              const password = formData.get('password') as string;
+              const providedHash = password ? await sha256(password + row.id) : '';
+
+              if (constantTimeEqual(providedHash, row.password_hash)) {
+                // Correct password: redirect with cookie
+                const maxAge = Math.max(0, row.expires_at - Math.floor(Date.now() / 1000));
+                return new Response(null, {
+                  status: 302,
+                  headers: {
+                    Location: `${url.origin}/s/${slug}/`,
+                    'Set-Cookie': `${cookieName}=1; Path=/s/${slug}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`,
+                  },
+                });
+              }
+
+              // Wrong password: show form again
+              return new Response(passwordForm(slug, true), {
+                status: 401,
+                headers: { 'Content-Type': 'text/html' },
+              });
+            }
+
+            // GET without session: show password form
+            return new Response(passwordForm(slug, false), {
+              status: 200,
+              headers: { 'Content-Type': 'text/html' },
+            });
+          }
+        }
+
+        // Serve content
         let filePath = slugMatch[2] || 'index.html';
         if (filePath.endsWith('/')) filePath += 'index.html';
 
