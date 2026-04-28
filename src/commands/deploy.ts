@@ -246,9 +246,9 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     }
   }
 
-  const workerName = subdomain ? `toss-${subdomain}` : 'toss';
-  const dbName = subdomain ? `toss-db-${subdomain}` : 'toss-db';
-  const kvTitle = subdomain ? `toss-kv-${subdomain}` : 'toss-kv';
+  const workerName = subdomain && subdomain !== 'toss' ? `toss-${subdomain}` : 'toss';
+  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
+  const kvTitle = subdomain && subdomain !== 'toss' ? `toss-kv-${subdomain}` : 'toss-kv';
   const workerDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'worker');
   const ownerToken = generateToken();
   const jwtSecret = generateToken();

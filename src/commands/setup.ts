@@ -10,9 +10,9 @@ const execAsync = promisify(exec);
 
 async function checkSubdomainAvailability(subdomain: string, accountId: string, token: string): Promise<{ available: boolean; conflicts: string[] }> {
   const conflicts: string[] = [];
-  const workerName = `toss-${subdomain}`;
-  const dbName = `toss-db-${subdomain}`;
-  const kvTitle = `toss-kv-${subdomain}`;
+  const workerName = subdomain && subdomain !== 'toss' ? `toss-${subdomain}` : 'toss';
+  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
+  const kvTitle = subdomain && subdomain !== 'toss' ? `toss-kv-${subdomain}` : 'toss-kv';
 
   // Check existing workers
   try {

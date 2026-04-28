@@ -1,17 +1,48 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { deployCommand } from './commands/deploy.js';
+import { deployVercelCommand } from './commands/deploy-vercel.js';
 import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
 import { destroyCommand } from './commands/destroy.js';
+import { destroyVercelCommand } from './commands/destroy-vercel.js';
 import { doctorCommand } from './commands/doctor.js';
 import { infoCommand } from './commands/info.js';
 import { setupCommand } from './commands/setup.js';
+import { setupVercelCommand } from './commands/setup-vercel.js';
 import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
 import { tokenCreateCommand, tokenListCommand, tokenRevokeCommand, tokenRotateCommand } from './commands/token.js';
 import { joinCommand } from './commands/join.js';
 import { profileListCommand, profileSwitchCommand, profileShowCommand, profileDeleteCommand, profileDefaultCommand, profileRenameCommand } from './commands/profile.js';
+import { loadConfig } from './lib/config.js';
+
+async function routeDeploy(options: any) {
+  const backend = options.backend || (await loadConfig(options.profile))?.backend || 'cloudflare';
+  if (backend === 'vercel') {
+    await deployVercelCommand(options);
+  } else {
+    await deployCommand(options);
+  }
+}
+
+async function routeSetup(options: any) {
+  const backend = options.backend || 'cloudflare';
+  if (backend === 'vercel') {
+    await setupVercelCommand(options);
+  } else {
+    await setupCommand(options);
+  }
+}
+
+async function routeDestroy(options: any) {
+  const backend = options.backend || (await loadConfig(options.profile))?.backend || 'cloudflare';
+  if (backend === 'vercel') {
+    await destroyVercelCommand(options);
+  } else {
+    await destroyCommand(options);
+  }
+}
 
 const program = new Command();
 
@@ -22,11 +53,15 @@ program
 
 program
   .command('deploy')
-  .description('Deploy your toss infrastructure to Cloudflare')
-  .option('-d, --domain <domain>', 'Custom domain (must be on Cloudflare)')
+  .description('Deploy your toss infrastructure')
+  .option('-d, --domain <domain>', 'Custom domain')
   .option('--multi-tenant', 'Enable multi-user team mode')
-  .option('--profile <name>', 'Deploy to a specific profile (uses stored API token)')
-  .action(deployCommand);
+  .option('--profile <name>', 'Deploy to a specific profile')
+  .option('--backend <backend>', 'Deployment backend: cloudflare or vercel', 'cloudflare')
+  .option('--postgres-url <url>', 'Postgres connection string (Vercel only)')
+  .option('--blob-token <token>', 'Vercel Blob read-write token (Vercel only)')
+  .option('-y, --yes', 'Skip interactive prompts')
+  .action(routeDeploy);
 
 program
   .command('share <file>')
@@ -54,15 +89,18 @@ program
   .command('destroy')
   .description('Destroy your toss infrastructure')
   .option('--profile <name>', 'Use a specific profile')
-  .action(destroyCommand);
+  .option('--backend <backend>', 'Target backend: cloudflare or vercel')
+  .option('-y, --yes', 'Skip confirmation')
+  .action(routeDestroy);
 
 program
   .command('setup')
-  .description('One-time setup: install wrangler, login, check subdomain')
+  .description('One-time setup: login, check prerequisites')
   .option('--profile <name>', 'Configure auth for a specific profile')
   .option('--subdomain <name>', 'Set the default subdomain for this profile')
   .option('-y, --yes', 'Auto-accept defaults (non-interactive)')
-  .action(setupCommand);
+  .option('--backend <backend>', 'Target backend: cloudflare or vercel', 'cloudflare')
+  .action(routeSetup);
 
 program
   .command('doctor')

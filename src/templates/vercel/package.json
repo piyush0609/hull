@@ -1,0 +1,8 @@
+{
+  "name": "toss-vercel",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.0"
+  }
+}

@@ -115,7 +115,7 @@ function passwordForm(slug: string, error: boolean): string {
 </head>
 <body>
   <div class="box">
-    <h1>🔒 Password Required</h1>
+    <h1>Password Required</h1>
     <p>This link is password-protected.</p>
     ${error ? '<div class="error">Incorrect password. Please try again.</div>' : ''}
     <form method="POST" action="/s/${slug}">
@@ -531,6 +531,36 @@ export default {
 
         const meta = { id, expires_at: payload.exp as number };
         return serveArtifact(meta, filePath, request, env);
+      }
+
+      // Root (/)
+      if (url.pathname === '/' || url.pathname === '') {
+        const isMulti = env.MULTI_TENANT === 'true';
+        let artifactCount = 0;
+        try {
+          const countRow = await env.TOSS_DB.prepare('SELECT COUNT(*) as c FROM artifacts').first<{ c: number }>();
+          artifactCount = countRow?.c || 0;
+        } catch {}
+
+        let userCount = 0;
+        if (isMulti) {
+          try {
+            const userRow = await env.TOSS_DB.prepare('SELECT COUNT(*) as c FROM users').first<{ c: number }>();
+            userCount = userRow?.c || 0;
+          } catch {}
+        }
+
+        return new Response(JSON.stringify({
+          ok: true,
+          backend: 'cloudflare',
+          mode: isMulti ? 'multi-tenant' : 'single-user',
+          artifacts: artifactCount,
+          users: isMulti ? userCount : undefined,
+          version: '0.1.0',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
 
       return new Response('Not found', { status: 404 });

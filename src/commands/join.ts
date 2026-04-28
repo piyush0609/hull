@@ -24,7 +24,10 @@ export async function joinCommand(endpoint: string, options: { token: string; pr
   }
 
   // Extract subdomain from endpoint for config
-  const subdomainMatch = url.match(/toss-([a-z0-9-]+)\./);
+  const hostMatch = url.match(/https?:\/\/([^\/]+)/);
+  const host = hostMatch ? hostMatch[1] : '';
+  // Use the first segment of the hostname as subdomain hint
+  const subdomainMatch = host.match(/^([a-z0-9-]+)\./);
   const subdomain = subdomainMatch ? subdomainMatch[1] : 'shared';
 
   await saveConfig({

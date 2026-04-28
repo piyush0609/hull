@@ -18,9 +18,12 @@ export interface TossConfig {
   endpoint: string;
   ownerToken: string;
   subdomain: string;
+  backend?: 'cloudflare' | 'vercel';
   kvId?: string;
   accountId?: string;
   apiToken?: string;
+  vercelProjectId?: string;
+  vercelTeamId?: string;
 }
 
 interface ProfilesData {

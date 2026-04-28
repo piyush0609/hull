@@ -23,7 +23,7 @@ export async function destroyCommand(options: { profile?: string } = {}) {
   console.log(`Destroying toss (${subdomain || 'unknown'})...\n`);
 
   const workerDir = join(process.env.HOME || '.', '.toss', 'worker');
-  const dbName = subdomain ? `toss-db-${subdomain}` : 'toss-db';
+  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
 
   // Build env with profile API token if available
   const env: NodeJS.ProcessEnv = { ...process.env };
