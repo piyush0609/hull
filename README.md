@@ -1,10 +1,10 @@
 # toss
 
-Share HTML artifacts with access-controlled links. Self-hosted on Cloudflare's free tier — no credit card required.
+Share HTML artifacts with access-controlled links. Self-hosted on **Cloudflare** or **Vercel** — your choice.
 
 ```
 toss share ./report.html --expires 24h
-# → https://toss-you.piyush-sinha.workers.dev/a/abc123?t=eyJ...
+# → https://your-domain.com/s/report-AbC1
 ```
 
 ## Install
@@ -17,27 +17,20 @@ The installer detects your OS/arch, downloads the latest binary from [GitHub Rel
 
 **Note:** `npm install -g toss-cli` is not yet available. Use the install script or build from source.
 
-**Requirements for deploy:**
-- Node.js 18+ (for Wrangler CLI)
-- [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (installed automatically by `toss setup`)
-- A Cloudflare account with a [workers.dev subdomain](https://dash.cloudflare.com/workers/onboarding)
+---
 
-> **Note:** `toss deploy` calls Wrangler, which requires Node.js. The toss binary itself has no runtime dependencies.
+## Backends
 
-## Before You Start
+| Backend | Stack | Best For |
+|---------|-------|----------|
+| **Cloudflare** | Workers + D1 + KV | Free tier, no credit card |
+| **Vercel** | Edge Function + Neon + Blob | Postgres-native, larger files |
 
-If you already have a Cloudflare account with a workers.dev subdomain, skip to [Quick Start](#quick-start).
+Switch backends with `toss deploy --backend cloudflare` or `toss deploy --backend vercel`.
 
-**New to Cloudflare? Do this first (in a browser tab):**
+---
 
-1. **Sign up** at https://dash.cloudflare.com/sign-up
-2. **Verify your email** (check inbox for confirmation)
-3. **Complete onboarding** — accept terms of service in the dashboard
-4. **Register a workers.dev subdomain** at https://dash.cloudflare.com/workers/onboarding
-
-> ⚠️ `toss setup` will fail if you haven't completed Cloudflare onboarding. The OAuth flow requires an active, verified account.
-
-## Quick Start
+## Quick Start (Cloudflare)
 
 ### 1. Set up prerequisites
 
@@ -45,87 +38,189 @@ If you already have a Cloudflare account with a workers.dev subdomain, skip to [
 toss setup
 ```
 
-This interactive command:
 - Checks Node.js version
 - Installs Wrangler if missing
 - Authenticates with Cloudflare (browser OAuth or API token)
 - Verifies your workers.dev subdomain
 
-**Multi-account users:** If you have multiple Cloudflare accounts, `toss setup` handles them automatically — it extracts the account ID and passes it to all Wrangler commands.
-
-**Login options:**
-- **Browser login** — Opens Cloudflare OAuth with minimal scopes. Use incognito/private mode to switch accounts.
-- **API token** — Paste a token from https://dash.cloudflare.com/profile/api-tokens. Best for CI and account switching.
-
-### 2. Deploy your toss
+### 2. Deploy
 
 ```bash
 toss deploy
 # Choose a subdomain, e.g. "you"
 ```
 
-This creates:
+Creates:
 - A Cloudflare Worker (`toss-you`)
-- A D1 database (`toss-db-you`) for metadata
-- A KV namespace (`toss-kv-you`) for file storage
+- A D1 database (`toss-db-you`)
+- A KV namespace (`toss-kv-you`)
 
-### 3. Share a file
+### 3. Share
 
 ```bash
 toss share ./index.html --expires 24h
 ```
 
-Options:
-- `--expires 1h|24h|7d|30d` — link lifetime (required)
-- `--clipboard` — copy link to clipboard
-- `--json` — output JSON
+---
 
-### 4. Share a folder
+## Quick Start (Vercel)
+
+### 1. Set up prerequisites
+
+```bash
+toss setup --backend vercel
+```
+
+- Checks Node.js and Vercel CLI
+- Authenticates with Vercel
+
+### 2. Deploy
+
+```bash
+toss deploy --backend vercel
+```
+
+Auto-provisions:
+- Vercel project
+- Neon Postgres database
+- Vercel Blob store
+
+### 3. Add a custom domain (optional)
+
+```bash
+# In Vercel dashboard: Project → Settings → Domains
+# Then update toss config:
+toss endpoint https://share.yourdomain.com
+```
+
+---
+
+## Sharing
+
+### Basic share
+
+```bash
+toss share ./report.html --expires 24h
+```
+
+### Password-protected
+
+```bash
+toss share ./report.html --expires 7d --password
+# Secure interactive prompt (hidden input)
+```
+
+### Folder share
 
 ```bash
 toss share ./my-site --expires 7d
 ```
 
-Uploads all files recursively. The first `index.html` found (or first `.html`) becomes the entry point. All other files are served as static assets with proper MIME types and cookie-based auth.
+Uploads all files recursively. First `index.html` (or first `.html`) becomes the entry point. All other files are served as static assets with proper MIME types and cookie-based auth.
 
-### 5. Manage artifacts
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--expires 1h\|24h\|7d\|30d` | Link lifetime (required) |
+| `--password` | Password-protect (secure prompt) |
+| `--password <value>` | Password via CLI (visible in history) |
+| `--clipboard` | Copy link to clipboard |
+| `--json` | Output JSON |
+| `--profile <name>` | Use a specific profile |
+
+---
+
+## Management Commands
 
 ```bash
-toss list          # Show all shared artifacts
-toss revoke <id>   # Delete an artifact
-toss info          # Show endpoint, subdomain, artifact count
-toss destroy       # Tear down everything
+toss list                    # Show all shared artifacts
+toss revoke <slug>           # Delete an artifact
+toss info                    # Show endpoint, count, backend
+toss destroy                 # Tear down everything
+toss doctor                  # Check prerequisites
 ```
 
-### 6. Install AI assistant skill (optional)
+---
+
+## Profiles
+
+Manage multiple deployments (personal, work, client, tenant).
 
 ```bash
-toss skill install --all        # Auto-detect and install to all editors
-toss skill install claude-code  # Or install for a specific tool
-toss skill list                 # Check what's installed
-toss skill update               # Update to latest
+toss profile list                        # List all profiles
+toss profile switch work                 # Switch active profile
+toss profile default work                # Set active profile
+toss share ./file.html --profile work    # One-off profile use
 ```
 
-Supported: `claude-code`, `cursor`, `codex`, `kimi`, `opencode`, `cline`, `gemini`, `agents`. The `agents` path is cross-compatible — Kimi, Gemini CLI, and Codex all read it.
+**Storage:**
+- `~/.toss/config.json` — default profile
+- `~/.toss/profiles.json` — named profiles + active marker
+
+---
+
+## Multi-Tenant Team Mode
+
+Enable during `toss deploy` by selecting "Multi-tenant team".
+
+**Admin commands:**
+```bash
+toss token create --label "alice"        # Create a tenant token
+toss token list                          # List all tokens
+toss token revoke <hash>                 # Revoke a token
+toss token rotate                        # Regenerate admin token
+```
+
+**Tenant onboarding:**
+```bash
+# Admin creates token, sends to teammate
+toss token create --label "alice"
+
+# Teammate joins
+toss join https://your-domain.com --token <their-token> --profile alice
+
+# Or manually create a profile:
+toss profile switch alice
+toss endpoint https://your-domain.com
+toss token <their-token>
+```
+
+**Tenant isolation:**
+- Tenants can only see/upload/revoke their own artifacts
+- Admins see all artifacts across all tenants
+- Each artifact is tagged with the uploader's token hash
+
+---
 
 ## How It Works
 
+### Cloudflare
+
 | Component | Purpose |
 |-----------|---------|
-| **Cloudflare Worker** | Edge compute — upload, serve, list, delete |
-| **D1** | SQLite metadata (id, name, size, expiry) |
+| **Worker** | Edge compute — upload, serve, list, delete |
+| **D1** | SQLite metadata (id, slug, name, size, expiry) |
 | **KV** | File storage (25MB/value limit) |
-| **JWT** | Share links are self-contained signed tokens with expiry |
+
+### Vercel
+
+| Component | Purpose |
+|-----------|---------|
+| **Edge Function** | Edge compute — upload, serve, list, delete |
+| **Neon** | Postgres metadata (id, slug, name, size, expiry) |
+| **Blob** | File storage via REST API |
 
 ### Auth Model
 
-- **Upload** — hex owner token (stored in `~/.toss/config.json`)
-- **Share links** — HS256 JWT with `sub` (artifact ID) and `exp` (expiry)
-- **Folder sub-files** — HttpOnly cookie scoped to `/a/{id}` set on first HTML load
+- **Upload** — hex owner token (stored in `~/.toss/config.json`, chmod 600)
+- **Share links** — Short slug URLs (`/s/:slug`) with optional password
+- **Legacy links** — HS256 JWT with `sub` (artifact ID) and `exp` (expiry)
+- **Passwords** — SHA-256 hashed with artifact ID as salt
+- **Folder sub-files** — HttpOnly cookie scoped to `/s/:slug`
 
 ### Security Headers
 
-Served HTML includes:
 - `Content-Security-Policy` — strict CSP for React apps
 - `X-Content-Type-Options: nosniff`
 - `Referrer-Policy: no-referrer`
@@ -133,19 +228,7 @@ Served HTML includes:
 
 Static assets get `Cache-Control: public, max-age=86400, immutable`.
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `toss setup` | One-time setup: install wrangler, login, verify subdomain |
-| `toss deploy` | Deploy infrastructure to Cloudflare |
-| `toss share <file> --expires <duration>` | Share an HTML file or folder |
-| `toss list` | List all artifacts with expiry status |
-| `toss revoke <id>` | Permanently delete an artifact |
-| `toss info` | Show endpoint, subdomain, KV ID, artifact count |
-| `toss destroy` | Delete worker, D1, KV, and local config |
-| `toss doctor` | Check prerequisites (read-only diagnostic) |
-| `toss skill install [tool]` | Install AI assistant skill for editor integration |
+---
 
 ## Configuration
 
@@ -153,18 +236,24 @@ Stored in `~/.toss/config.json`:
 
 ```json
 {
-  "endpoint": "https://toss-you.piyush-sinha.workers.dev",
+  "endpoint": "https://your-domain.com",
   "ownerToken": "...",
   "subdomain": "you",
-  "kvId": "..."
+  "backend": "vercel",
+  "vercelProjectId": "..."
 }
 ```
 
+---
+
 ## Limitations
 
-- **25MB total per upload** (Cloudflare KV limit)
-- **KV eventual consistency** — newly shared links may 404 for 1–60 seconds in some regions
-- **No background cleanup** — expired artifacts stay in KV/D1 until revoked or destroyed
+- **25MB total per upload** (Cloudflare KV / Vercel Blob limit)
+- **Max expiry 30d**
+- **No background cleanup** — expired artifacts stay in storage until revoked or destroyed
+- Cloudflare KV has eventual consistency (1–60s delay in some regions)
+
+---
 
 ## Development
 
