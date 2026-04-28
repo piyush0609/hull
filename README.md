@@ -17,6 +17,8 @@ The installer detects your OS/arch, downloads the latest binary from [GitHub Rel
 
 **Note:** `npm install -g toss-cli` is not yet available. Use the install script or build from source.
 
+If `~/.claude/skills/` (Claude Code) or `~/.agents/skills/` (Codex/generic) exists, the installer also drops `SKILL.md` into it so any AI agent can guide you through setup, sharing, and tenant onboarding. Opt out with `TOSS_SKIP_SKILL=1 curl ... | sh`.
+
 ---
 
 ## Backends

@@ -9,6 +9,27 @@ REPO="piyush0609/toss"
 VERSION="${VERSION:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
+# Drop SKILL.md into known agent harness dirs (Claude Code, Codex/generic)
+# only when the parent dir already exists. Set TOSS_SKIP_SKILL=1 to opt out.
+install_skill() {
+  src="$1"
+  [ "$TOSS_SKIP_SKILL" = "1" ] && return 0
+  [ -f "$src" ] || return 0
+
+  installed=""
+  for parent in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+    if [ -d "$parent" ]; then
+      mkdir -p "$parent/toss"
+      cp "$src" "$parent/toss/SKILL.md"
+      installed="$installed $parent/toss"
+    fi
+  done
+
+  if [ -n "$installed" ]; then
+    echo "✅ Agent skill installed at:$installed"
+  fi
+}
+
 # Detect OS
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$OS" in
@@ -87,6 +108,8 @@ EOF
       echo "   Restart your terminal or run: source $PROFILE"
     fi
 
+    install_skill "$SRC_DIR/SKILL.md"
+
     echo ""
     echo "✅ toss installed from source (~100KB download)"
     echo "   toss doctor    # Check prerequisites"
@@ -141,6 +164,12 @@ if [ -n "$VERSION" ]; then
         echo "✅ Added $USER_BIN to PATH in $PROFILE"
         echo "   Restart your terminal or run: source $PROFILE"
       fi
+    fi
+
+    SKILL_TMP="/tmp/toss-SKILL-$$.md"
+    if $FETCH "https://raw.githubusercontent.com/$REPO/main/SKILL.md" > "$SKILL_TMP" 2>/dev/null; then
+      install_skill "$SKILL_TMP"
+      rm -f "$SKILL_TMP"
     fi
 
     echo ""

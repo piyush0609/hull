@@ -1,19 +1,12 @@
-# Toss CLI Skill
+---
+name: toss
+description: Use when sharing HTML files, folders, reports, demos, or static sites with expiring links — or when the user mentions toss, self-hosted artifact sharing, or commands like `toss share`, `toss deploy`, `toss setup`, `toss list`, `toss revoke`, `toss profile`, `toss token`, `toss join`. Covers Cloudflare Workers and Vercel Edge backends, multi-tenant teams, password-protected shares, profile switching across deployments, and custom domains. Trigger when user asks how to share an HTML file/folder with an expiry, set up a self-hosted share service, or onboard teammates to a shared toss instance.
+license: MIT
+---
+
+# Toss CLI
 
 Self-host HTML artifact sharing on Cloudflare or Vercel. Generate time-expiring links for HTML files and folders. No third-party service required.
-
----
-
-name: toss-cli
-description: Deploy and manage a self-hosted HTML sharing service on Cloudflare Workers or Vercel Edge Functions. Share HTML files or folders with time-controlled links via CLI. Ideal for sharing reports, demos, prototypes, and static sites with expiry.
-license: MIT
-compatibility: macOS, Linux, Windows. Cloudflare or Vercel account required.
-metadata:
-  author: Toss
-  version: "0.1.0"
-  requires: ["node"]
-
----
 
 ## Overview
 
@@ -30,42 +23,104 @@ Toss deploys a complete sharing infrastructure to your chosen backend:
 - **Blob Storage** — File storage via REST API
 
 Shared features:
-- **Short Share URLs** — Human-readable slugs like `q4-report-Q7x9`
-- **Password Protection** — SHA-256 hashed passwords with session cookie auth
-- **Multi-Tenant Mode** — Per-user tokens with admin/user roles
-- **Custom Domains** — Point any domain at your toss instance
-- **Profile System** — Switch between multiple deployments and tenants
+- **Short share URLs** — Human-readable slugs like `q4-report-Q7x9`
+- **Password protection** — SHA-256 hashed with session cookie auth
+- **Multi-tenant mode** — Per-user tokens with admin/user roles
+- **Custom domains** — Point any domain at your toss instance
+- **Profile system** — Switch between multiple deployments and tenants
 
-## When to Use This Skill
+## When to Use
 
 Use toss when:
 
 - Sharing HTML reports, demos, or prototypes with controlled expiry
 - Sharing folders containing static sites (HTML + CSS + JS + assets)
-- Needing self-hosted sharing without relying on third-party services
+- Needing self-hosted sharing without third-party services
 - Working in environments where data residency matters
-- Sharing content that should auto-expire (1h to 30d)
+- Auto-expiring content (1h to 30d)
 - Password-protecting sensitive shared content
 - Running a team sharing service with per-user access control
 - Wanting a custom domain for shared links
 
 Don't use when:
-- You need permanent/long-term hosting (toss max expiry is 30d)
-- You're sharing files larger than 25MB total
+- You need permanent/long-term hosting (max expiry 30d)
+- Files exceed 25MB total
 - You need real-time collaboration or editing
 
-## Prerequisites
+## Onboarding Flow
 
-1. A Cloudflare account (for Cloudflare backend) or Vercel account (for Vercel backend)
-2. Node.js 18+
+When the user wants to use toss, **detect state first, ask only what's unknown**. Never assume install state or jump straight to questions a probe could answer. Walk these steps in order.
 
-## Install
+### Step 1 — Is toss installed?
 
+Probe:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
+command -v toss && toss --version
 ```
 
-## Interactive Setup
+- **Not installed** → install it, then continue:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
+  ```
+  Verifies Node.js 18+ and falls back to standalone binary if Node is missing.
+- **Installed** → continue.
+
+### Step 2 — Is there existing config?
+
+Probe:
+```bash
+toss profile list 2>/dev/null
+toss info 2>/dev/null
+```
+
+- **No profiles / no config** → first-time user. Go to Step 3.
+- **Has profiles** → the user already has at least one toss instance configured. Show them what exists and ask what they want to do:
+  - "Use existing profile `<name>` to share something?" → skip ahead to **Share**.
+  - "Add another profile (different deployment, different tenant)?" → Step 3.
+  - "Switch backends or rebuild?" → `toss destroy` first (confirm with user), then Step 3.
+
+### Step 3 — Owner or tenant?
+
+> "Are you setting up your own toss instance, or joining one a teammate already deployed?"
+
+| Answer | What you need from the user | Next |
+|--------|------------------------------|------|
+| **Tenant** (joining) | endpoint URL + access token + a local profile name | Step 4a |
+| **Owner** (own setup) | which backend (Cloudflare or Vercel) | Step 4b |
+
+### Step 4a — Tenant onboarding
+
+Confirm you have:
+- **Endpoint URL** (e.g. `https://share.company.com`)
+- **Access token** (provided by the owner via `toss token create`)
+- **Local profile name** (e.g. `work`, `alice`)
+
+Run:
+```bash
+toss join <endpoint-url> --token <token> --profile <name>
+```
+
+Done. The user can now `toss share`, `toss list`, etc. against that instance.
+
+### Step 4b — Owner onboarding
+
+**Pick a backend:**
+
+| Backend | Storage | Required account | Setup + deploy |
+|---------|---------|------------------|----------------|
+| **Cloudflare** (default) | D1 + KV | Cloudflare + workers.dev subdomain | `toss setup` → `toss deploy` |
+| **Vercel** | Neon Postgres + Blob | Vercel | `toss setup --backend vercel` → `toss deploy --backend vercel` |
+
+`toss setup` is interactive: installs missing CLIs (Wrangler / Vercel CLI), authenticates, verifies prerequisites. It can run `toss deploy` immediately after.
+
+**During `toss deploy`, the user picks a deployment mode:**
+
+- **Single-user** — personal use, one owner token.
+- **Multi-tenant team** — admin issues per-user tokens; each tenant only sees their own artifacts. Pick this if teammates will share the instance.
+
+After deploy: the owner can hand out tokens with `toss token create --label <name>`, and teammates onboard via the **tenant path (Step 4a)**.
+
+## Setup
 
 ### Cloudflare
 
@@ -80,8 +135,8 @@ toss setup
 - Optionally runs `toss deploy` immediately after
 
 **Login methods:**
-- **Browser login** — Opens Cloudflare OAuth. Use incognito/private mode to switch accounts.
-- **API token** — Paste a token from https://dash.cloudflare.com/profile/api-tokens. No browser needed.
+- **Browser** — Opens Cloudflare OAuth. Use incognito to switch accounts.
+- **API token** — Paste a token from https://dash.cloudflare.com/profile/api-tokens.
 
 ### Vercel
 
@@ -89,8 +144,7 @@ toss setup
 toss setup --backend vercel
 ```
 
-- Checks Node.js and Vercel CLI
-- Authenticates with Vercel
+Checks Node.js and Vercel CLI, then authenticates.
 
 ## Deploy
 
@@ -100,33 +154,23 @@ toss setup --backend vercel
 toss deploy
 ```
 
-Interactive prompts walk you through:
+Interactive prompts:
 
-**Profile selection:**
 ```
 Existing profiles:
   default
   work
 Use an existing profile? (Y/n):
-```
 
-**Deployment mode:**
-```
 Deployment mode:
   1. Single-user (personal use)
   2. Multi-tenant team (shared with teammates)
 Select: 1
-```
 
-**Subdomain:**
-```
 Choose a subdomain (e.g., yourname): yourname
 ```
 
-Creates:
-- A Cloudflare Worker (`toss-you`)
-- A D1 database (`toss-db-you`)
-- A KV namespace (`toss-kv-you`)
+Creates: a Worker (`toss-you`), a D1 database (`toss-db-you`), a KV namespace (`toss-kv-you`).
 
 ### Vercel
 
@@ -134,12 +178,7 @@ Creates:
 toss deploy --backend vercel
 ```
 
-Auto-provisions:
-- Vercel project
-- Neon Postgres database
-- Vercel Blob store
-- Sets environment variables
-- Runs database migrations
+Auto-provisions a Vercel project, Neon Postgres database, Vercel Blob store, env vars, and runs migrations.
 
 ## Share
 
@@ -147,7 +186,7 @@ Auto-provisions:
 # Basic share
 toss share ./index.html --expires 24h
 
-# Password-protected share (secure interactive prompt)
+# Password-protected (secure interactive prompt)
 toss share ./report.html --expires 7d --password
 
 # Password via CLI (visible in shell history — not recommended)
@@ -158,8 +197,8 @@ toss share ./file.html --expires 24h --profile work
 ```
 
 **Password security:**
-- Use `--password` (no value) for a secure interactive prompt. Characters are hidden with `*`.
-- Passing `--password <value>` works but warns that the password is exposed in shell history.
+- Use `--password` (no value) for an interactive prompt — characters hidden with `*`.
+- Passing `--password <value>` works but exposes the password in shell history.
 - Passwords are SHA-256 hashed with the artifact ID as salt before storage.
 - Recipients enter the password on a web form; a session cookie grants access for the link's lifetime.
 
@@ -172,35 +211,24 @@ toss info
 toss destroy
 ```
 
-## Profile System
+## Profiles
 
-Profiles let you manage multiple toss deployments (personal, work, client projects, tenants, etc.).
+Profiles let you manage multiple toss deployments (personal, work, client projects, tenants).
 
 ```bash
-# List all profiles
 toss profile list
-
-# Show current active profile
 toss profile show
-
-# Switch active profile
 toss profile switch work
-
-# Set active profile (alias for switch)
 toss profile default work
-
-# Rename a profile
 toss profile rename old-name new-name
-
-# Delete a profile
 toss profile delete work
 ```
 
-**Profile storage:**
+**Storage:**
 - `~/.toss/config.json` — default profile
 - `~/.toss/profiles.json` — named profiles + active marker
 
-**Multi-account deploy:** Each profile stores its own endpoint and token. Use `--profile` on any command to target a specific deployment without switching:
+**Per-command targeting:** Use `--profile <name>` on any command without switching:
 
 ```bash
 toss deploy --profile work
@@ -210,25 +238,18 @@ toss list --profile tenant-alice
 
 ## Multi-Tenant Team Mode
 
-Enable during `toss deploy` by selecting "Multi-tenant team". This adds:
+Enable during `toss deploy` by selecting "Multi-tenant team". Adds:
 
 - Per-user upload tokens stored in the database
-- Artifact ownership (users can only see/delete their own uploads)
+- Artifact ownership (users see/delete only their own uploads)
 - Admin vs user roles
 - Token isolation at the database level
 
 **Admin commands:**
 ```bash
-# Create a token for a teammate
 toss token create --label "alice"
-
-# List all tokens
 toss token list
-
-# Revoke a token
 toss token revoke <hash>
-
-# Regenerate admin token
 toss token rotate
 ```
 
@@ -237,7 +258,7 @@ toss token rotate
 # Option 1: Join command
 toss join https://your-domain.com --token <their-token> --profile alice
 
-# Option 2: Manual profile setup
+# Option 2: Manual setup
 toss profile switch alice
 toss endpoint https://your-domain.com
 toss token <their-token>
@@ -245,23 +266,18 @@ toss token <their-token>
 
 **Tenant testing:**
 ```bash
-# Share as tenant
 toss share ./file.html --expires 24h --profile alice
-
-# List only tenant's artifacts
-toss list --profile alice
-
-# Admin sees all artifacts
-toss list --profile default
+toss list --profile alice          # only tenant's artifacts
+toss list --profile default        # admin sees all
 ```
 
 ## Custom Domains
 
-1. Add your domain in the Vercel/Cloudflare dashboard
-2. Update toss config:
-```bash
-toss endpoint https://share.yourdomain.com
-```
+1. Add your domain in the Cloudflare/Vercel dashboard
+2. Point toss at it:
+   ```bash
+   toss endpoint https://share.yourdomain.com
+   ```
 3. All future shares use the custom domain
 
 ## Commands
@@ -293,14 +309,14 @@ toss endpoint https://share.yourdomain.com
 
 ## Security Model
 
-- **Upload** — hex owner token stored in `~/.toss/config.json` (chmod 600)
-- **Share links** — Short slug URLs (`/s/:slug`) with optional password protection
+- **Upload** — hex owner token in `~/.toss/config.json` (chmod 600)
+- **Share links** — Short slug URLs (`/s/:slug`) with optional password
 - **Legacy links** — HS256 JWT with `sub` (artifact ID) and `exp` (expiry)
-- **Passwords** — SHA-256(password + artifact.id) hashing, no plaintext storage
+- **Passwords** — SHA-256(password + artifact.id), no plaintext storage
 - **Folder sub-files** — HttpOnly cookie scoped to `/s/:slug`
-- **Token comparison** — Constant-time comparison to prevent timing attacks
+- **Token comparison** — Constant-time, prevents timing attacks
 - **Path traversal** — Validated on serve route
-- **Size limits** — 25MB enforced on the server side
+- **Size limits** — 25MB enforced server-side
 - **Multi-tenant** — Token hash isolation in database queries
 
 ## Limitations
@@ -312,49 +328,37 @@ toss endpoint https://share.yourdomain.com
 
 ## Example Workflows
 
-### Share a generated report
-
+**Share a generated report**
 ```bash
 node generate-report.js > report.html
 toss share ./report.html --expires 24h --clipboard
 ```
 
-### Share a React build folder
-
+**Share a React build folder**
 ```bash
 npm run build
 toss share ./dist --expires 7d
 ```
 
-### Password-protect a sensitive report
-
+**Password-protect a sensitive report**
 ```bash
 toss share ./financial-report.html --expires 7d --password
-# Enter password securely (hidden input)
 ```
 
-### CI integration
-
+**CI integration**
 ```bash
 toss share ./coverage-report/index.html --expires 1d --json | jq -r '.url'
 ```
 
-### Deploy to work account
-
+**Deploy to work account**
 ```bash
 toss deploy --profile work
 ```
 
-### Create a tenant token
-
+**Create a tenant token + onboard teammate**
 ```bash
 toss token create --label "alice"
 # → token: abc123...
-```
-
-### Teammate joins with token
-
-```bash
 toss join https://share.company.com --token abc123... --profile alice
 ```
 
