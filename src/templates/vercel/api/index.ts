@@ -244,7 +244,8 @@ interface ArtifactMeta {
 }
 
 async function serveArtifact(meta: ArtifactMeta, filePath: string, request: Request): Promise<Response> {
-  if (meta.expires_at < Math.floor(Date.now() / 1000)) {
+  // expires_at = 0 means permanent (never expires).
+  if (meta.expires_at > 0 && meta.expires_at < Math.floor(Date.now() / 1000)) {
     return new Response('Link expired', { status: 410 });
   }
 
@@ -269,7 +270,10 @@ async function serveArtifact(meta: ArtifactMeta, filePath: string, request: Requ
   };
 
   if (filePath.endsWith('.html')) {
-    const maxAge = Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
+    // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
+    const maxAge = meta.expires_at === 0
+      ? 30 * 86400
+      : Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
     headers['Cache-Control'] = 'private, no-store, max-age=0';
