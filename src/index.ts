@@ -1,16 +1,10 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { deployCommand } from './commands/deploy.js';
-import { deployVercelCommand } from './commands/deploy-vercel.js';
 import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
-import { destroyCommand } from './commands/destroy.js';
-import { destroyVercelCommand } from './commands/destroy-vercel.js';
 import { doctorCommand } from './commands/doctor.js';
 import { infoCommand } from './commands/info.js';
-import { setupCommand } from './commands/setup.js';
-import { setupVercelCommand } from './commands/setup-vercel.js';
 import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
 import { tokenCreateCommand, tokenListCommand, tokenRevokeCommand, tokenRotateCommand } from './commands/token.js';
 import { joinCommand } from './commands/join.js';
@@ -19,32 +13,26 @@ import { loadConfig } from './lib/config.js';
 import { whoamiCommand } from './commands/whoami.js';
 import { membersListCommand } from './commands/members.js';
 import { cleanupCommand } from './commands/cleanup.js';
+import { getBackendStrategy, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-strategy.js';
 
 async function routeDeploy(options: any) {
-  const backend = options.backend || (await loadConfig(options.profile))?.backend || 'cloudflare';
-  if (backend === 'vercel') {
-    await deployVercelCommand(options);
-  } else {
-    await deployCommand(options);
-  }
+  const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
+  await getBackendStrategy(backend).deploy({ ...options, backend });
 }
 
 async function routeSetup(options: any) {
-  const backend = options.backend || 'cloudflare';
-  if (backend === 'vercel') {
-    await setupVercelCommand(options);
-  } else {
-    await setupCommand(options);
-  }
+  const profileBackend = (await loadConfig(options.profile))?.backend;
+  const backend = await resolveBackendForSetup({
+    requestedBackend: options.backend,
+    profileBackend,
+    promptOnMissing: process.stdin.isTTY && !options.yes,
+  });
+  await getBackendStrategy(backend).setup({ ...options, backend });
 }
 
 async function routeDestroy(options: any) {
-  const backend = options.backend || (await loadConfig(options.profile))?.backend || 'cloudflare';
-  if (backend === 'vercel') {
-    await destroyVercelCommand(options);
-  } else {
-    await destroyCommand(options);
-  }
+  const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
+  await getBackendStrategy(backend).destroy({ ...options, backend });
 }
 
 type PublishOptions = {
@@ -243,7 +231,7 @@ admin
   .option('--multi-tenant', 'Enable multi-user team mode')
   .option('--profile <name>', 'Deploy to a specific profile')
   .option('--subdomain <name>', 'Deployment suffix (overrides TOSS_SUBDOMAIN env)')
-  .option('--backend <backend>', 'Deployment backend: cloudflare or vercel', 'cloudflare')
+  .option('--backend <backend>', 'Deployment backend: cloudflare or vercel')
   .option('--postgres-url <url>', 'Postgres connection string (Vercel only)')
   .option('--blob-token <token>', 'Vercel Blob read-write token (Vercel only)')
   .option('-y, --yes', 'Skip interactive prompts')
@@ -255,7 +243,7 @@ admin
   .option('--profile <name>', 'Configure auth for a specific profile')
   .option('--subdomain <name>', 'Set the deployment suffix (overrides TOSS_SUBDOMAIN env)')
   .option('-y, --yes', 'Auto-accept defaults (non-interactive)')
-  .option('--backend <backend>', 'Target backend: cloudflare or vercel', 'cloudflare')
+  .option('--backend <backend>', 'Target backend: cloudflare or vercel')
   .action((...args) => routeSetup(getCommandOptions(args, ['profile', 'subdomain', 'yes', 'backend'])));
 
 admin
@@ -344,7 +332,7 @@ program
   .option('--multi-tenant')
   .option('--profile <name>')
   .option('--subdomain <name>')
-  .option('--backend <backend>', 'Deployment backend: cloudflare or vercel', 'cloudflare')
+  .option('--backend <backend>', 'Deployment backend: cloudflare or vercel')
   .option('--postgres-url <url>')
   .option('--blob-token <token>')
   .option('-y, --yes')
@@ -355,7 +343,7 @@ program
   .option('--profile <name>')
   .option('--subdomain <name>')
   .option('-y, --yes')
-  .option('--backend <backend>', 'Target backend: cloudflare or vercel', 'cloudflare')
+  .option('--backend <backend>', 'Target backend: cloudflare or vercel')
   .action(routeSetup);
 
 program
