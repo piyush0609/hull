@@ -81,15 +81,13 @@ function generateId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function generateSlug(name: string): string {
-  const base = name
-    .replace(/\.html?$/i, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 30);
-  const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
-  return `${base || 'share'}-${suffix}`;
+// Opaque random slug — 8 chars of [a-z0-9]. Never derived from the user's
+// filename or path (those leak local structure into the public URL).
+function generateSlug(): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let s = '';
+  for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
 }
 
 // --- MIME ---
@@ -250,7 +248,7 @@ export default {
         }
 
         const id = generateId();
-        const slug = generateSlug(name);
+        const slug = generateSlug();
         const html = await request.text();
 
         const passwordParam = url.searchParams.get('password');

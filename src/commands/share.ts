@@ -1,6 +1,6 @@
 import { readFile, stat, readdir, lstat } from 'fs/promises';
 import { spawn } from 'child_process';
-import { join, relative } from 'path';
+import { basename, join, relative } from 'path';
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 import { promptPassword } from '../lib/prompt.js';
@@ -126,8 +126,11 @@ export async function shareCommand(file: string, options: { expires: string; cli
     let entryFile = htmlFiles.find(f => f.endsWith('/index.html') || f.endsWith('\\index.html'));
     if (!entryFile) entryFile = htmlFiles[0];
 
-    // Upload entry point to create artifact
-    const entryName = relative(file, entryFile).replace(/^\.\//, '');
+    // Upload entry point to create artifact.
+    // We send the *folder* basename as the display name (not the entry HTML's
+    // relative path) so `toss list` shows a meaningful identifier and we don't
+    // leak the user's local path/structure.
+    const entryName = basename(file);
     const entryHtml = await readFile(entryFile);
     try {
       result = await api.upload(entryHtml, entryName, expires, password);
@@ -163,7 +166,8 @@ export async function shareCommand(file: string, options: { expires: string; cli
       console.error(`Error: Could not read file "${file}"`);
       process.exit(1);
     }
-    const name = file.replace(/^\.\//, '');
+    // Send only the basename — never the user's full local path.
+    const name = basename(file);
     try {
       result = await api.upload(html, name, expires, password);
     } catch (err) {
