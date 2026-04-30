@@ -15,26 +15,26 @@ export type BackendActionOptions = {
   [key: string]: unknown;
 };
 
-export interface BackendStrategy {
+export interface BackendHandler {
   name: BackendName;
   setup(options: BackendActionOptions): Promise<void>;
   deploy(options: BackendActionOptions): Promise<void>;
   destroy(options: BackendActionOptions): Promise<void>;
 }
 
-type StrategyDeps = {
-  cloudflare: Omit<BackendStrategy, 'name'>;
-  vercel: Omit<BackendStrategy, 'name'>;
+type HandlerDeps = {
+  cloudflare: Omit<BackendHandler, 'name'>;
+  vercel: Omit<BackendHandler, 'name'>;
 };
 
-export function createBackendStrategies(deps: StrategyDeps): Record<BackendName, BackendStrategy> {
+export function createBackendHandlers(deps: HandlerDeps): Record<BackendName, BackendHandler> {
   return {
     cloudflare: { name: 'cloudflare', ...deps.cloudflare },
     vercel: { name: 'vercel', ...deps.vercel },
   };
 }
 
-const backendStrategies = createBackendStrategies({
+const backendHandlers = createBackendHandlers({
   cloudflare: {
     setup: setupCommand,
     deploy: deployCommand,
@@ -57,8 +57,8 @@ export function normalizeBackendName(value?: string): BackendName | undefined {
   return isBackendName(normalized) ? normalized : undefined;
 }
 
-export function getBackendStrategy(name: BackendName): BackendStrategy {
-  return backendStrategies[name];
+export function getBackendHandler(name: BackendName): BackendHandler {
+  return backendHandlers[name];
 }
 
 export function resolveBackendForCommand(requestedBackend?: string, profileBackend?: string): BackendName {

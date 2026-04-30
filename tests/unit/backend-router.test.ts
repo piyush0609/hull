@@ -6,19 +6,19 @@ vi.mock('../../src/lib/prompt.js', () => ({
 
 import { promptSelect } from '../../src/lib/prompt.js';
 import {
-  createBackendStrategies,
-  getBackendStrategy,
+  createBackendHandlers,
+  getBackendHandler,
   resolveBackendForCommand,
   resolveBackendForSetup,
-} from '../../src/lib/backend-strategy.js';
+} from '../../src/lib/backend-router.js';
 
-describe('Backend Strategy', () => {
+describe('Backend Router', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('should create backend strategies with names', () => {
-    const strategies = createBackendStrategies({
+  it('should create backend handlers with names', () => {
+    const handlers = createBackendHandlers({
       cloudflare: {
         setup: vi.fn(),
         deploy: vi.fn(),
@@ -31,8 +31,8 @@ describe('Backend Strategy', () => {
       },
     });
 
-    expect(strategies.cloudflare.name).toBe('cloudflare');
-    expect(strategies.vercel.name).toBe('vercel');
+    expect(handlers.cloudflare.name).toBe('cloudflare');
+    expect(handlers.vercel.name).toBe('vercel');
   });
 
   it('should resolve requested backend for commands', () => {
@@ -88,8 +88,8 @@ describe('Backend Strategy', () => {
     })).resolves.toBe('cloudflare');
   });
 
-  it('should expose real backend strategies', () => {
-    expect(getBackendStrategy('cloudflare').name).toBe('cloudflare');
-    expect(getBackendStrategy('vercel').name).toBe('vercel');
+  it('should expose real backend handlers', () => {
+    expect(getBackendHandler('cloudflare').name).toBe('cloudflare');
+    expect(getBackendHandler('vercel').name).toBe('vercel');
   });
 });

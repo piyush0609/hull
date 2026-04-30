@@ -13,11 +13,11 @@ import { loadConfig } from './lib/config.js';
 import { whoamiCommand } from './commands/whoami.js';
 import { membersListCommand } from './commands/members.js';
 import { cleanupCommand } from './commands/cleanup.js';
-import { getBackendStrategy, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-strategy.js';
+import { getBackendHandler, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-router.js';
 
 async function routeDeploy(options: any) {
   const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
-  await getBackendStrategy(backend).deploy({ ...options, backend });
+  await getBackendHandler(backend).deploy({ ...options, backend });
 }
 
 async function routeSetup(options: any) {
@@ -27,12 +27,12 @@ async function routeSetup(options: any) {
     profileBackend,
     promptOnMissing: process.stdin.isTTY && !options.yes,
   });
-  await getBackendStrategy(backend).setup({ ...options, backend });
+  await getBackendHandler(backend).setup({ ...options, backend });
 }
 
 async function routeDestroy(options: any) {
   const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
-  await getBackendStrategy(backend).destroy({ ...options, backend });
+  await getBackendHandler(backend).destroy({ ...options, backend });
 }
 
 type PublishOptions = {
