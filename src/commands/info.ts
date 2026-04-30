@@ -4,7 +4,7 @@ import { TossAPI } from '../lib/api.js';
 export async function infoCommand(options: { profile?: string } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
+    console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
     process.exit(1);
   }
 
@@ -13,6 +13,7 @@ export async function infoCommand(options: { profile?: string } = {}) {
   console.log('Toss Info');
   console.log('=========');
   console.log(`Profile:   ${activeProfile || 'default'}`);
+  console.log(`Role:      ${config.role || 'owner'}`);
   console.log(`Endpoint:  ${config.endpoint}`);
   console.log(`Subdomain: ${config.subdomain}`);
   if (config.accountId) {

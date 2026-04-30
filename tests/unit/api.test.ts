@@ -3,7 +3,7 @@ import { TossAPI } from '../../src/lib/api.js';
 
 const TEST_CONFIG = {
   endpoint: 'https://toss-test.workers.dev',
-  ownerToken: 'deadbeef0123456789abcdef01234567',
+  token: 'deadbeef0123456789abcdef01234567',
   subdomain: 'test',
 };
 
@@ -35,7 +35,7 @@ describe('TossAPI', () => {
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({
-          Authorization: `Bearer ${TEST_CONFIG.ownerToken}`,
+          Authorization: `Bearer ${TEST_CONFIG.token}`,
         }),
         body: expect.any(Uint8Array),
       })
@@ -68,7 +68,7 @@ describe('TossAPI', () => {
     expect(fetch).toHaveBeenCalledWith(
       'https://toss-test.workers.dev/artifacts',
       expect.objectContaining({
-        headers: { Authorization: `Bearer ${TEST_CONFIG.ownerToken}` },
+        headers: { Authorization: `Bearer ${TEST_CONFIG.token}` },
       })
     );
   });
@@ -83,7 +83,7 @@ describe('TossAPI', () => {
       'https://toss-test.workers.dev/artifacts/abc123',
       expect.objectContaining({
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${TEST_CONFIG.ownerToken}` },
+        headers: { Authorization: `Bearer ${TEST_CONFIG.token}` },
       })
     );
   });

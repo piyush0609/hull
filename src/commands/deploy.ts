@@ -11,6 +11,12 @@ import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+function deriveDeploymentSuffix(profileName?: string, savedSubdomain?: string): string {
+  if (savedSubdomain) return savedSubdomain;
+  if (!profileName || profileName === 'default' || profileName === 'owner') return 'toss';
+  return profileName.toLowerCase().replace(/_/g, '-');
+}
+
 function generateToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return Array.from(bytes)
@@ -114,7 +120,7 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
   try {
     await execAsync('wrangler --version');
   } catch {
-    console.error('❌ Wrangler not found. Run: toss setup');
+    console.error('❌ Wrangler not found. Run: toss admin setup');
     process.exit(1);
   }
 
@@ -203,36 +209,28 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     try {
       const { stdout } = await execAsync('wrangler whoami');
       if (stdout.includes('not authenticated')) {
-        console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
+        console.error('❌ Not authenticated with Cloudflare. Run: toss admin setup');
         process.exit(1);
       }
       const match = stdout.match(/([a-f0-9]{32})/);
       if (match) accountId = match[1];
     } catch {
-      console.error('❌ Not authenticated with Cloudflare. Run: toss setup');
+      console.error('❌ Not authenticated with Cloudflare. Run: toss admin setup');
       process.exit(1);
     }
   }
 
-  // If profile already has a subdomain from setup, use it
-  const profileSubdomain = profileConfig?.subdomain;
-  if (profileSubdomain && !process.env.TOSS_SUBDOMAIN) {
-    console.log(`Using profile subdomain: ${profileSubdomain}`);
-  }
-
-  let subdomain = process.env.TOSS_SUBDOMAIN || profileSubdomain || '';
-  if (!subdomain && process.stdin.isTTY) {
-    const answer = await prompt('Choose a subdomain suffix (press Enter for default "toss"): ');
-    subdomain = answer.trim();
-  }
+  const subdomain = deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
+  console.log(`Using deployment suffix: ${subdomain}`);
 
   // Save subdomain early so destroy can find resources if deploy fails later
-  const earlyConfig = await loadConfig(profileName) || { endpoint: '', ownerToken: '', subdomain };
+  const earlyConfig = await loadConfig(profileName) || { endpoint: '', token: '', subdomain, role: 'owner' as const };
   earlyConfig.subdomain = subdomain;
+  earlyConfig.role = 'owner';
   if (accountId) earlyConfig.accountId = accountId;
   if (apiToken) earlyConfig.apiToken = apiToken;
   await saveConfig(earlyConfig, profileName);
@@ -355,7 +353,19 @@ database_id = "${databaseId}"
     process.exit(1);
   }
 
-  await saveConfig({ endpoint: workerUrl, ownerToken, subdomain, kvId, accountId, apiToken }, profileName);
+  await saveConfig(
+    {
+      endpoint: workerUrl,
+      token: ownerToken,
+      subdomain,
+      role: 'owner',
+      backend: 'cloudflare',
+      kvId,
+      accountId,
+      apiToken,
+    },
+    profileName
+  );
 
   // Auto-switch to the deployed profile
   if (profileName) {
@@ -366,8 +376,8 @@ database_id = "${databaseId}"
   console.log(`   Endpoint: ${workerUrl}`);
   if (multiTenant) {
     console.log(`   Mode:     Multi-tenant team service`);
-    console.log(`   Admin:    toss token create --label "teammate"`);
+    console.log(`   Admin:    toss admin token create --label "teammate"`);
   }
-  console.log(`   Upload:   toss share ./file.html --expires 24h`);
+  console.log(`   Upload:   toss ./file.html`);
   console.log(`   Manage:   toss list`);
 }

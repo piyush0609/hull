@@ -10,7 +10,7 @@ const projectRoot = join(__dirname, '../..');
 describe.skipIf(!RUN_E2E)('Live E2E', () => {
   let tempHome: string;
   let config: { endpoint: string; ownerToken: string; subdomain: string };
-  const subdomain = `e2e-${Date.now()}`;
+  const profile = `e2e-${Date.now()}`;
 
   beforeAll(async () => {
     tempHome = await mkdtemp(join(tmpdir(), 'toss-e2e-'));
@@ -19,9 +19,9 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
     execSync('npm run build', { cwd: projectRoot, stdio: 'ignore' });
 
     // Deploy non-interactively
-    execSync('node dist/index.js deploy', {
+    execSync(`node dist/index.js admin deploy --profile ${profile}`, {
       cwd: projectRoot,
-      env: { ...process.env, HOME: tempHome, TOSS_SUBDOMAIN: subdomain },
+      env: { ...process.env, HOME: tempHome },
       stdio: 'pipe',
     });
 
@@ -32,10 +32,10 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
 
   afterAll(async () => {
     try {
-      execSync('node dist/index.js destroy', {
-        cwd: projectRoot,
-        env: { ...process.env, HOME: tempHome },
-        stdio: 'pipe',
+      execSync('node dist/index.js admin destroy', {
+      cwd: projectRoot,
+      env: { ...process.env, HOME: tempHome },
+      stdio: 'pipe',
       });
       console.log('Destroyed.');
     } catch {
@@ -49,7 +49,7 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
     await writeFile(htmlFile, '<html><body>Hello E2E</body></html>');
 
     // Share
-    const shareJson = execSync('node dist/index.js share test.html --expires 1h --json', {
+    const shareJson = execSync('node dist/index.js test.html --expires 1h --json', {
       cwd: projectRoot,
       env: { ...process.env, HOME: tempHome },
       encoding: 'utf-8',

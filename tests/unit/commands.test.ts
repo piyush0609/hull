@@ -3,6 +3,7 @@ import { shareCommand } from '../../src/commands/share.js';
 import { listCommand } from '../../src/commands/list.js';
 import { revokeCommand } from '../../src/commands/revoke.js';
 import { destroyCommand } from '../../src/commands/destroy.js';
+import { tokenListCommand } from '../../src/commands/token.js';
 import * as config from '../../src/lib/config.js';
 
 describe('CLI Commands', () => {
@@ -22,24 +23,35 @@ describe('CLI Commands', () => {
   it('share should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(shareCommand('test.html', { expires: '24h' })).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
   });
 
   it('list should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(listCommand()).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
   });
 
   it('revoke should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(revokeCommand('abc123')).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Run "toss deploy" first.');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
   });
 
   it('destroy should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(destroyCommand()).rejects.toThrow('process.exit(1)');
     expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss found. Nothing to destroy.');
+  });
+
+  it('admin token list should reject member profiles locally', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue({
+      endpoint: 'https://example.com',
+      token: 'member-token',
+      subdomain: 'team',
+      role: 'member',
+    });
+    await expect(tokenListCommand()).rejects.toThrow('process.exit(1)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Error: This profile is a member profile and cannot run admin token commands.');
   });
 });

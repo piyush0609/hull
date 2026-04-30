@@ -4,15 +4,16 @@ export async function profileListCommand() {
   const { active, profiles } = await listProfiles();
 
   if (Object.keys(profiles).length === 0) {
-    console.log('No profiles found. Run toss deploy or toss join to create one.');
+    console.log('No profiles found. Run "toss admin deploy" or "toss login" to create one.');
     return;
   }
 
-  console.log('PROFILE    ENDPOINT');
+  console.log('PROFILE    ROLE     ENDPOINT');
   for (const [name, config] of Object.entries(profiles)) {
     const marker = name === active ? '* ' : '  ';
     const endpoint = config.endpoint;
-    console.log(`${marker}${name.padEnd(8)} ${endpoint}`);
+    const role = (config.role || 'owner').padEnd(8);
+    console.log(`${marker}${name.padEnd(8)} ${role} ${endpoint}`);
   }
   console.log('\n* = active profile');
 }
@@ -31,11 +32,12 @@ export async function profileShowCommand() {
   const active = await getActiveProfile();
   const config = await loadConfig();
   if (!config) {
-    console.error('Error: No profile active. Run "toss deploy" or "toss join" first.');
+    console.error('Error: No profile active. Run "toss admin deploy" or "toss login" first.');
     process.exit(1);
   }
 
   console.log(`Profile:   ${active || 'default'}`);
+  console.log(`Role:      ${config.role || 'owner'}`);
   console.log(`Endpoint:  ${config.endpoint}`);
   console.log(`Subdomain: ${config.subdomain}`);
   if (config.accountId) {
@@ -65,7 +67,7 @@ export async function profileDefaultCommand(name?: string) {
   if (!name) {
     const active = await getActiveProfile();
     if (!active) {
-      console.log('No active profile set. Run "toss deploy" or "toss join" first.');
+      console.log('No active profile set. Run "toss admin deploy" or "toss login" first.');
       return;
     }
     console.log(`Active profile: ${active}`);
@@ -84,7 +86,7 @@ export async function profileDefaultCommand(name?: string) {
 export async function profileRenameCommand(oldName: string, newName: string) {
   if (oldName === 'default') {
     console.error('Error: Cannot rename the default profile.');
-    console.error('Use "toss deploy --profile <new>" to copy default to a named profile.');
+    console.error('Use "toss admin deploy --profile <new>" to copy default to a named profile.');
     process.exit(1);
   }
   if (newName === 'default') {

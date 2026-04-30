@@ -93,13 +93,13 @@ export async function doctorCommand() {
   if (config) {
     console.log(`✅ Toss config found (${config.subdomain})`);
   } else {
-    console.log(`ℹ️  No toss config found — run 'toss deploy' when ready`);
+    console.log(`ℹ️  No toss config found — run 'toss login' to connect or 'toss admin deploy' to self-host`);
   }
 
   console.log();
   if (ok) {
-    console.log('All checks passed. Ready to deploy!');
-    console.log('   toss deploy');
+    console.log('All checks passed. Ready for owner setup.');
+    console.log('   toss admin deploy');
   } else {
     console.log('Some checks failed. Fix the issues above, then try again.');
     process.exit(1);

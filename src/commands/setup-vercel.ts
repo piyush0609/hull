@@ -5,9 +5,14 @@ import { loadConfig, saveConfig, switchProfile } from '../lib/config.js';
 
 const execAsync = promisify(exec);
 
+function deriveDeploymentSuffix(profileName?: string, savedSubdomain?: string): string {
+  if (savedSubdomain) return savedSubdomain;
+  if (!profileName || profileName === 'default' || profileName === 'owner') return 'toss';
+  return profileName.toLowerCase().replace(/_/g, '-');
+}
+
 export async function setupVercelCommand(options: { profile?: string; subdomain?: string; yes?: boolean } = {}) {
   const profileName = options.profile;
-  const presetSubdomain = options.subdomain;
   const autoYes = options.yes || !process.stdin.isTTY;
 
   if (profileName) {
@@ -27,19 +32,13 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
     console.log('Toss Setup — Vercel\n==========\n');
   }
 
-  // Subdomain
-  let subdomain = presetSubdomain;
-  if (!subdomain && process.stdin.isTTY && !autoYes) {
-    subdomain = await prompt('Choose a project suffix (e.g., rf, share, team): ');
-    if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
-      console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
-      process.exit(1);
-    }
-  }
+  const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
+  const subdomain = deriveDeploymentSuffix(profileName, existingConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
+  console.log(`Using project suffix: ${subdomain}`);
 
   // Check Node.js
   const nodeVersion = process.version;
@@ -111,20 +110,21 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
 
   // Save profile
   if (profileName) {
-    const existingConfig = await loadConfig(profileName);
-    const config = existingConfig || { endpoint: '', ownerToken: '', subdomain: '' };
+    const config = existingConfig || { endpoint: '', token: '', subdomain: '', role: 'owner' as const };
     config.backend = 'vercel';
-    if (subdomain) config.subdomain = subdomain;
+    config.subdomain = subdomain;
+    config.role = 'owner';
     await saveConfig(config, profileName);
     await switchProfile(profileName);
     console.log(`\n✅ Profile "${profileName}" configured for Vercel.`);
-    console.log(`   Next: toss deploy --backend vercel --profile ${profileName}`);
+    console.log(`   Next: toss admin deploy --backend vercel --profile ${profileName}`);
   } else {
-    const config = await loadConfig() || { endpoint: '', ownerToken: '', subdomain: '' };
+    const config = existingConfig || { endpoint: '', token: '', subdomain: '', role: 'owner' as const };
     config.backend = 'vercel';
-    if (subdomain) config.subdomain = subdomain;
+    config.subdomain = subdomain;
+    config.role = 'owner';
     await saveConfig(config);
     console.log('\n✅ Setup complete for Vercel.');
-    console.log('   Next: toss deploy --backend vercel');
+    console.log('   Next: toss admin deploy --backend vercel');
   }
 }

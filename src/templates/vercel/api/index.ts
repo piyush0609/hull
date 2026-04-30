@@ -139,6 +139,14 @@ interface AuthUser {
   isAdmin: boolean;
 }
 
+function authJson(data: unknown, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  headers.set('Cache-Control', 'private, no-store, max-age=0');
+  headers.set('Vary', 'Authorization, Cookie');
+  return new Response(JSON.stringify(data), { ...init, headers });
+}
+
 async function resolveUser(request: Request): Promise<AuthUser | null> {
   const auth = request.headers.get('Authorization') || '';
   if (!auth.startsWith('Bearer ')) return null;
@@ -429,9 +437,7 @@ export default async function handler(request: Request): Promise<Response> {
       const legacyUrl = `${url.origin}/a/${id}?t=${jwt}`;
       const shortUrl = `${url.origin}/s/${slug}`;
 
-      return new Response(JSON.stringify({ id, slug, url: shortUrl, legacyUrl }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return authJson({ id, slug, url: shortUrl, legacyUrl });
     }
 
     // ===== UPLOAD additional files =====
@@ -469,9 +475,7 @@ export default async function handler(request: Request): Promise<Response> {
       const body = await request.arrayBuffer();
       await blobPut(`artifacts/${id}/files/${filePath}`, body, mimeType(filePath));
 
-      return new Response(JSON.stringify({ uploaded: filePath }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return authJson({ uploaded: filePath });
     }
 
     // ===== LIST artifacts =====
@@ -487,9 +491,7 @@ export default async function handler(request: Request): Promise<Response> {
         results = await sql`SELECT id, slug, name, size_bytes, created_at, expires_at FROM artifacts ORDER BY created_at DESC`;
       }
 
-      return new Response(JSON.stringify(results), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return authJson(results);
     }
 
     // ===== DELETE artifact =====
@@ -513,9 +515,7 @@ export default async function handler(request: Request): Promise<Response> {
       }
       await sql`DELETE FROM artifacts WHERE id = ${id}`;
 
-      return new Response(JSON.stringify({ revoked: id }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return authJson({ revoked: id });
     }
 
     // ===== TOKEN MANAGEMENT (admin only) =====
@@ -527,9 +527,7 @@ export default async function handler(request: Request): Promise<Response> {
         if (auth instanceof Response) return auth;
 
         const results = await sql`SELECT token_hash, label, created_at, is_admin FROM users ORDER BY created_at DESC`;
-        return new Response(JSON.stringify(results), {
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return authJson(results);
       }
 
       if (request.method === 'POST') {
@@ -544,9 +542,7 @@ export default async function handler(request: Request): Promise<Response> {
 
         await sql`INSERT INTO users (token_hash, label, created_at, is_admin) VALUES (${tokenHash}, ${label}, ${Math.floor(Date.now() / 1000)}, 0)`;
 
-        return new Response(JSON.stringify({ token, label }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
+        return authJson({ token, label });
       }
     }
 
@@ -558,9 +554,7 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       await sql`DELETE FROM users WHERE token_hash = ${tokenHash} AND is_admin = 0`;
 
-      return new Response(JSON.stringify({ revoked: tokenHash }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      return authJson({ revoked: tokenHash });
     }
 
     // ===== SERVE by slug (/s/:slug) =====
