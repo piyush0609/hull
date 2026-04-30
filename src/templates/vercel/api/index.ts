@@ -172,6 +172,13 @@ function requireAdmin(request: Request): Promise<AuthUser | Response> {
   });
 }
 
+// --- Reserved slugs (route namespace) ---
+// Caller-supplied --id values matching any of these are rejected so they
+// can't shadow built-in routes.
+const RESERVED_SLUGS = new Set([
+  's', 'a', 'tokens', 'artifacts', 'health', 'api', 'status',
+]);
+
 // --- ID / Slug generation ---
 function generateId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -179,13 +186,22 @@ function generateId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-// Opaque random slug — 8 chars of [a-z0-9]. Never derived from the user's
-// filename or path (those leak local structure into the public URL).
+// Opaque random slug — 12 chars of [a-z0-9] (~62 bits) from a CSPRNG.
+// Never derived from the user's filename or path (those leak local structure).
+// Long-lived/permanent bearer URLs need real entropy, not Math.random().
+const SLUG_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const SLUG_LEN = 12;
 function generateSlug(): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let s = '';
-  for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  return s;
+  // Reject-sample so the modulus skew is zero. With a 36-char alphabet, bytes
+  // < 252 (= 36*7) are unbiased; the rest are discarded.
+  const out: string[] = [];
+  while (out.length < SLUG_LEN) {
+    const buf = crypto.getRandomValues(new Uint8Array(SLUG_LEN * 2));
+    for (let i = 0; i < buf.length && out.length < SLUG_LEN; i++) {
+      if (buf[i] < 252) out.push(SLUG_CHARS[buf[i] % 36]);
+    }
+  }
+  return out.join('');
 }
 
 // --- MIME ---
@@ -339,8 +355,7 @@ export default async function handler(request: Request): Promise<Response> {
 
       // Validate caller-supplied stable slug if present
       if (requestedId !== null) {
-        const RESERVED = new Set(['s', 'a', 'tokens', 'artifacts', 'health']);
-        if (!/^[a-z0-9][a-z0-9-]{2,63}$/.test(requestedId) || RESERVED.has(requestedId)) {
+        if (!/^[a-z0-9][a-z0-9-]{2,63}$/.test(requestedId) || RESERVED_SLUGS.has(requestedId)) {
           return new Response('Invalid id: lowercase alphanumeric and hyphens, 3-64 chars', { status: 400 });
         }
       }
@@ -350,8 +365,10 @@ export default async function handler(request: Request): Promise<Response> {
       const now = Math.floor(Date.now() / 1000);
 
       // Replace-in-place when a stable slug already exists and is owned by the caller.
-      // We deliberately keep slug, expires_at, and password_hash unchanged on update —
-      // recipients keep working URLs, sessions, and lifetime guarantees.
+      // The slug stays (recipients keep working URLs); name, content, expires_at,
+      // and password_hash all reflect the new request — re-sharing fully re-describes
+      // the share. Omitting --password clears the password; omitting --expires (or
+      // --expires never) makes it permanent.
       if (requestedId !== null) {
         const existing = await sql`SELECT id, token_hash FROM artifacts WHERE slug = ${requestedId}`;
         if (existing[0]) {
@@ -359,8 +376,12 @@ export default async function handler(request: Request): Promise<Response> {
             return new Response('Slug already taken by another tenant', { status: 409 });
           }
           const existingId = existing[0].id;
+          // Password salt is the artifact id, which is preserved on update.
+          const passwordParam = url.searchParams.get('password');
+          const newPasswordHash = passwordParam ? await sha256(passwordParam + existingId) : null;
+          const newExpiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
           await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
-          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length} WHERE id = ${existingId}`;
+          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           const shortUrl = `${url.origin}/s/${requestedId}`;
           return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
             headers: { 'Content-Type': 'application/json' },
@@ -370,7 +391,19 @@ export default async function handler(request: Request): Promise<Response> {
 
       // New artifact.
       const id = generateId();
-      const slug = requestedId || generateSlug();
+      let slug: string;
+      if (requestedId !== null) {
+        slug = requestedId;
+      } else {
+        // 62-bit slugs collide with vanishing probability, but a pre-check loop
+        // beats relying on the DB unique constraint to surface a 500.
+        slug = generateSlug();
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const taken = await sql`SELECT 1 FROM artifacts WHERE slug = ${slug}`;
+          if (!taken[0]) break;
+          slug = generateSlug();
+        }
+      }
 
       const passwordParam = url.searchParams.get('password');
       const passwordHash = passwordParam ? await sha256(passwordParam + id) : null;
@@ -381,9 +414,18 @@ export default async function handler(request: Request): Promise<Response> {
       const expiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
       await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash})`;
 
-      // Legacy /a/:id?t=jwt URL — far-future exp for permanent so the JWT keeps validating.
-      const jwtExp = expiresSeconds === 0 ? now + (100 * 365 * 86400) : (now + expiresSeconds);
-      const jwt = await signJWT({ sub: id, iat: now, exp: jwtExp }, JWT_SECRET);
+      // Legacy /a/:id?t=jwt URL — for permanent shares we mark the JWT with
+      // `permanent: true` so the verifier can normalize expires_at = 0 instead
+      // of treating the far-future `exp` as a real expiry (which would cause
+      // a 100-year cookie max-age).
+      const jwtPayload: Record<string, unknown> = { sub: id, iat: now };
+      if (expiresSeconds === 0) {
+        jwtPayload.permanent = true;
+        jwtPayload.exp = now + (100 * 365 * 86400);
+      } else {
+        jwtPayload.exp = now + expiresSeconds;
+      }
+      const jwt = await signJWT(jwtPayload, JWT_SECRET);
       const legacyUrl = `${url.origin}/a/${id}?t=${jwt}`;
       const shortUrl = `${url.origin}/s/${slug}`;
 
@@ -609,7 +651,9 @@ export default async function handler(request: Request): Promise<Response> {
       try {
         payload = await verifyJWT(token, JWT_SECRET);
         if (payload.sub !== id) return new Response('Invalid token scope', { status: 403 });
-        if (typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) {
+        // Permanent JWTs skip the exp check; everything else uses exp as before.
+        const isPermanent = payload.permanent === true;
+        if (!isPermanent && typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) {
           return new Response('Link expired', { status: 410 });
         }
       } catch {
@@ -626,7 +670,12 @@ export default async function handler(request: Request): Promise<Response> {
       }
       filePath = parts.join('/');
 
-      const meta: ArtifactMeta = { id, expires_at: payload.exp as number };
+      // Normalize permanent tokens to expires_at = 0 so the cookie max-age
+      // and 410 guard in serveArtifact() take the permanent branch.
+      const meta: ArtifactMeta = {
+        id,
+        expires_at: payload.permanent === true ? 0 : (payload.exp as number),
+      };
       return serveArtifact(meta, filePath, request);
     }
 

@@ -30,7 +30,7 @@ describe('Worker Routes', () => {
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(200);
       const body = await res.json() as { id: string; slug: string; url: string };
-      expect(body.slug).toMatch(/^[a-z0-9]{8}$/);
+      expect(body.slug).toMatch(/^[a-z0-9]{12}$/);
       expect(body.url).toContain(`/s/${body.slug}`);
     });
 

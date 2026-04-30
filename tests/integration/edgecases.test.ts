@@ -3,6 +3,13 @@ import worker from '../../src/templates/worker/src/index.js';
 import { signJWT } from '../../src/templates/worker/src/jwt.js';
 import { MockKV, MockD1, SECRET, OWNER, createEnv } from './helpers.js';
 
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 describe('Worker Edge Cases', () => {
   let kv: MockKV;
   let db: MockD1;
@@ -34,7 +41,7 @@ describe('Worker Edge Cases', () => {
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(200);
       const body = await res.json() as { id: string; slug: string };
-      expect(body.slug).toMatch(/^[a-z0-9]{8}$/);
+      expect(body.slug).toMatch(/^[a-z0-9]{12}$/);
     });
 
     it('should reject expires > 90 days', async () => {
@@ -210,6 +217,148 @@ describe('Worker Edge Cases', () => {
       const correctRes = await worker.fetch(correctReq, createEnv(kv, db));
       expect(correctRes.status).toBe(302);
       expect(correctRes.headers.get('Set-Cookie')).toContain(`toss_pwd_${slug}=1`);
+    });
+  });
+
+  describe('Stable slug (--id)', () => {
+    it('should create new artifact with caller-supplied slug', async () => {
+      const req = new Request('http://localhost/artifacts?expires=3600&name=test.html&id=my-stable-slug', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html>hello</html>',
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { slug: string; updated?: boolean };
+      expect(body.slug).toBe('my-stable-slug');
+      expect(body.updated).toBeUndefined();
+    });
+
+    it('should replace-in-place when owner re-shares same slug', async () => {
+      const ownerHash = await sha256Hex(OWNER);
+      db.setRows([{
+        id: 'abc12345-1234-1234-1234-123456789abc',
+        slug: 'my-stable-slug',
+        token_hash: ownerHash,
+      }]);
+      const req = new Request('http://localhost/artifacts?expires=3600&name=updated.html&id=my-stable-slug', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html>updated</html>',
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { slug: string; updated?: boolean };
+      expect(body.slug).toBe('my-stable-slug');
+      expect(body.updated).toBe(true);
+    });
+
+    it('should reject replace by a different tenant (409)', async () => {
+      db.setRows([{
+        id: 'abc12345-1234-1234-1234-123456789abc',
+        slug: 'my-stable-slug',
+        token_hash: 'a-different-tenants-hash',
+      }]);
+      const req = new Request('http://localhost/artifacts?expires=3600&name=hijack.html&id=my-stable-slug', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html>hijack</html>',
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(409);
+    });
+
+    for (const reserved of ['s', 'a', 'tokens', 'artifacts', 'health', 'api', 'status']) {
+      it(`should reject reserved slug "${reserved}"`, async () => {
+        const req = new Request(`http://localhost/artifacts?expires=3600&name=test.html&id=${reserved}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${OWNER}` },
+          body: '<html></html>',
+        });
+        const res = await worker.fetch(req, createEnv(kv, db));
+        expect(res.status).toBe(400);
+      });
+    }
+
+    it('should reject slug shorter than 3 chars', async () => {
+      const req = new Request('http://localhost/artifacts?expires=3600&name=test.html&id=ab', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html></html>',
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(400);
+    });
+
+    it('should reject slug with uppercase or invalid chars', async () => {
+      const req = new Request('http://localhost/artifacts?expires=3600&name=test.html&id=Bad_Slug', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html></html>',
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('Permanent shares', () => {
+    it('should serve 200 for slug with expires_at=0 (no 410)', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      const slug = 'permanent-test';
+      db.setRows([{ id, slug, expires_at: 0, password_hash: null }]);
+      await kv.put(`artifacts/${id}/files/index.html`, '<html>perm</html>');
+
+      const req = new Request(`http://localhost/s/${slug}/`);
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('<html>perm</html>');
+    });
+
+    it('should set 30d cookie on permanent password-protected share', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      const slug = 'perm-pwd';
+      const passwordHash = await sha256Hex('pwd' + id);
+      db.setRows([{ id, slug, expires_at: 0, password_hash: passwordHash }]);
+      await kv.put(`artifacts/${id}/files/index.html`, '<html>perm pwd</html>');
+
+      const req = new Request(`http://localhost/s/${slug}/`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'pwd' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(302);
+      // 30 days = 2592000s, not 100y.
+      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=2592000');
+    });
+
+    it('should serve permanent JWT (permanent:true payload) without 410', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      db.setRows([{ id, slug: 'p', expires_at: 0 }]);
+      await kv.put(`artifacts/${id}/files/index.html`, '<html>perm jwt</html>');
+
+      const now = Math.floor(Date.now() / 1000);
+      // exp is intentionally far past — permanent:true must override the expiry check.
+      const token = await signJWT(
+        { sub: id, iat: now, exp: now - 100, permanent: true },
+        SECRET
+      );
+
+      const req = new Request(`http://localhost/a/${id}/?t=${token}`);
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(200);
+      // Cookie max-age should be the 30d permanent-branch value, not seconds-until-exp.
+      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=2592000');
+    });
+
+    it('should still reject expired non-permanent JWT', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      const now = Math.floor(Date.now() / 1000);
+      const token = await signJWT({ sub: id, iat: now, exp: now - 100 }, SECRET);
+
+      const req = new Request(`http://localhost/a/${id}/?t=${token}`);
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(410);
     });
   });
 });
