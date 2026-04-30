@@ -25,14 +25,16 @@ describe('Worker Edge Cases', () => {
       expect(body.id).toBeDefined();
     });
 
-    it('should reject expires=0', async () => {
+    it('should treat expires=0 as permanent (200 + slug returned)', async () => {
       const req = new Request('http://localhost/artifacts?expires=0&name=test.html', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OWNER}` },
         body: '<html></html>',
       });
       const res = await worker.fetch(req, createEnv(kv, db));
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { id: string; slug: string };
+      expect(body.slug).toMatch(/^[a-z0-9]{8}$/);
     });
 
     it('should reject expires > 90 days', async () => {

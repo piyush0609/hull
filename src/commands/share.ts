@@ -8,14 +8,16 @@ import { promptPassword } from '../lib/prompt.js';
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB KV limit
 const SKIP_DIRS = new Set(['node_modules', '__pycache__', 'dist', 'build', 'target', '.next', '.vercel', '.turbo', '.cache', 'out']);
 
-function parseDuration(d: string): number {
+// 0 = permanent (no expiry).
+function parseDuration(d: string | undefined): number {
+  if (!d || d === 'never' || d === 'permanent') return 0;
   const map: Record<string, number> = {
     '1h': 3600,
     '24h': 86400,
     '7d': 604800,
     '30d': 2592000,
   };
-  if (!map[d]) throw new Error(`Invalid duration: ${d}. Use: 1h, 24h, 7d, 30d`);
+  if (!map[d]) throw new Error(`Invalid duration: ${d}. Use: 1h, 24h, 7d, 30d, or omit for permanent.`);
   return map[d];
 }
 
@@ -67,7 +69,7 @@ async function walkDir(dir: string): Promise<string[]> {
   return files;
 }
 
-export async function shareCommand(file: string, options: { expires: string; clipboard?: boolean; json?: boolean; password?: string | true; profile?: string } = { expires: '24h' }) {
+export async function shareCommand(file: string, options: { expires?: string; id?: string; clipboard?: boolean; json?: boolean; password?: string | true; profile?: string } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss found. Run "toss deploy" first.');
@@ -94,11 +96,16 @@ export async function shareCommand(file: string, options: { expires: string; cli
     password = options.password;
   }
 
-  let result: { id: string; slug: string; url: string; legacyUrl: string };
+  let result: { id: string; slug: string; url: string; legacyUrl: string; updated?: boolean };
 
   const fileStat = await stat(file).catch(() => null);
   if (!fileStat) {
     console.error(`Error: Could not read "${file}"`);
+    process.exit(1);
+  }
+
+  if (fileStat.isDirectory() && options.id) {
+    console.error('Error: --id is not yet supported for folder shares.');
     process.exit(1);
   }
 
@@ -169,7 +176,7 @@ export async function shareCommand(file: string, options: { expires: string; cli
     // Send only the basename — never the user's full local path.
     const name = basename(file);
     try {
-      result = await api.upload(html, name, expires, password);
+      result = await api.upload(html, name, expires, password, options.id);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -183,10 +190,10 @@ export async function shareCommand(file: string, options: { expires: string; cli
   if (options.json) {
     console.log(JSON.stringify(result));
   } else {
-    console.log(`\nLink:     ${result.url}`);
+    console.log(`\nLink:     ${result.url}${result.updated ? '  (updated in place)' : ''}`);
     if (result.legacyUrl) console.log(`Legacy:   ${result.legacyUrl}`);
     if (password) console.log(`Password: ${password}`);
-    console.log(`Expires:  ${options.expires}`);
+    console.log(`Expires:  ${expires === 0 ? 'never (permanent)' : options.expires}`);
     if (options.clipboard) console.log('Copied to clipboard.');
     console.log(`Revoke:   toss revoke ${result.slug || result.id}\n`);
   }

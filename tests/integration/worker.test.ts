@@ -21,14 +21,17 @@ describe('Worker Routes', () => {
       expect(res.status).toBe(401);
     });
 
-    it('should reject missing expires param', async () => {
+    it('should accept missing expires param as permanent (200 + slug returned)', async () => {
       const req = new Request('http://localhost/artifacts?name=test.html', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OWNER}` },
         body: '<html>test</html>',
       });
       const res = await worker.fetch(req, createEnv(kv, db));
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(200);
+      const body = await res.json() as { id: string; slug: string; url: string };
+      expect(body.slug).toMatch(/^[a-z0-9]{8}$/);
+      expect(body.url).toContain(`/s/${body.slug}`);
     });
 
     it('should reject invalid expires', async () => {

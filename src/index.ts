@@ -65,8 +65,9 @@ program
 
 program
   .command('share <file>')
-  .description('Share an HTML file')
-  .requiredOption('-e, --expires <duration>', 'Link lifetime: 1h, 24h, 7d, 30d')
+  .description('Share an HTML file or folder')
+  .option('-e, --expires <duration>', 'Link lifetime: 1h, 24h, 7d, 30d (omit for permanent)')
+  .option('--id <slug>', 'Stable URL slug — re-running with same id replaces the content (single file only)')
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this share (omit value for secure prompt)')

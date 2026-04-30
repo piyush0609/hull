@@ -317,31 +317,69 @@ export default async function handler(request: Request): Promise<Response> {
 
       const name = url.searchParams.get('name') || 'untitled.html';
       const expiresParam = url.searchParams.get('expires');
-      if (!expiresParam) return new Response('Missing expires param', { status: 400 });
+      const requestedId = url.searchParams.get('id');
 
-      const expiresSeconds = parseInt(expiresParam, 10);
-      if (isNaN(expiresSeconds) || expiresSeconds <= 0) {
-        return new Response('Invalid expires param', { status: 400 });
-      }
-      const MAX_TTL = 90 * 24 * 60 * 60;
-      if (expiresSeconds > MAX_TTL) {
-        return new Response('Max expiry is 90 days', { status: 400 });
+      // expires=0 or missing → permanent. Otherwise capped at 90 days.
+      let expiresSeconds = 0;
+      if (expiresParam !== null && expiresParam !== '0') {
+        const parsed = parseInt(expiresParam, 10);
+        if (isNaN(parsed) || parsed < 0) {
+          return new Response('Invalid expires param', { status: 400 });
+        }
+        const MAX_TTL = 90 * 24 * 60 * 60;
+        if (parsed > MAX_TTL) {
+          return new Response('Max expiry is 90 days', { status: 400 });
+        }
+        expiresSeconds = parsed;
       }
 
-      const id = generateId();
-      const slug = generateSlug();
+      // Validate caller-supplied stable slug if present
+      if (requestedId !== null) {
+        const RESERVED = new Set(['s', 'a', 'tokens', 'artifacts', 'health']);
+        if (!/^[a-z0-9][a-z0-9-]{2,63}$/.test(requestedId) || RESERVED.has(requestedId)) {
+          return new Response('Invalid id: lowercase alphanumeric and hyphens, 3-64 chars', { status: 400 });
+        }
+      }
+
       const html = await request.text();
+      const sql = getSQL();
+      const now = Math.floor(Date.now() / 1000);
+
+      // Replace-in-place when a stable slug already exists and is owned by the caller.
+      // We deliberately keep slug, expires_at, and password_hash unchanged on update —
+      // recipients keep working URLs, sessions, and lifetime guarantees.
+      if (requestedId !== null) {
+        const existing = await sql`SELECT id, token_hash FROM artifacts WHERE slug = ${requestedId}`;
+        if (existing[0]) {
+          if (existing[0].token_hash !== auth.tokenHash) {
+            return new Response('Slug already taken by another tenant', { status: 409 });
+          }
+          const existingId = existing[0].id;
+          await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
+          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length} WHERE id = ${existingId}`;
+          const shortUrl = `${url.origin}/s/${requestedId}`;
+          return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // New artifact.
+      const id = generateId();
+      const slug = requestedId || generateSlug();
 
       const passwordParam = url.searchParams.get('password');
       const passwordHash = passwordParam ? await sha256(passwordParam + id) : null;
 
       await blobPut(`artifacts/${id}/files/index.html`, html, 'text/html');
 
-      const sql = getSQL();
-      const now = Math.floor(Date.now() / 1000);
-      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${now + expiresSeconds}, ${auth.tokenHash}, ${passwordHash})`;
+      // expires_at = 0 in the row signals "never expires".
+      const expiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
+      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash})`;
 
-      const jwt = await signJWT({ sub: id, iat: now, exp: now + expiresSeconds }, JWT_SECRET);
+      // Legacy /a/:id?t=jwt URL — far-future exp for permanent so the JWT keeps validating.
+      const jwtExp = expiresSeconds === 0 ? now + (100 * 365 * 86400) : (now + expiresSeconds);
+      const jwt = await signJWT({ sub: id, iat: now, exp: jwtExp }, JWT_SECRET);
       const legacyUrl = `${url.origin}/a/${id}?t=${jwt}`;
       const shortUrl = `${url.origin}/s/${slug}`;
 
@@ -488,7 +526,8 @@ export default async function handler(request: Request): Promise<Response> {
 
       if (!rows[0]) return new Response('Not found', { status: 404 });
 
-      if (rows[0].expires_at < Math.floor(Date.now() / 1000)) {
+      // expires_at = 0 means permanent (never expires).
+      if (rows[0].expires_at > 0 && rows[0].expires_at < Math.floor(Date.now() / 1000)) {
         return new Response('Link expired', { status: 410 });
       }
 
@@ -504,7 +543,10 @@ export default async function handler(request: Request): Promise<Response> {
             const providedHash = password ? await sha256(password + rows[0].id) : '';
 
             if (constantTimeEqual(providedHash, rows[0].password_hash)) {
-              const maxAge = Math.max(0, rows[0].expires_at - Math.floor(Date.now() / 1000));
+              // Permanent shares: give the cookie a 30d life; time-bound shares: scope to remaining lifetime.
+              const maxAge = rows[0].expires_at === 0
+                ? 30 * 86400
+                : Math.max(0, rows[0].expires_at - Math.floor(Date.now() / 1000));
               return new Response(null, {
                 status: 302,
                 headers: {

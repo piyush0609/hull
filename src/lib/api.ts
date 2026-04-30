@@ -11,11 +11,13 @@ async function safeFetch(url: string, init: RequestInit): Promise<Response> {
 export class TossAPI {
   constructor(private config: TossConfig) {}
 
-  async upload(html: Buffer, name: string, expiresSeconds: number, password?: string): Promise<{ id: string; slug: string; url: string; legacyUrl: string }> {
+  async upload(html: Buffer, name: string, expiresSeconds: number, password?: string, id?: string): Promise<{ id: string; slug: string; url: string; legacyUrl: string; updated?: boolean }> {
     const url = new URL('/artifacts', this.config.endpoint);
+    // expiresSeconds === 0 signals "never expires"
     url.searchParams.set('expires', String(expiresSeconds));
     url.searchParams.set('name', name);
     if (password) url.searchParams.set('password', password);
+    if (id) url.searchParams.set('id', id);
 
     const res = await safeFetch(url.href, {
       method: 'POST',
