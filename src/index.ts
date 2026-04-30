@@ -16,6 +16,9 @@ import { tokenCreateCommand, tokenListCommand, tokenRevokeCommand, tokenRotateCo
 import { joinCommand } from './commands/join.js';
 import { profileListCommand, profileSwitchCommand, profileShowCommand, profileDeleteCommand, profileDefaultCommand, profileRenameCommand } from './commands/profile.js';
 import { loadConfig } from './lib/config.js';
+import { whoamiCommand } from './commands/whoami.js';
+import { membersListCommand } from './commands/members.js';
+import { cleanupCommand } from './commands/cleanup.js';
 
 async function routeDeploy(options: any) {
   const backend = options.backend || (await loadConfig(options.profile))?.backend || 'cloudflare';
@@ -185,6 +188,12 @@ program
   .action((...args) => infoCommand(getCommandOptions(args, ['profile'])));
 
 program
+  .command('whoami')
+  .description('Show the current profile, role, and endpoint')
+  .option('--profile <name>', 'Use a specific profile')
+  .action((...args) => whoamiCommand(getCommandOptions(args, ['profile'])));
+
+program
   .command('doctor')
   .description('Check owner-side setup prerequisites')
   .action(doctorCommand);
@@ -254,6 +263,19 @@ admin
   .option('--backend <backend>', 'Target backend: cloudflare or vercel')
   .option('-y, --yes', 'Skip confirmation')
   .action((...args) => routeDestroy(getCommandOptions(args, ['profile', 'backend', 'yes'])));
+
+admin
+  .command('members')
+  .description('List members on the shared toss service')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .action((...args) => membersListCommand(getCommandOptions(args, ['profile'])));
+
+admin
+  .command('cleanup')
+  .description('Delete expired artifacts from the shared toss service')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-y, --yes', 'Skip confirmation')
+  .action((...args) => cleanupCommand(getCommandOptions(args, ['profile', 'yes'])));
 
 const token = admin
   .command('token')

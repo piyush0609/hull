@@ -39,6 +39,7 @@ toss ./report.html
 toss ./site --expires 7d
 toss list
 toss revoke <slug-or-id>
+toss whoami
 ```
 
 ### Default publish behavior
@@ -127,6 +128,8 @@ Owners can create upload tokens for teammates:
 toss admin token create --label alice
 toss admin token list
 toss admin token revoke <hash>
+toss admin members
+toss admin cleanup
 ```
 
 Teammates then connect with:
@@ -139,6 +142,7 @@ toss login https://share.example.com --token <their-token>
 
 ```bash
 toss info
+toss whoami
 toss doctor
 toss skill install
 toss admin destroy

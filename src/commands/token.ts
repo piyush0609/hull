@@ -1,22 +1,12 @@
-import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
-
-async function requireOwnerProfile(profile?: string) {
-  const config = await loadConfig(profile);
-  if (!config) {
-    console.error('Error: No toss connection found. Run "toss admin deploy" first.');
-    process.exit(1);
-  }
-  if (config.role && config.role !== 'owner') {
-    console.error('Error: This profile is a member profile and cannot run admin token commands.');
-    console.error('Use an owner profile with "toss profile switch <owner-profile>" or pass "--profile <owner-profile>".');
-    process.exit(1);
-  }
-  return config;
-}
+import { requireOwnerProfile } from '../lib/owner.js';
 
 export async function tokenCreateCommand(options: { label: string; profile?: string } = { label: '' }) {
-  const config = await requireOwnerProfile(options.profile);
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   const api = new TossAPI(config);
   try {
@@ -46,7 +36,11 @@ export async function tokenCreateCommand(options: { label: string; profile?: str
 }
 
 export async function tokenListCommand(options: { profile?: string } = {}) {
-  const config = await requireOwnerProfile(options.profile);
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   try {
     const res = await fetch(`${config.endpoint}/tokens`, {
@@ -80,7 +74,11 @@ export async function tokenListCommand(options: { profile?: string } = {}) {
 }
 
 export async function tokenRevokeCommand(hash: string, options: { profile?: string } = {}) {
-  const config = await requireOwnerProfile(options.profile);
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   try {
     const res = await fetch(`${config.endpoint}/tokens/${hash}`, {
@@ -102,7 +100,11 @@ export async function tokenRevokeCommand(hash: string, options: { profile?: stri
 }
 
 export async function tokenRotateCommand(options: { profile?: string } = {}) {
-  const config = await requireOwnerProfile(options.profile);
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   console.log('Token rotation requires re-deploying the worker with a new OWNER_TOKEN.');
   console.log('Run: toss admin destroy && toss admin deploy --multi-tenant');

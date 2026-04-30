@@ -1,7 +1,12 @@
 import { loadConfig, getActiveProfile } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
-export async function infoCommand(options: { profile?: string } = {}) {
+function displayProfileName(requestedProfile?: string, activeProfile?: string): string {
+  if (requestedProfile) return requestedProfile;
+  return activeProfile || 'default';
+}
+
+export async function whoamiCommand(options: { profile?: string } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
@@ -9,9 +14,9 @@ export async function infoCommand(options: { profile?: string } = {}) {
   }
 
   const activeProfile = await getActiveProfile();
-  const shownProfile = options.profile || activeProfile || 'default';
+  const shownProfile = displayProfileName(options.profile, activeProfile);
 
-  console.log('Toss Info');
+  console.log('Who Am I');
   console.log('=========');
   console.log(`Profile:   ${shownProfile}`);
   if (activeProfile && shownProfile !== activeProfile) {
@@ -20,21 +25,14 @@ export async function infoCommand(options: { profile?: string } = {}) {
   console.log(`Role:      ${config.role || 'owner'}`);
   console.log(`Endpoint:  ${config.endpoint}`);
   console.log(`Subdomain: ${config.subdomain}`);
-  if (config.accountId) {
-    console.log(`Account:   ${config.accountId}`);
-  }
-  if (config.kvId) {
-    console.log(`KV ID:     ${config.kvId}`);
+  if (config.backend) {
+    console.log(`Backend:   ${config.backend}`);
   }
 
   try {
     const api = new TossAPI(config);
     const artifacts = await api.list();
     console.log(`Artifacts: ${artifacts.length}`);
-    const expired = artifacts.filter((a) => Number(a.expires_at) * 1000 < Date.now()).length;
-    if (expired > 0) {
-      console.log(`  (including ${expired} expired)`);
-    }
   } catch {
     console.log('Artifacts: (could not reach worker)');
   }
