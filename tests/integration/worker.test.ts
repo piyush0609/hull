@@ -49,6 +49,7 @@ class StatefulMockD1 {
   commentThreads: Array<{
     id: string;
     artifact_id: string;
+    page_path: string;
     created_by_token_hash: string;
     created_by_label: string;
     scope_type: string;
@@ -107,18 +108,19 @@ class StatefulMockD1 {
       this.commentThreads.push({
         id: String(values[0]),
         artifact_id: String(values[1]),
-        created_by_token_hash: String(values[2]),
-        created_by_label: String(values[3]),
-        scope_type: String(values[4]),
-        anchor_json: values[5] == null ? null : String(values[5]),
-        status: String(values[6]),
+        page_path: String(values[2]),
+        created_by_token_hash: String(values[3]),
+        created_by_label: String(values[4]),
+        scope_type: String(values[5]),
+        anchor_json: values[6] == null ? null : String(values[6]),
+        status: String(values[7]),
         resolved_by_token_hash: null,
         resolved_by_label: null,
         resolved_at: null,
         deleted_at: null,
         deleted_by_token_hash: null,
-        created_at: Number(values[7]),
-        updated_at: Number(values[8]),
+        created_at: Number(values[8]),
+        updated_at: Number(values[9]),
       });
       return { success: true };
     }
@@ -240,6 +242,17 @@ class StatefulMockD1 {
       };
     }
 
+    if (query.includes('FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC')) {
+      const artifactId = String(values[0]);
+      const pagePath = String(values[1]);
+      return {
+        results: this.commentThreads
+          .filter((thread) => thread.artifact_id === artifactId && thread.page_path === pagePath && thread.deleted_at == null)
+          .slice()
+          .sort((a, b) => b.created_at - a.created_at),
+      };
+    }
+
     if (query.includes('FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC')) {
       const artifactId = String(values[0]);
       return {
@@ -247,6 +260,22 @@ class StatefulMockD1 {
           .filter((thread) => thread.artifact_id === artifactId && thread.deleted_at == null)
           .slice()
           .sort((a, b) => b.created_at - a.created_at),
+      };
+    }
+
+    if (query.includes('FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC')) {
+      const artifactId = String(values[0]);
+      const pagePath = String(values[1]);
+      const validThreads = new Map(
+        this.commentThreads
+          .filter((thread) => thread.artifact_id === artifactId && thread.page_path === pagePath && thread.deleted_at == null)
+          .map((thread) => [thread.id, thread])
+      );
+      return {
+        results: this.commentMessages
+          .filter((message) => validThreads.has(message.thread_id))
+          .map((message) => ({ ...message, thread_status: validThreads.get(message.thread_id)?.status || 'open' }))
+          .sort((a, b) => a.created_at - b.created_at),
       };
     }
 
@@ -491,34 +520,9 @@ describe('Worker Routes', () => {
 
       const body = await res.text();
       expect(body).toContain('<html>secret');
-      expect(body).toContain('toss-comments-root');
-      expect(body).toContain('X-Toss-Viewer');
-      expect(body).toContain('Comment target');
-      expect(body).toContain('Use whole page');
-      expect(body).toContain('toss-comment-draft-highlight');
-      expect(body).toContain('toss-comments-badge');
-      expect(body).toContain('toss-comments-notify-toggle');
-      expect(body).toContain('toss-comments-notifications');
-      expect(body).toContain('toss-comments-notification-list');
-      expect(body).toContain("activity.unread ? ' unread' : ''");
-      expect(body).toContain('describeActivities');
-      expect(body).toContain("state.activityFeed.filter((item) => item.id !== activityId)");
-      expect(body).toContain('Post Comment →');
-      expect(body).toContain('applyThreads = !silent');
-      expect(body).toContain("target.closest('button, textarea, input, label')");
-      expect(body).toContain('Jumped to the latest activity.');
-      expect(body).toContain('Replying to ');
-      expect(body).toContain('.toss-comments-message.parent');
-      expect(body).toContain('toss-comments-reply-input');
-      expect(body).toContain('Post Reply');
-      expect(body).toContain('visibilitychange');
-      expect(body).toContain('}, 2000);');
-      expect(body).toContain("document.addEventListener('click'");
-      expect(body).toContain('added a comment.');
-      expect(body).toContain(':nth-of-type(');
-      expect(body).toContain("parts.unshift('#' + node.id)");
-      expect(body).not.toContain('Pick Element');
-      expect(body).not.toContain('Use Selection');
+      expect(body).not.toContain('toss-comments-root');
+      expect(body).not.toContain('X-Toss-Viewer');
+      expect(body).not.toContain('Comment target');
     });
 
     it('should return 404 for missing artifact', async () => {
@@ -604,6 +608,31 @@ describe('Worker Routes', () => {
       expect(ownRevoke.status).toBe(200);
     });
 
+    it('does not inject comments UI or expose comment APIs in single-user mode', async () => {
+      const env = createEnv(kv, new StatefulMockD1() as unknown as MockD1);
+
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=single.html', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html><body><h1>Single user share</h1></body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string; slug: string };
+
+      const htmlResponse = await worker.fetch(new Request(`http://localhost/s/${artifact.slug}/`), env);
+      const htmlBody = await htmlResponse.text();
+      expect(htmlResponse.status).toBe(200);
+      expect(htmlBody).not.toContain('toss-comments-root');
+      expect(htmlBody).not.toContain('Discuss this shared page');
+
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      const viewerToken = await signJWT({ sub: artifact.id, iat: now, exp: now + 3600 }, SECRET);
+      const commentsResponse = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${OWNER}` },
+      }), env);
+      expect(commentsResponse.status).toBe(404);
+    });
+
     it('should support threaded comments with anchors, replies, resolve, edit, and delete permissions', async () => {
       const statefulDb = new StatefulMockD1();
       const memberAToken = 'member-a-token';
@@ -643,6 +672,7 @@ describe('Worker Routes', () => {
         },
         body: JSON.stringify({
           body: 'Hero heading should feel bolder.',
+          pagePath: 'index.html',
           scopeType: 'element',
           anchor: {
             selector: '#hero',
@@ -670,6 +700,7 @@ describe('Worker Routes', () => {
         },
         body: JSON.stringify({
           body: 'This sentence is the key message.',
+          pagePath: 'index.html',
           scopeType: 'selection',
           anchor: {
             selector: 'main p',
@@ -764,22 +795,28 @@ describe('Worker Routes', () => {
       }), env);
       expect(deleteOwnReply.status).toBe(204);
 
-      const threadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+      const threadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
         headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${memberAToken}` },
       }), env);
       expect(threadList.status).toBe(200);
       const threadData = await threadList.json() as {
+        pagePath: string;
         viewer: { authenticated: boolean; label: string | null };
+        activityThreads: Array<{ id: string; page_path: string }>;
         threads: Array<{
           id: string;
+          page_path: string;
           scope_type: string;
           status: string;
           anchor: { selector?: string; selectedText?: string } | null;
           messages: Array<{ body: string; deleted_at: number | null; can_edit: boolean; can_delete: boolean }>;
         }>;
       };
+      expect(threadData.pagePath).toBe('index.html');
       expect(threadData.viewer).toEqual({ authenticated: true, label: 'member-a' });
       expect(threadData.threads).toHaveLength(2);
+      expect(threadData.activityThreads).toHaveLength(2);
+      expect(threadData.threads.every((thread) => thread.page_path === 'index.html')).toBe(true);
       expect(threadData.threads.some((thread) => thread.scope_type === 'element' && thread.anchor?.selector === '#hero')).toBe(true);
       expect(threadData.threads.some((thread) => thread.scope_type === 'selection' && thread.anchor?.selectedText === 'Faster builds for every branch')).toBe(true);
       const reopenedThread = threadData.threads.find((thread) => thread.id === createdThread.id);
@@ -787,7 +824,7 @@ describe('Worker Routes', () => {
       expect(reopenedThread?.messages.some((message) => message.deleted_at !== null)).toBe(true);
       expect(reopenedThread?.messages.some((message) => message.body === 'Agree, and maybe tighten line height.' && message.can_edit)).toBe(false);
 
-      const memberBThreadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+      const memberBThreadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
         headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${memberBToken}` },
       }), env);
       expect(memberBThreadList.status).toBe(200);
@@ -815,9 +852,98 @@ describe('Worker Routes', () => {
           'X-Toss-Viewer': viewerToken,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body: 'Anonymous should not work', scopeType: 'artifact' }),
+        body: JSON.stringify({ body: 'Anonymous should not work', pagePath: 'index.html', scopeType: 'artifact' }),
       }), env);
       expect(anonymousCreate.status).toBe(401);
+    });
+
+    it('isolates comment threads by page path while still exposing artifact-wide activity', async () => {
+      const statefulDb = new StatefulMockD1();
+      const ownerHash = await sha256(OWNER);
+      const memberHash = await sha256('member-page-token');
+      statefulDb.users.push({ token_hash: ownerHash, label: 'admin', created_at: 1, is_admin: 1 });
+      statefulDb.users.push({ token_hash: memberHash, label: 'member-page', created_at: 2, is_admin: 0 });
+
+      const kv = new MockKV();
+      const env = {
+        ...createEnv(kv, statefulDb as unknown as MockD1),
+        MULTI_TENANT: 'true',
+      };
+
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site/index.html', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html><body><h1>Overview</h1></body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string };
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      const viewerToken = await signJWT({ sub: artifact.id, iat: now, exp: now + 3600 }, SECRET);
+
+      const createIndexThread = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer member-page-token',
+          'X-Toss-Viewer': viewerToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          body: 'Index page comment',
+          pagePath: 'index.html',
+          scopeType: 'artifact',
+        }),
+      }), env);
+      expect(createIndexThread.status).toBe(201);
+
+      const createFeaturesThread = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer member-page-token',
+          'X-Toss-Viewer': viewerToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          body: 'Features page comment',
+          pagePath: 'features.html',
+          scopeType: 'artifact',
+        }),
+      }), env);
+      expect(createFeaturesThread.status).toBe(201);
+
+      const indexThreads = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
+        headers: {
+          Authorization: 'Bearer member-page-token',
+          'X-Toss-Viewer': viewerToken,
+        },
+      }), env);
+      expect(indexThreads.status).toBe(200);
+      const indexData = await indexThreads.json() as {
+        pagePath: string;
+        threads: Array<{ page_path: string; messages: Array<{ body: string }> }>;
+        activityThreads: Array<{ page_path: string; messages: Array<{ body: string }> }>;
+      };
+      expect(indexData.pagePath).toBe('index.html');
+      expect(indexData.threads).toHaveLength(1);
+      expect(indexData.threads[0].page_path).toBe('index.html');
+      expect(indexData.threads[0].messages[0].body).toBe('Index page comment');
+      expect(indexData.activityThreads).toHaveLength(2);
+      expect(indexData.activityThreads.map((thread) => thread.page_path).sort()).toEqual(['features.html', 'index.html']);
+
+      const featureThreads = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=features.html&includeActivity=1`, {
+        headers: {
+          Authorization: 'Bearer member-page-token',
+          'X-Toss-Viewer': viewerToken,
+        },
+      }), env);
+      expect(featureThreads.status).toBe(200);
+      const featureData = await featureThreads.json() as {
+        pagePath: string;
+        threads: Array<{ page_path: string; messages: Array<{ body: string }> }>;
+      };
+      expect(featureData.pagePath).toBe('features.html');
+      expect(featureData.threads).toHaveLength(1);
+      expect(featureData.threads[0].page_path).toBe('features.html');
+      expect(featureData.threads[0].messages[0].body).toBe('Features page comment');
     });
   });
 });

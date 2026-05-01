@@ -180,12 +180,28 @@ async function requireViewerForArtifact(request: Request, artifactId: string, en
 
 type CommentScope = 'artifact' | 'element' | 'selection';
 
-function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null } | Response {
+function normalizePagePath(value: unknown): string | Response {
+  if (typeof value !== 'string') return new Response('Page path is required', { status: 400 });
+  let pagePath = value.trim().replace(/\\/g, '/');
+  if (!pagePath) pagePath = 'index.html';
+  if (pagePath.endsWith('/')) pagePath += 'index.html';
+  const parts = pagePath.split('/').filter((part) => part !== '' && part !== '.');
+  if (parts.some((part) => part === '..')) {
+    return new Response('Invalid page path', { status: 400 });
+  }
+  pagePath = parts.join('/') || 'index.html';
+  if (pagePath.length > 512) return new Response('Page path is too long', { status: 400 });
+  return pagePath;
+}
+
+function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null; pagePath: string } | Response {
   if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
-  const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown };
+  const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown; pagePath?: unknown };
   const message = typeof payload.body === 'string' ? payload.body.trim() : '';
   if (!message) return new Response('Comment body is required', { status: 400 });
   if (message.length > 4000) return new Response('Comment is too long', { status: 400 });
+  const pagePath = normalizePagePath(payload.pagePath ?? 'index.html');
+  if (pagePath instanceof Response) return pagePath;
 
   const scopeType = payload.scopeType === 'element' || payload.scopeType === 'selection' || payload.scopeType === 'artifact'
     ? payload.scopeType
@@ -193,7 +209,7 @@ function normalizeThreadInput(body: unknown): { body: string; scopeType: Comment
   if (!scopeType) return new Response('Invalid scope type', { status: 400 });
 
   if (scopeType === 'artifact') {
-    return { body: message, scopeType, anchorJson: null };
+    return { body: message, scopeType, anchorJson: null, pagePath };
   }
 
   if (!payload.anchor || typeof payload.anchor !== 'object') {
@@ -202,7 +218,7 @@ function normalizeThreadInput(body: unknown): { body: string; scopeType: Comment
 
   const anchorJson = JSON.stringify(payload.anchor);
   if (anchorJson.length > 6000) return new Response('Anchor is too large', { status: 400 });
-  return { body: message, scopeType, anchorJson };
+  return { body: message, scopeType, anchorJson, pagePath };
 }
 
 function normalizeMessageInput(body: unknown): string | Response {
@@ -213,7 +229,13 @@ function normalizeMessageInput(body: unknown): string | Response {
   return message;
 }
 
-function injectCommentsUI(html: string, config: { artifactId: string; viewerToken: string; origin: string }): string {
+function injectCommentsUI(html: string, config: {
+  artifactId: string;
+  viewerToken: string;
+  origin: string;
+  artifactBasePath: string;
+  currentPagePath: string;
+}): string {
   const payload = JSON.stringify(config);
   const shell = `
 <div id="toss-comments-root"></div>
@@ -235,6 +257,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
     unreadCount: 0,
     activityFeed: [],
     lastDigest: '',
+    activityThreads: [],
     pollTimer: null,
     replyThreadId: '',
     replyDraft: '',
@@ -248,6 +271,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
     .replace(/'/g, '&#39;');
 
   const root = document.getElementById('toss-comments-root');
+  const targetStorageKey = 'toss-comment-target:' + cfg.artifactId;
   root.innerHTML = '<style>' +
     '#toss-comments-root{position:fixed;top:0;right:0;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;color:#111827}' +
     '#toss-comments-root *{box-sizing:border-box}' +
@@ -353,6 +377,42 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
   const list = root.querySelector('.toss-comments-thread-list');
   const contextLabel = root.querySelector('.toss-comments-context-label');
   tokenInput.value = state.token;
+  const currentPagePath = cfg.currentPagePath || 'index.html';
+  const currentPageLabel = () => {
+    const tail = (currentPagePath.split('/').pop() || 'index.html').replace(/\.html?$/i, '');
+    if (!tail || tail === 'index') return 'Overview';
+    return tail.replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  };
+  const buildCommentsPath = (includeActivity = false) => {
+    const params = new URLSearchParams();
+    params.set('pagePath', currentPagePath);
+    if (includeActivity) params.set('includeActivity', '1');
+    return '/artifacts/' + cfg.artifactId + '/comment-threads?' + params.toString();
+  };
+  const buildPageUrl = (pagePath) => {
+    if (!pagePath || pagePath === 'index.html') return cfg.origin + cfg.artifactBasePath;
+    return cfg.origin + cfg.artifactBasePath + pagePath;
+  };
+  const setPendingTarget = (target) => {
+    try { sessionStorage.setItem(targetStorageKey, JSON.stringify(target)); } catch {}
+  };
+  const readPendingTarget = () => {
+    try {
+      const raw = sessionStorage.getItem(targetStorageKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+  const consumePendingTarget = () => {
+    const parsed = readPendingTarget();
+    if (!parsed || parsed.pagePath !== currentPagePath) return null;
+    try { sessionStorage.removeItem(targetStorageKey); } catch {}
+    return parsed;
+  };
 
   const selectorFor = (el) => {
     if (!(el instanceof Element)) return 'unknown';
@@ -467,8 +527,8 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
       return;
     }
     notificationList.innerHTML = state.activityFeed.map((activity, index) =>
-      '<button type="button" class="toss-comments-notification' + (activity.unread ? ' unread' : '') + '" data-thread-id="' + esc(activity.threadId || '') + '" data-activity-id="' + esc(activity.id || '') + '">' +
-        '<strong>' + esc(String(index + 1) + '. ' + (activity.actor || 'Someone')) + '</strong>' +
+      '<button type="button" class="toss-comments-notification' + (activity.unread ? ' unread' : '') + '" data-thread-id="' + esc(activity.threadId || '') + '" data-activity-id="' + esc(activity.id || '') + '" data-page-path="' + esc(activity.pagePath || 'index.html') + '">' +
+        '<strong>' + esc(String(index + 1) + '. ' + (activity.actor || 'Someone') + ' · ' + (activity.pageLabel || 'Overview')) + '</strong>' +
         '<span>' + esc(activity.snippet || activity.message || 'New activity') + '</span>' +
       '</button>'
     ).join('');
@@ -501,26 +561,34 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
     if (thread.resolved_by_label) return thread.resolved_by_label;
     return thread.created_by_label || '';
   };
+  const labelForPagePath = (pagePath) => {
+    const tail = String(pagePath || 'index.html').split('/').pop() || 'index.html';
+    const base = tail.replace(/\.html?$/i, '');
+    if (!base || base === 'index') return 'Overview';
+    return base.replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  };
   const describeActivities = (previousThreads, nextThreads) => {
     const previousById = new Map((previousThreads || []).map((thread) => [thread.id, thread]));
     const candidates = [];
     (nextThreads || []).forEach((thread) => {
       const previous = previousById.get(thread.id);
+      const pagePath = thread.page_path || 'index.html';
+      const pageLabel = labelForPagePath(pagePath);
       if (!previous) {
         const actor = latestActorForThread(thread);
         const newestMessage = (thread.messages || []).slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))[0];
-        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':create', updated_at: thread.updated_at || 0, actor, threadId: thread.id, message: (actor || 'Someone') + ' added a comment.', snippet: shortSnippet(newestMessage ? newestMessage.body : 'New comment on this page'), unread: true });
+        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':create', updated_at: thread.updated_at || 0, actor, threadId: thread.id, pagePath, pageLabel, message: (actor || 'Someone') + ' added a comment.', snippet: shortSnippet(newestMessage ? newestMessage.body : 'New comment on this page'), unread: true });
         return;
       }
       const previousMessages = new Map((previous.messages || []).map((message) => [message.id, message]));
       const newMessage = (thread.messages || []).find((message) => !previousMessages.has(message.id));
       if (newMessage) {
-        candidates.push({ id: thread.id + ':' + String(newMessage.updated_at || thread.updated_at || 0) + ':reply', updated_at: newMessage.updated_at || thread.updated_at || 0, actor: newMessage.author_label || '', threadId: thread.id, message: (newMessage.author_label || 'Someone') + ' replied to a comment.', snippet: shortSnippet(newMessage.body || 'New reply'), unread: true });
+        candidates.push({ id: thread.id + ':' + String(newMessage.updated_at || thread.updated_at || 0) + ':reply', updated_at: newMessage.updated_at || thread.updated_at || 0, actor: newMessage.author_label || '', threadId: thread.id, pagePath, pageLabel, message: (newMessage.author_label || 'Someone') + ' replied to a comment.', snippet: shortSnippet(newMessage.body || 'New reply'), unread: true });
         return;
       }
       if (thread.status !== previous.status) {
         const actor = thread.resolved_by_label || latestActorForThread(thread);
-        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':status:' + thread.status, updated_at: thread.updated_at || 0, actor, threadId: thread.id, message: (actor || 'Someone') + (thread.status === 'resolved' ? ' resolved a comment.' : ' reopened a comment.'), snippet: shortSnippet(anchorLabel(thread)), unread: true });
+        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':status:' + thread.status, updated_at: thread.updated_at || 0, actor, threadId: thread.id, pagePath, pageLabel, message: (actor || 'Someone') + (thread.status === 'resolved' ? ' resolved a comment.' : ' reopened a comment.'), snippet: shortSnippet(anchorLabel(thread)), unread: true });
         return;
       }
       const editedMessage = (thread.messages || []).find((message) => {
@@ -529,7 +597,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
       });
       if (editedMessage) {
         const suffix = editedMessage.deleted_at ? ' deleted a comment.' : ' updated a comment.';
-        candidates.push({ id: thread.id + ':' + String(editedMessage.updated_at || thread.updated_at || 0) + ':edit', updated_at: editedMessage.updated_at || thread.updated_at || 0, actor: editedMessage.author_label || '', threadId: thread.id, message: (editedMessage.author_label || 'Someone') + suffix, snippet: shortSnippet(editedMessage.deleted_at ? 'Comment deleted' : editedMessage.body), unread: true });
+        candidates.push({ id: thread.id + ':' + String(editedMessage.updated_at || thread.updated_at || 0) + ':edit', updated_at: editedMessage.updated_at || thread.updated_at || 0, actor: editedMessage.author_label || '', threadId: thread.id, pagePath, pageLabel, message: (editedMessage.author_label || 'Someone') + suffix, snippet: shortSnippet(editedMessage.deleted_at ? 'Comment deleted' : editedMessage.body), unread: true });
       }
     });
     candidates.sort((a, b) => b.updated_at - a.updated_at);
@@ -711,7 +779,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
   const render = () => {
     list.innerHTML = '';
     if (!state.threads.length) {
-      list.innerHTML = '<div class="toss-comments-empty">No comments yet.</div>';
+      list.innerHTML = '<div class="toss-comments-empty">No comments on ' + esc(currentPageLabel()) + ' yet.</div>';
       renderNotifications();
       renderPins();
       return;
@@ -798,6 +866,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
         const target = event.target;
         if (target instanceof HTMLElement && target.closest('button, textarea, input, label')) return;
         state.activeThreadId = thread.id;
+        markThreadNotificationsRead(thread.id);
         render();
         renderFocusHighlight();
       });
@@ -814,22 +883,23 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
     const { silent = false, applyThreads = !silent } = options;
     state.loading = true;
     try {
-      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads');
+      const data = await api(buildCommentsPath(true));
       const nextThreads = (data.threads || []).map(normalizeThread);
-      const previousThreads = state.threads;
+      const nextActivityThreads = (data.activityThreads || data.threads || []).map(normalizeThread);
+      const previousThreads = state.activityThreads;
       const previousDigest = state.lastDigest;
       const nextLabel = data.viewer && data.viewer.label ? data.viewer.label : '';
+      state.currentLabel = nextLabel;
       if (applyThreads) {
-        state.currentLabel = nextLabel;
         state.threads = nextThreads;
         state.loaded = true;
       }
-      const nextDigest = threadsDigest(nextThreads);
+      const nextDigest = threadsDigest(nextActivityThreads);
       if (!previousDigest) {
         state.lastDigest = nextDigest;
       } else if (previousDigest !== nextDigest) {
         state.lastDigest = nextDigest;
-        const activities = describeActivities(previousThreads, nextThreads);
+        const activities = describeActivities(previousThreads, nextActivityThreads);
         if (activities.length) {
           const incomingIds = new Set(activities.map((item) => item.id));
           state.activityFeed = [
@@ -838,6 +908,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
           ].sort((a, b) => b.updated_at - a.updated_at).slice(0, 25);
         }
       }
+      state.activityThreads = nextActivityThreads;
       if (!silent && state.token) {
         setStatus(state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.');
       } else if (!silent) {
@@ -845,6 +916,13 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
       }
       if (applyThreads) {
         render();
+        const pendingTarget = consumePendingTarget();
+        if (pendingTarget && pendingTarget.threadId) {
+          markNotificationRead(pendingTarget.activityId || '');
+          markThreadNotificationsRead(pendingTarget.threadId);
+          activateThread(pendingTarget.threadId);
+          setStatus('Jumped to the latest activity.');
+        }
       } else {
         renderNotifications();
         renderUnread();
@@ -996,6 +1074,13 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
     if (notificationItem instanceof HTMLElement) {
       const threadId = notificationItem.dataset.threadId;
       const activityId = notificationItem.dataset.activityId;
+      const pagePath = notificationItem.dataset.pagePath || 'index.html';
+      if (pagePath !== currentPagePath) {
+        setPendingTarget({ threadId, activityId, pagePath });
+        notifications.classList.remove('open');
+        window.location.href = buildPageUrl(pagePath);
+        return;
+      }
       panel.classList.add('open');
       notifications.classList.remove('open');
       markNotificationRead(activityId);
@@ -1084,6 +1169,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
           method: 'POST',
           body: JSON.stringify({
             body,
+            pagePath: currentPagePath,
             scopeType: state.pendingScope,
             anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor,
           }),
@@ -1253,7 +1339,13 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
 
   updateContext();
   startPolling();
-  loadThreads({ silent: true });
+  const bootTarget = readPendingTarget();
+  if (bootTarget && bootTarget.pagePath === currentPagePath) {
+    panel.classList.add('open');
+    loadThreads({ silent: true, applyThreads: true });
+  } else {
+    loadThreads({ silent: true });
+  }
   setStatus('Select text on the page to anchor a comment, or write to comment on the whole page.');
 })();
 </script>`;
@@ -1303,7 +1395,8 @@ async function serveArtifact(
   meta: ArtifactMeta,
   filePath: string,
   request: Request,
-  env: Env
+  env: Env,
+  routeConfig: { artifactBasePath: string }
 ): Promise<Response> {
   // expires_at = 0 means permanent (never expires).
   if (meta.expires_at > 0 && meta.expires_at < Math.floor(Date.now() / 1000)) {
@@ -1332,16 +1425,26 @@ async function serveArtifact(
 
   if (filePath.endsWith('.html')) {
     const html = typeof obj === 'string' ? obj : new TextDecoder().decode(obj);
+    headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
+    if (env.MULTI_TENANT !== 'true') {
+      headers['Cache-Control'] = 'private, no-store, max-age=0';
+      return new Response(html, { status: 200, headers });
+    }
     const viewerToken = await createViewerToken(meta.id, meta.expires_at, env.JWT_SECRET);
     // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
     const maxAge = meta.expires_at === 0
       ? 30 * 86400
       : Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
-    headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
     headers['Cache-Control'] = 'private, no-store, max-age=0';
     return new Response(
-      injectCommentsUI(html, { artifactId: meta.id, viewerToken, origin: new URL(request.url).origin }),
+      injectCommentsUI(html, {
+        artifactId: meta.id,
+        viewerToken,
+        origin: new URL(request.url).origin,
+        artifactBasePath: routeConfig.artifactBasePath,
+        currentPagePath: filePath,
+      }),
       { status: 200, headers }
     );
   } else {
@@ -1587,50 +1690,84 @@ export default {
       // ===== COMMENT THREADS =====
       const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
       if (commentListMatch && request.method === 'GET') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const artifactId = commentListMatch[1];
         const viewerCheck = await requireViewerForArtifact(request, artifactId, env);
         if (viewerCheck instanceof Response) return viewerCheck;
+        const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
+        if (pagePath instanceof Response) return pagePath;
+        const includeActivity = url.searchParams.get('includeActivity') === '1';
 
         const auth = await resolveUser(request, env);
         const threadQuery = await env.TOSS_DB.prepare(
-          'SELECT id, artifact_id, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
-        ).bind(artifactId).all();
+          'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+        ).bind(artifactId, pagePath).all();
         const messageQuery = await env.TOSS_DB.prepare(
-          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
-        ).bind(artifactId).all();
-
-        const threads = (threadQuery.results || []).map((thread) => ({
-          ...thread,
-          anchor: thread.anchor_json ? JSON.parse(String(thread.anchor_json)) : null,
-          can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
-          can_resolve: !!auth,
-          messages: [],
-        })) as Array<Record<string, unknown>>;
-
-        const byThread = new Map<string, Array<Record<string, unknown>>>();
-        for (const row of (messageQuery.results || []) as Array<Record<string, unknown>>) {
-          const items = byThread.get(String(row.thread_id)) || [];
-          items.push({
-            ...row,
-            can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
-            can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
-          });
-          byThread.set(String(row.thread_id), items);
+          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+        ).bind(artifactId, pagePath).all();
+        let activityThreadQuery: { results?: unknown[] } | null = null;
+        let activityMessageQuery: { results?: unknown[] } | null = null;
+        if (includeActivity) {
+          activityThreadQuery = await env.TOSS_DB.prepare(
+            'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+          ).bind(artifactId).all();
+          activityMessageQuery = await env.TOSS_DB.prepare(
+            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+          ).bind(artifactId).all();
         }
 
-        for (const thread of threads) {
-          thread.messages = byThread.get(String(thread.id)) || [];
-          delete thread.anchor_json;
-          delete thread.created_by_token_hash;
-        }
+        const hydrateThreads = (
+          threadRows: Array<Record<string, unknown>>,
+          messageRows: Array<Record<string, unknown>>
+        ) => {
+          const threads = threadRows.map((thread) => ({
+            ...thread,
+            anchor: thread.anchor_json ? JSON.parse(String(thread.anchor_json)) : null,
+            can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
+            can_resolve: !!auth,
+            messages: [],
+          })) as Array<Record<string, unknown>>;
+
+          const byThread = new Map<string, Array<Record<string, unknown>>>();
+          for (const row of messageRows) {
+            const items = byThread.get(String(row.thread_id)) || [];
+            items.push({
+              ...row,
+              can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
+              can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
+            });
+            byThread.set(String(row.thread_id), items);
+          }
+
+          for (const thread of threads) {
+            thread.messages = byThread.get(String(thread.id)) || [];
+            delete thread.anchor_json;
+            delete thread.created_by_token_hash;
+          }
+          return threads;
+        };
+
+        const threads = hydrateThreads(
+          (threadQuery.results || []) as Array<Record<string, unknown>>,
+          (messageQuery.results || []) as Array<Record<string, unknown>>
+        );
+        const activityThreads = includeActivity
+          ? hydrateThreads(
+            (activityThreadQuery?.results || []) as Array<Record<string, unknown>>,
+            (activityMessageQuery?.results || []) as Array<Record<string, unknown>>
+          )
+          : threads;
 
         return jsonResponse({
+          pagePath,
           viewer: { authenticated: !!auth, label: auth?.label || null },
           threads,
+          activityThreads,
         });
       }
 
       if (commentListMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const artifactId = commentListMatch[1];
         const viewerCheck = await requireViewerForArtifact(request, artifactId, env);
         if (viewerCheck instanceof Response) return viewerCheck;
@@ -1646,10 +1783,11 @@ export default {
         const messageId = generateId();
 
         await env.TOSS_DB.prepare(
-          'INSERT INTO comment_threads (id, artifact_id, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
           threadId,
           artifactId,
+          normalized.pagePath,
           auth.tokenHash,
           auth.label,
           normalized.scopeType,
@@ -1669,6 +1807,7 @@ export default {
           thread: {
             id: threadId,
             artifact_id: artifactId,
+            page_path: normalized.pagePath,
             created_by_label: auth.label,
             scope_type: normalized.scopeType,
             anchor: normalized.anchorJson ? JSON.parse(normalized.anchorJson) : null,
@@ -1697,6 +1836,7 @@ export default {
 
       const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
       if (threadMessageMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const threadId = threadMessageMatch[1];
         const auth = await requireUser(request, env);
         if (auth instanceof Response) return auth;
@@ -1739,6 +1879,7 @@ export default {
 
       const threadResolveMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/(resolve|reopen)$/);
       if (threadResolveMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const threadId = threadResolveMatch[1];
         const action = threadResolveMatch[2];
         const auth = await requireUser(request, env);
@@ -1773,6 +1914,7 @@ export default {
 
       const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
       if (threadDeleteMatch && request.method === 'DELETE') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const threadId = threadDeleteMatch[1];
         const auth = await requireUser(request, env);
         if (auth instanceof Response) return auth;
@@ -1797,6 +1939,7 @@ export default {
 
       const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
       if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const messageId = messageMatch[1];
         const auth = await requireUser(request, env);
         if (auth instanceof Response) return auth;
@@ -1885,6 +2028,9 @@ export default {
       const slugMatch = url.pathname.match(/^\/s\/([a-zA-Z0-9-]+)(?:\/(.*))?$/);
       if (slugMatch) {
         const slug = slugMatch[1];
+        if (!url.pathname.endsWith('/') && slugMatch[2] === undefined) {
+          return Response.redirect(`${url.origin}${url.pathname}/`, 302);
+        }
         const row = await env.TOSS_DB.prepare(
           'SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?'
         ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null }>();
@@ -1949,7 +2095,7 @@ export default {
         }
         filePath = parts.join('/');
 
-        return serveArtifact(row, filePath, request, env);
+        return serveArtifact(row, filePath, request, env, { artifactBasePath: `/s/${slug}/` });
       }
 
       // ===== SERVE by ID + JWT (/a/:id) =====
@@ -2000,7 +2146,7 @@ export default {
           id,
           expires_at: payload.permanent === true ? 0 : (payload.exp as number),
         };
-        return serveArtifact(meta, filePath, request, env);
+        return serveArtifact(meta, filePath, request, env, { artifactBasePath: `/a/${id}/` });
       }
 
       // Root (/)

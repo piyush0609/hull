@@ -284,12 +284,28 @@ async function requireViewerForArtifact(request: Request, artifactId: string): P
 
 type CommentScope = 'artifact' | 'element' | 'selection';
 
-function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null } | Response {
+function normalizePagePath(value: unknown): string | Response {
+  if (typeof value !== 'string') return new Response('Page path is required', { status: 400 });
+  let pagePath = value.trim().replace(/\\/g, '/');
+  if (!pagePath) pagePath = 'index.html';
+  if (pagePath.endsWith('/')) pagePath += 'index.html';
+  const parts = pagePath.split('/').filter((part) => part !== '' && part !== '.');
+  if (parts.some((part) => part === '..')) {
+    return new Response('Invalid page path', { status: 400 });
+  }
+  pagePath = parts.join('/') || 'index.html';
+  if (pagePath.length > 512) return new Response('Page path is too long', { status: 400 });
+  return pagePath;
+}
+
+function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null; pagePath: string } | Response {
   if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
-  const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown };
+  const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown; pagePath?: unknown };
   const message = typeof payload.body === 'string' ? payload.body.trim() : '';
   if (!message) return new Response('Comment body is required', { status: 400 });
   if (message.length > 4000) return new Response('Comment is too long', { status: 400 });
+  const pagePath = normalizePagePath(payload.pagePath ?? 'index.html');
+  if (pagePath instanceof Response) return pagePath;
 
   const scopeType = payload.scopeType === 'element' || payload.scopeType === 'selection' || payload.scopeType === 'artifact'
     ? payload.scopeType
@@ -297,7 +313,7 @@ function normalizeThreadInput(body: unknown): { body: string; scopeType: Comment
   if (!scopeType) return new Response('Invalid scope type', { status: 400 });
 
   if (scopeType === 'artifact') {
-    return { body: message, scopeType, anchorJson: null };
+    return { body: message, scopeType, anchorJson: null, pagePath };
   }
 
   if (!payload.anchor || typeof payload.anchor !== 'object') {
@@ -306,7 +322,7 @@ function normalizeThreadInput(body: unknown): { body: string; scopeType: Comment
 
   const anchorJson = JSON.stringify(payload.anchor);
   if (anchorJson.length > 6000) return new Response('Anchor is too large', { status: 400 });
-  return { body: message, scopeType, anchorJson };
+  return { body: message, scopeType, anchorJson, pagePath };
 }
 
 function normalizeMessageInput(body: unknown): string | Response {
@@ -317,7 +333,13 @@ function normalizeMessageInput(body: unknown): string | Response {
   return message;
 }
 
-function injectCommentsUI(html: string, config: { artifactId: string; viewerToken: string; origin: string }): string {
+function injectCommentsUI(html: string, config: {
+  artifactId: string;
+  viewerToken: string;
+  origin: string;
+  artifactBasePath: string;
+  currentPagePath: string;
+}): string {
   const payload = JSON.stringify(config);
   const shell = `
 <div id="toss-comments-root"></div>
@@ -326,6 +348,7 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
   const cfg = ${payload};
   const storageKey = 'toss-comment-token:' + cfg.artifactId;
   const state = { token: localStorage.getItem(storageKey) || '', threads: [], activeThreadId: '', pendingScope: 'artifact', pendingAnchor: null, pendingRects: [], currentLabel: '', busy: false, loaded: false, loading: false };
+  const currentPagePath = cfg.currentPagePath || 'index.html';
   const esc = (text) => String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   const root = document.getElementById('toss-comments-root');
   root.innerHTML = '<style>#toss-comments-root{position:fixed;top:0;right:0;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;color:#111827}#toss-comments-root *{box-sizing:border-box}.toss-comments-shell{display:flex;align-items:flex-start;gap:0}.toss-comments-toggle{margin:12px 0 0 auto;background:#111827;color:#fff;border:none;border-radius:999px 0 0 999px;padding:10px 14px;cursor:pointer;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}.toss-comments-panel{width:360px;max-width:calc(100vw - 24px);height:100vh;background:#fff;border-left:1px solid #e5e7eb;box-shadow:-12px 0 32px rgba(15,23,42,.12);display:none;flex-direction:column}.toss-comments-panel.open{display:flex}.toss-comments-header{padding:16px;border-bottom:1px solid #e5e7eb;background:#f8fafc;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.toss-comments-header-copy{min-width:0}.toss-comments-close{border:none;background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 10px;font-size:12px;font-weight:700;cursor:pointer}.toss-comments-title{font-weight:700;font-size:16px;margin:0 0 4px}.toss-comments-sub{font-size:12px;color:#64748b}.toss-comments-body{padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px}.toss-comments-card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff}.toss-comments-card.resolved{background:#f8fafc}.toss-comments-card.focused{border-color:#0f172a;box-shadow:0 0 0 3px rgba(15,23,42,.12)}.toss-comments-meta,.toss-comments-message-meta{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#64748b;margin-bottom:8px}.toss-comments-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.toss-comments-actions button,.toss-comments-auth button,.toss-comments-context button{background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer}.toss-comments-actions button.primary{background:#111827;color:#fff;border-color:#111827}.toss-comments-actions button.warn{color:#b91c1c;border-color:#fecaca;background:#fff5f5}.toss-comments-auth input,.toss-comments-textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:13px;background:#fff}.toss-comments-textarea{min-height:92px;resize:vertical}.toss-comments-auth{display:flex;gap:8px;flex-wrap:wrap}.toss-comments-auth input{flex:1 1 180px}.toss-comments-status{font-size:12px;color:#475569;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px;padding:10px}.toss-comments-context{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid #dbe4f0;border-radius:10px;background:#fff;font-size:12px;color:#334155}.toss-comments-context strong{display:block;color:#0f172a;font-size:12px}.toss-comments-context span{display:block;color:#64748b;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}.toss-comments-thread-list{display:flex;flex-direction:column;gap:12px}.toss-comment-draft-highlight{position:absolute;z-index:2147483645;background:rgba(250,204,21,.35);outline:1px solid rgba(202,138,4,.8);border-radius:4px;pointer-events:none}.toss-comment-focus-highlight{position:absolute;z-index:2147483644;background:rgba(59,130,246,.16);outline:2px solid rgba(37,99,235,.8);border-radius:6px;pointer-events:none}.toss-comment-pin{position:absolute;z-index:2147483646;width:18px;height:18px;border-radius:999px;background:#111827;color:#fff;border:2px solid #fff;box-shadow:0 8px 24px rgba(15,23,42,.25);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer}.toss-comment-pin.active{background:#2563eb}.toss-comment-chip{position:absolute;z-index:2147483647;border:none;border-radius:999px;background:#111827;color:#fff;padding:8px 12px;font-size:12px;font-weight:600;box-shadow:0 10px 30px rgba(15,23,42,.28);cursor:pointer}.toss-comments-thread-anchor{font-size:12px;color:#475569;background:#f8fafc;border-radius:8px;padding:8px;margin-bottom:8px}.toss-comments-message{padding:8px 0;border-top:1px solid #f1f5f9}.toss-comments-message:first-child{border-top:none;padding-top:0}.toss-comments-empty{font-size:13px;color:#64748b}</style><div class="toss-comments-shell"><button class="toss-comments-toggle" type="button">Comments</button><aside class="toss-comments-panel" aria-label="Comments sidebar"><div class="toss-comments-header"><div class="toss-comments-header-copy"><div class="toss-comments-title">Comments</div><div class="toss-comments-sub">Discuss this shared page</div></div><button class="toss-comments-close" type="button" aria-label="Close comments">Close</button></div><div class="toss-comments-body"><div class="toss-comments-auth"><input class="toss-comments-token" placeholder="Paste your toss token to comment" /><button class="toss-comments-save-token primary" type="button">Save Token</button><button class="toss-comments-clear-token" type="button">Clear</button></div><div class="toss-comments-status"></div><div class="toss-comments-context"><div><strong>Comment target</strong><span class="toss-comments-context-label">Whole page</span></div><button class="toss-comments-context-clear" type="button">Use whole page</button></div><textarea class="toss-comments-textarea" placeholder="Write a comment..."></textarea><button class="toss-comments-submit primary" type="button">Post Comment</button><div class="toss-comments-thread-list"></div></div></aside></div>';
@@ -356,13 +379,13 @@ function injectCommentsUI(html: string, config: { artifactId: string; viewerToke
   const updateThread = (threadId, updater) => { state.threads = state.threads.map((thread) => thread.id === threadId ? updater(thread) : thread); };
   const renderPins = () => { document.querySelectorAll('.toss-comment-pin').forEach((node) => node.remove()); state.threads.forEach((thread, index) => { if (thread.deleted_at || thread.scope_type === 'artifact' || !thread.anchor) return; const rect = rectFromAnchor(thread.anchor); if (!rect) return; const pin = document.createElement('button'); pin.type = 'button'; pin.className = 'toss-comment-pin' + (thread.id === state.activeThreadId ? ' active' : ''); pin.textContent = String(index + 1); pin.style.left = (rect.x || 0) + 'px'; pin.style.top = (rect.y || 0) + 'px'; pin.title = anchorLabel(thread); pin.addEventListener('click', () => { panel.classList.add('open'); ensureThreadsLoaded(); activateThread(thread.id); }); document.body.appendChild(pin); }); };
   const render = () => { list.innerHTML = ''; if (!state.threads.length) { list.innerHTML = '<div class=\"toss-comments-empty\">No comments yet.</div>'; renderPins(); clearFocusHighlight(); return; } state.threads.forEach((thread) => { const article = document.createElement('article'); article.className = 'toss-comments-card' + (thread.status === 'resolved' ? ' resolved' : ''); if (thread.id === state.activeThreadId) article.className += ' focused'; article.dataset.threadId = thread.id; const meta = document.createElement('div'); meta.className = 'toss-comments-meta'; meta.innerHTML = '<span>' + esc(thread.created_by_label) + '</span><span>' + esc(thread.status) + '</span>'; article.appendChild(meta); const anchor = document.createElement('div'); anchor.className = 'toss-comments-thread-anchor'; anchor.textContent = anchorLabel(thread); article.appendChild(anchor); (thread.messages || []).forEach((message) => { const box = document.createElement('div'); box.className = 'toss-comments-message'; box.innerHTML = '<div class=\"toss-comments-message-meta\"><span>' + esc(message.author_label) + '</span><span>' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span></div><div>' + esc(message.deleted_at ? 'Message deleted' : message.body) + '</div>'; if (!message.deleted_at && (message.can_edit || message.can_delete)) { const actions = document.createElement('div'); actions.className = 'toss-comments-actions'; if (message.can_edit) { const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = 'Edit'; edit.dataset.action = 'edit-message'; edit.dataset.messageId = message.id; edit.dataset.body = message.body; actions.appendChild(edit); } if (message.can_delete) { const del = document.createElement('button'); del.type = 'button'; del.textContent = 'Delete'; del.className = 'warn'; del.dataset.action = 'delete-message'; del.dataset.messageId = message.id; actions.appendChild(del); } box.appendChild(actions); } article.appendChild(box); }); const actions = document.createElement('div'); actions.className = 'toss-comments-actions'; actions.innerHTML = '<button type=\"button\" data-action=\"reply-thread\" data-thread-id=\"' + thread.id + '\">Reply</button>'; if (thread.can_resolve && thread.status !== 'resolved') actions.innerHTML += '<button type=\"button\" class=\"primary\" data-action=\"resolve-thread\" data-thread-id=\"' + thread.id + '\">Resolve</button>'; if (thread.can_resolve && thread.status === 'resolved') actions.innerHTML += '<button type=\"button\" data-action=\"reopen-thread\" data-thread-id=\"' + thread.id + '\">Reopen</button>'; if (thread.can_delete) actions.innerHTML += '<button type=\"button\" class=\"warn\" data-action=\"delete-thread\" data-thread-id=\"' + thread.id + '\">Delete Thread</button>'; article.appendChild(actions); article.addEventListener('click', () => { state.activeThreadId = thread.id; render(); renderFocusHighlight(); }); list.appendChild(article); }); renderPins(); renderFocusHighlight(); };
-  const loadThreads = async () => { state.loading = true; try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads'); state.threads = (data.threads || []).map(normalizeThread); state.currentLabel = data.viewer && data.viewer.label ? data.viewer.label : ''; state.loaded = true; setStatus(state.token ? (state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.') : 'Paste your toss token to create comments, reply, resolve, edit, or delete.'); render(); } catch (error) { setStatus(error.message || 'Failed to load comments.'); } finally { state.loading = false; } };
+  const loadThreads = async () => { state.loading = true; try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(currentPagePath) + '&includeActivity=1'); state.threads = (data.threads || []).map(normalizeThread); state.currentLabel = data.viewer && data.viewer.label ? data.viewer.label : ''; state.loaded = true; setStatus(state.token ? (state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.') : 'Paste your toss token to create comments, reply, resolve, edit, or delete.'); render(); } catch (error) { setStatus(error.message || 'Failed to load comments.'); } finally { state.loading = false; } };
   const ensureThreadsLoaded = async (force = false) => { if (state.loading) return; if (!force && state.loaded) return; await loadThreads(); };
   const openPanelForComment = () => { panel.classList.add('open'); ensureThreadsLoaded(); };
   const captureSelectionAnchor = (options = {}) => { const openPanel = !!options.openPanel; const silent = !!options.silent; const selection = window.getSelection(); if (!selection || selection.isCollapsed || !selection.toString().trim()) { if (!silent) setStatus('Select some text on the page first.'); return false; } const range = selection.getRangeAt(0); const rect = range.getBoundingClientRect(); const rects = Array.from(range.getClientRects()).map((clientRect) => ({ x: Math.round(clientRect.left + window.scrollX), y: Math.round(clientRect.top + window.scrollY), width: Math.round(clientRect.width), height: Math.round(clientRect.height) })).filter((clientRect) => clientRect.width > 0 && clientRect.height > 0); const selectedText = selection.toString().trim(); state.pendingScope = 'selection'; state.pendingAnchor = { selector: selectorFor(range.startContainer && range.startContainer.parentElement), selectedText, textSnippet: selectedText.slice(0, 240), rect: { x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }, startOffset: range.startOffset, endOffset: range.endOffset }; state.pendingRects = rects.length ? rects : [{ x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }]; renderDraftHighlight(); renderDraftChip(); updateContext(); setStatus('Selection captured. Add your comment.'); if (openPanel) openPanelForComment(); return true; };
   document.addEventListener('mouseup', (event) => { const target = event.target; if (target instanceof Node && root.contains(target)) return; captureSelectionAnchor({ openPanel: false, silent: true }); });
   document.addEventListener('keydown', (event) => { if (event.key !== 'Escape') return; const selection = window.getSelection(); if (selection) selection.removeAllRanges(); if (state.pendingScope === 'selection' || state.pendingRects.length) { resetPendingAnchor(); setStatus('Selection cleared.'); } });
-  root.addEventListener('click', async (event) => { const target = event.target; if (!(target instanceof HTMLElement)) return; const action = target.dataset.action; if (state.busy && !target.classList.contains('toss-comments-toggle')) return; if (target.classList.contains('toss-comments-toggle') || target.classList.contains('toss-comments-close')) { panel.classList.toggle('open'); if (panel.classList.contains('open')) ensureThreadsLoaded(); else { resetPendingAnchor(); state.activeThreadId = ''; clearFocusHighlight(); setStatus('Comments closed.'); } return; } if (target.classList.contains('toss-comments-save-token')) { state.token = tokenInput.value.trim(); if (state.token) localStorage.setItem(storageKey, state.token); setStatus('Token saved. Loading comment permissions...'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-clear-token')) { state.token = ''; tokenInput.value = ''; localStorage.removeItem(storageKey); setStatus('Comment token cleared.'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-context-clear')) { resetPendingAnchor(); setStatus('Comment will be posted on the whole page.'); return; } if (target.classList.contains('toss-comments-submit')) { if (!state.token) { setStatus('Paste your toss token first.'); return; } const body = textarea.value.trim(); if (!body) { setStatus('Write a comment first.'); return; } const draft = textarea.value; textarea.value = ''; captureSelectionAnchor({ silent: true }); const optimisticThreadId = tempId('thread'); const optimisticMessageId = tempId('message'); const now = Math.floor(Date.now() / 1000); upsertThread({ id: optimisticThreadId, artifact_id: cfg.artifactId, created_by_label: state.currentLabel || 'You', scope_type: state.pendingScope, anchor: state.pendingScope === 'artifact' ? null : state.pendingAnchor, status: 'open', resolved_by_label: null, resolved_at: null, deleted_at: null, created_at: now, updated_at: now, can_delete: true, can_resolve: true, messages: [{ id: optimisticMessageId, thread_id: optimisticThreadId, author_label: state.currentLabel || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true }] }, { prepend: true }); render(); scrollThreadIntoView(optimisticThreadId); try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ body, scopeType: state.pendingScope, anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor }) }, true); if (data && data.thread) { removeThread(optimisticThreadId); upsertThread(data.thread, { prepend: true }); render(); } resetPendingAnchor(); setStatus('Comment posted.'); } catch (error) { removeThread(optimisticThreadId); render(); textarea.value = draft; setStatus(error.message || 'Failed to post comment.'); } return; } if (!action) return; if (!state.token) { setStatus('Paste your toss token first.'); return; } try { if (action === 'reply-thread') { const body = window.prompt('Reply'); if (!body) return; const threadId = target.dataset.threadId; const optimisticMessageId = tempId('reply'); const now = Math.floor(Date.now() / 1000); updateThread(threadId, (thread) => ({ ...thread, updated_at: now, messages: [...(thread.messages || []), normalizeMessage({ id: optimisticMessageId, thread_id: threadId, author_label: state.currentLabel || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true })] })); render(); scrollThreadIntoView(threadId); const data = await api('/comment-threads/' + target.dataset.threadId + '/messages', { method: 'POST', body: JSON.stringify({ body }) }, true); if (data && data.message) { updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === optimisticMessageId ? normalizeMessage(data.message) : message) })); } } else if (action === 'resolve-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'resolved', resolved_by_label: state.currentLabel || 'You', resolved_at: Math.floor(Date.now() / 1000), messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/resolve', { method: 'POST' }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: data.resolvedByLabel, resolved_at: data.resolvedAt, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); } else if (action === 'reopen-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'open', resolved_by_label: null, resolved_at: null, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST' }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: null, resolved_at: null, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })) })); } else if (action === 'delete-thread') { if (!window.confirm('Delete this thread?')) return; if (state.activeThreadId === target.dataset.threadId) { state.activeThreadId = ''; clearFocusHighlight(); } removeThread(target.dataset.threadId); render(); await api('/comment-threads/' + target.dataset.threadId, { method: 'DELETE' }, true); } else if (action === 'edit-message') { const nextBody = window.prompt('Edit comment', target.dataset.body || ''); if (!nextBody) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: nextBody, updated_at: Math.floor(Date.now() / 1000) } : message) })); render(); const data = await api('/comment-messages/' + target.dataset.messageId, { method: 'PATCH', body: JSON.stringify({ body: nextBody }) }, true); updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: data.body, updated_at: data.updatedAt || message.updated_at } : message) })); } else if (action === 'delete-message') { if (!window.confirm('Delete this comment?')) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, deleted_at: Math.floor(Date.now() / 1000), body: '' } : message) })); render(); await api('/comment-messages/' + target.dataset.messageId, { method: 'DELETE' }, true); } render(); } catch (error) { setStatus(error.message || 'Action failed.'); } });
+  root.addEventListener('click', async (event) => { const target = event.target; if (!(target instanceof HTMLElement)) return; const action = target.dataset.action; if (state.busy && !target.classList.contains('toss-comments-toggle')) return; if (target.classList.contains('toss-comments-toggle') || target.classList.contains('toss-comments-close')) { panel.classList.toggle('open'); if (panel.classList.contains('open')) ensureThreadsLoaded(); else { resetPendingAnchor(); state.activeThreadId = ''; clearFocusHighlight(); setStatus('Comments closed.'); } return; } if (target.classList.contains('toss-comments-save-token')) { state.token = tokenInput.value.trim(); if (state.token) localStorage.setItem(storageKey, state.token); setStatus('Token saved. Loading comment permissions...'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-clear-token')) { state.token = ''; tokenInput.value = ''; localStorage.removeItem(storageKey); setStatus('Comment token cleared.'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-context-clear')) { resetPendingAnchor(); setStatus('Comment will be posted on the whole page.'); return; } if (target.classList.contains('toss-comments-submit')) { if (!state.token) { setStatus('Paste your toss token first.'); return; } const body = textarea.value.trim(); if (!body) { setStatus('Write a comment first.'); return; } const draft = textarea.value; textarea.value = ''; captureSelectionAnchor({ silent: true }); const optimisticThreadId = tempId('thread'); const optimisticMessageId = tempId('message'); const now = Math.floor(Date.now() / 1000); upsertThread({ id: optimisticThreadId, artifact_id: cfg.artifactId, created_by_label: state.currentLabel || 'You', scope_type: state.pendingScope, anchor: state.pendingScope === 'artifact' ? null : state.pendingAnchor, status: 'open', resolved_by_label: null, resolved_at: null, deleted_at: null, created_at: now, updated_at: now, can_delete: true, can_resolve: true, messages: [{ id: optimisticMessageId, thread_id: optimisticThreadId, author_label: state.currentLabel || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true }] }, { prepend: true }); render(); scrollThreadIntoView(optimisticThreadId); try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ body, pagePath: currentPagePath, scopeType: state.pendingScope, anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor }) }, true); if (data && data.thread) { removeThread(optimisticThreadId); upsertThread(data.thread, { prepend: true }); render(); } resetPendingAnchor(); setStatus('Comment posted.'); } catch (error) { removeThread(optimisticThreadId); render(); textarea.value = draft; setStatus(error.message || 'Failed to post comment.'); } return; } if (!action) return; if (!state.token) { setStatus('Paste your toss token first.'); return; } try { if (action === 'reply-thread') { const body = window.prompt('Reply'); if (!body) return; const threadId = target.dataset.threadId; const optimisticMessageId = tempId('reply'); const now = Math.floor(Date.now() / 1000); updateThread(threadId, (thread) => ({ ...thread, updated_at: now, messages: [...(thread.messages || []), normalizeMessage({ id: optimisticMessageId, thread_id: threadId, author_label: state.currentLabel || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true })] })); render(); scrollThreadIntoView(threadId); const data = await api('/comment-threads/' + target.dataset.threadId + '/messages', { method: 'POST', body: JSON.stringify({ body }) }, true); if (data && data.message) { updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === optimisticMessageId ? normalizeMessage(data.message) : message) })); } } else if (action === 'resolve-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'resolved', resolved_by_label: state.currentLabel || 'You', resolved_at: Math.floor(Date.now() / 1000), messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/resolve', { method: 'POST' }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: data.resolvedByLabel, resolved_at: data.resolvedAt, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); } else if (action === 'reopen-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'open', resolved_by_label: null, resolved_at: null, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST' }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: null, resolved_at: null, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })) })); } else if (action === 'delete-thread') { if (!window.confirm('Delete this thread?')) return; if (state.activeThreadId === target.dataset.threadId) { state.activeThreadId = ''; clearFocusHighlight(); } removeThread(target.dataset.threadId); render(); await api('/comment-threads/' + target.dataset.threadId, { method: 'DELETE' }, true); } else if (action === 'edit-message') { const nextBody = window.prompt('Edit comment', target.dataset.body || ''); if (!nextBody) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: nextBody, updated_at: Math.floor(Date.now() / 1000) } : message) })); render(); const data = await api('/comment-messages/' + target.dataset.messageId, { method: 'PATCH', body: JSON.stringify({ body: nextBody }) }, true); updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: data.body, updated_at: data.updatedAt || message.updated_at } : message) })); } else if (action === 'delete-message') { if (!window.confirm('Delete this comment?')) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, deleted_at: Math.floor(Date.now() / 1000), body: '' } : message) })); render(); await api('/comment-messages/' + target.dataset.messageId, { method: 'DELETE' }, true); } render(); } catch (error) { setStatus(error.message || 'Action failed.'); } });
   updateContext(); setStatus('Select text on the page to anchor a comment, or write to comment on the whole page.');
 })();
 </script>`;
@@ -375,7 +398,12 @@ interface ArtifactMeta {
   expires_at: number;
 }
 
-async function serveArtifact(meta: ArtifactMeta, filePath: string, request: Request): Promise<Response> {
+async function serveArtifact(
+  meta: ArtifactMeta,
+  filePath: string,
+  request: Request,
+  routeConfig: { artifactBasePath: string }
+): Promise<Response> {
   // expires_at = 0 means permanent (never expires).
   if (meta.expires_at > 0 && meta.expires_at < Math.floor(Date.now() / 1000)) {
     return new Response('Link expired', { status: 410 });
@@ -405,16 +433,26 @@ async function serveArtifact(meta: ArtifactMeta, filePath: string, request: Requ
     const response = await fetch(blobUrl(`artifacts/${meta.id}/files/${filePath}`), { headers: blobHeaders() });
     if (!response.ok) return new Response('Not found', { status: 404 });
     const html = await response.text();
+    headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
+    if (!MULTI_TENANT) {
+      headers['Cache-Control'] = 'private, no-store, max-age=0';
+      return new Response(html, { status: 200, headers });
+    }
     const viewerToken = await createViewerToken(meta.id, meta.expires_at, JWT_SECRET);
     // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
     const maxAge = meta.expires_at === 0
       ? 30 * 86400
       : Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
-    headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
     headers['Cache-Control'] = 'private, no-store, max-age=0';
     return new Response(
-      injectCommentsUI(html, { artifactId: meta.id, viewerToken, origin: new URL(request.url).origin }),
+      injectCommentsUI(html, {
+        artifactId: meta.id,
+        viewerToken,
+        origin: new URL(request.url).origin,
+        artifactBasePath: routeConfig.artifactBasePath,
+        currentPagePath: filePath,
+      }),
       { status: 200, headers }
     );
   } else {
@@ -635,39 +673,56 @@ export default async function handler(request: Request): Promise<Response> {
 
     const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
     if (commentListMatch && request.method === 'GET') {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
       const viewerCheck = await requireViewerForArtifact(request, artifactId);
       if (viewerCheck instanceof Response) return viewerCheck;
+      const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
+      if (pagePath instanceof Response) return pagePath;
+      const includeActivity = url.searchParams.get('includeActivity') === '1';
 
       const auth = await resolveUser(request);
       const sql = getSQL();
-      const threads = await sql`SELECT id, artifact_id, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND deleted_at IS NULL ORDER BY created_at DESC`;
-      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+      const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND deleted_at IS NULL ORDER BY created_at DESC`;
+      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+      const activityThreads = includeActivity
+        ? await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND deleted_at IS NULL ORDER BY created_at DESC`
+        : threads;
+      const activityMessages = includeActivity
+        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
+        : messages;
 
-      const grouped = new Map();
-      for (const row of messages) {
-        const items = grouped.get(row.thread_id) || [];
-        items.push({
-          ...row,
-          can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
-          can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
-        });
-        grouped.set(row.thread_id, items);
-      }
+      const hydrateThreads = (threadRows: any[], messageRows: any[]) => {
+        const grouped = new Map();
+        for (const row of messageRows) {
+          const items = grouped.get(row.thread_id) || [];
+          items.push({
+            ...row,
+            can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
+            can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
+          });
+          grouped.set(row.thread_id, items);
+        }
 
-      return authJson({
-        viewer: { authenticated: !!auth, label: auth?.label || null },
-        threads: threads.map((thread) => ({
+        return threadRows.map((thread) => ({
           ...thread,
           anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null,
           can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
           can_resolve: !!auth,
           messages: grouped.get(thread.id) || [],
-        })),
+        }));
+      };
+
+      return authJson({
+        pagePath,
+        viewer: { authenticated: !!auth, label: auth?.label || null },
+        threads: hydrateThreads(threads, messages),
+        activityThreads: hydrateThreads(activityThreads, activityMessages),
       });
     }
 
     if (commentListMatch && request.method === 'POST') {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
       const viewerCheck = await requireViewerForArtifact(request, artifactId);
       if (viewerCheck instanceof Response) return viewerCheck;
@@ -681,7 +736,7 @@ export default async function handler(request: Request): Promise<Response> {
       const now = Math.floor(Date.now() / 1000);
       const threadId = generateId();
       const messageId = generateId();
-      await sql`INSERT INTO comment_threads (id, artifact_id, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${auth.tokenHash}, ${auth.label}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
+      await sql`INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${normalized.pagePath}, ${auth.tokenHash}, ${auth.label}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
       await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${auth.tokenHash}, ${auth.label}, ${normalized.body}, ${now}, ${now})`;
       return authJson({
         id: threadId,
@@ -689,6 +744,7 @@ export default async function handler(request: Request): Promise<Response> {
         thread: {
           id: threadId,
           artifact_id: artifactId,
+          page_path: normalized.pagePath,
           created_by_label: auth.label,
           scope_type: normalized.scopeType,
           anchor: normalized.anchorJson ? JSON.parse(normalized.anchorJson) : null,
@@ -717,6 +773,7 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
     if (threadMessageMatch && request.method === 'POST') {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadMessageMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -754,6 +811,7 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadResolveMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/(resolve|reopen)$/);
     if (threadResolveMatch && request.method === 'POST') {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadResolveMatch[1];
       const action = threadResolveMatch[2];
       const auth = await requireUser(request);
@@ -782,6 +840,7 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
     if (threadDeleteMatch && request.method === 'DELETE') {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadDeleteMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -802,6 +861,7 @@ export default async function handler(request: Request): Promise<Response> {
 
     const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
     if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
+      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const messageId = messageMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -931,7 +991,7 @@ export default async function handler(request: Request): Promise<Response> {
       }
       filePath = parts.join('/');
 
-      return serveArtifact(rows[0], filePath, request);
+      return serveArtifact(rows[0], filePath, request, { artifactBasePath: `/s/${slug}/` });
     }
 
     // ===== SERVE by ID + JWT (/a/:id) =====
@@ -982,7 +1042,7 @@ export default async function handler(request: Request): Promise<Response> {
         id,
         expires_at: payload.permanent === true ? 0 : (payload.exp as number),
       };
-      return serveArtifact(meta, filePath, request);
+      return serveArtifact(meta, filePath, request, { artifactBasePath: `/a/${id}/` });
     }
 
     // ===== Root (/)
