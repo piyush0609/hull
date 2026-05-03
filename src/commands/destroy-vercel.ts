@@ -8,7 +8,7 @@ const execAsync = promisify(exec);
 export async function destroyVercelCommand(options: { profile?: string; yes?: boolean } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
-    console.error('No configuration found. Run: toss setup --backend vercel');
+    console.error('No configuration found. Run: toss admin setup --backend vercel');
     process.exit(1);
   }
 
@@ -48,7 +48,7 @@ export async function destroyVercelCommand(options: { profile?: string; yes?: bo
   }
 
   // Clear config
-  const cleared = { endpoint: '', ownerToken: '', subdomain: '', backend: 'vercel' as const };
+  const cleared = { endpoint: '', token: '', subdomain: '', role: 'owner' as const, backend: 'vercel' as const };
   await saveConfig(cleared, options.profile);
 
   console.log('\n✅ Toss Vercel project destroyed.');

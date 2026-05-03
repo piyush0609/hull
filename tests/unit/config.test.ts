@@ -36,6 +36,13 @@ async function writeProfiles(active: string | undefined, profiles: Record<string
   await writeFile(profilesFile(), JSON.stringify({ active, profiles }));
 }
 
+function withLegacyToken(config: TossConfig) {
+  return {
+    ...config,
+    ownerToken: config.token || config.ownerToken,
+  };
+}
+
 describe('Config', () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'toss-test-'));
@@ -55,81 +62,81 @@ describe('Config', () => {
   it('should save and load config', async () => {
     const testConfig: TossConfig = {
       endpoint: 'https://toss-test.workers.dev',
-      ownerToken: 'deadbeef0123456789abcdef01234567',
+      token: 'deadbeef0123456789abcdef01234567',
       subdomain: 'test',
     };
 
     await saveConfig(testConfig);
     const loaded = await loadConfig();
 
-    expect(loaded).toEqual(testConfig);
+    expect(loaded).toEqual(withLegacyToken(testConfig));
   });
 
   it('should load default profile explicitly', async () => {
     const testConfig: TossConfig = {
       endpoint: 'https://default.workers.dev',
-      ownerToken: 'token-default',
+      token: 'token-default',
       subdomain: 'default',
     };
     await writeDefaultConfig(testConfig);
 
     const loaded = await loadConfig('default');
-    expect(loaded).toEqual(testConfig);
+    expect(loaded).toEqual(withLegacyToken(testConfig));
   });
 
   it('should load named profile', async () => {
     const workConfig: TossConfig = {
       endpoint: 'https://work.workers.dev',
-      ownerToken: 'token-work',
+      token: 'token-work',
       subdomain: 'work',
     };
     await writeProfiles(undefined, { work: workConfig });
 
     const loaded = await loadConfig('work');
-    expect(loaded).toEqual(workConfig);
+    expect(loaded).toEqual(withLegacyToken(workConfig));
   });
 
   it('should use active profile when no profile specified', async () => {
     const workConfig: TossConfig = {
       endpoint: 'https://work.workers.dev',
-      ownerToken: 'token-work',
+      token: 'token-work',
       subdomain: 'work',
     };
     await writeProfiles('work', { work: workConfig });
 
     const loaded = await loadConfig();
-    expect(loaded).toEqual(workConfig);
+    expect(loaded).toEqual(withLegacyToken(workConfig));
   });
 
   it('should fall back to default config when no active profile', async () => {
     const defaultConfig: TossConfig = {
       endpoint: 'https://default.workers.dev',
-      ownerToken: 'token-default',
+      token: 'token-default',
       subdomain: 'default',
     };
     await writeDefaultConfig(defaultConfig);
 
     const loaded = await loadConfig();
-    expect(loaded).toEqual(defaultConfig);
+    expect(loaded).toEqual(withLegacyToken(defaultConfig));
   });
 
   it('should fall back to default config when active is default', async () => {
     const defaultConfig: TossConfig = {
       endpoint: 'https://default.workers.dev',
-      ownerToken: 'token-default',
+      token: 'token-default',
       subdomain: 'default',
     };
     await writeDefaultConfig(defaultConfig);
     await writeProfiles('default', {});
 
     const loaded = await loadConfig();
-    expect(loaded).toEqual(defaultConfig);
+    expect(loaded).toEqual(withLegacyToken(defaultConfig));
   });
 
   it('should save to active profile when no profile specified', async () => {
     const workConfig: TossConfig = {
       endpoint: 'https://work.workers.dev',
-      ownerToken: 'token-work',
+      token: 'token-work',
       subdomain: 'work',
     };
     await writeProfiles('work', { work: workConfig });
@@ -141,13 +148,13 @@ describe('Config', () => {
     await saveConfig(updatedConfig);
 
     const loaded = await loadConfig('work');
-    expect(loaded).toEqual(updatedConfig);
+    expect(loaded).toEqual(withLegacyToken(updatedConfig));
   });
 
   it('should save to default config when no active profile', async () => {
     const defaultConfig: TossConfig = {
       endpoint: 'https://default.workers.dev',
-      ownerToken: 'token-default',
+      token: 'token-default',
       subdomain: 'default',
     };
     await writeDefaultConfig(defaultConfig);
@@ -159,13 +166,13 @@ describe('Config', () => {
     await saveConfig(updatedConfig);
 
     const loaded = await loadConfig('default');
-    expect(loaded).toEqual(updatedConfig);
+    expect(loaded).toEqual(withLegacyToken(updatedConfig));
   });
 
   it('should save to explicit default profile', async () => {
     const defaultConfig: TossConfig = {
       endpoint: 'https://default.workers.dev',
-      ownerToken: 'token-default',
+      token: 'token-default',
       subdomain: 'default',
     };
     await writeDefaultConfig(defaultConfig);
@@ -177,7 +184,7 @@ describe('Config', () => {
     await saveConfig(updatedConfig, 'default');
 
     const loaded = await loadConfig('default');
-    expect(loaded).toEqual(updatedConfig);
+    expect(loaded).toEqual(withLegacyToken(updatedConfig));
   });
 });
 
@@ -197,12 +204,12 @@ describe('getActiveProfile', () => {
   });
 
   it('should return default when only config.json exists', async () => {
-    await writeDefaultConfig({ endpoint: 'https://test.workers.dev', ownerToken: 't', subdomain: 's' });
+    await writeDefaultConfig({ endpoint: 'https://test.workers.dev', token: 't', subdomain: 's' });
     expect(await getActiveProfile()).toBe('default');
   });
 
   it('should return active profile name', async () => {
-    await writeProfiles('work', { work: { endpoint: 'https://work.workers.dev', ownerToken: 't', subdomain: 's' } });
+    await writeProfiles('work', { work: { endpoint: 'https://work.workers.dev', token: 't', subdomain: 's' } });
     expect(await getActiveProfile()).toBe('work');
   });
 });
@@ -219,18 +226,18 @@ describe('renameProfile', () => {
   });
 
   it('should rename a profile', async () => {
-    const config: TossConfig = { endpoint: 'https://old.workers.dev', ownerToken: 't', subdomain: 's' };
+    const config: TossConfig = { endpoint: 'https://old.workers.dev', token: 't', subdomain: 's' };
     await writeProfiles('old', { old: config });
 
     const ok = await renameProfile('old', 'new');
     expect(ok).toBe(true);
 
     expect(await loadConfig('old')).toBeNull();
-    expect(await loadConfig('new')).toEqual(config);
+    expect(await loadConfig('new')).toEqual(withLegacyToken(config));
   });
 
   it('should update active profile on rename', async () => {
-    const config: TossConfig = { endpoint: 'https://old.workers.dev', ownerToken: 't', subdomain: 's' };
+    const config: TossConfig = { endpoint: 'https://old.workers.dev', token: 't', subdomain: 's' };
     await writeProfiles('old', { old: config });
 
     await renameProfile('old', 'new');
@@ -246,8 +253,8 @@ describe('renameProfile', () => {
   });
 
   it('should fail if target exists', async () => {
-    const a: TossConfig = { endpoint: 'https://a.workers.dev', ownerToken: 't', subdomain: 's' };
-    const b: TossConfig = { endpoint: 'https://b.workers.dev', ownerToken: 't', subdomain: 's' };
+    const a: TossConfig = { endpoint: 'https://a.workers.dev', token: 't', subdomain: 's' };
+    const b: TossConfig = { endpoint: 'https://b.workers.dev', token: 't', subdomain: 's' };
     await writeProfiles('a', { a, b });
 
     expect(await renameProfile('a', 'b')).toBe(false);
@@ -266,30 +273,30 @@ describe('copyProfile', () => {
   });
 
   it('should copy default to named profile', async () => {
-    const config: TossConfig = { endpoint: 'https://default.workers.dev', ownerToken: 't', subdomain: 's' };
+    const config: TossConfig = { endpoint: 'https://default.workers.dev', token: 't', subdomain: 's' };
     await writeDefaultConfig(config);
 
     const ok = await copyProfile('default', 'work');
     expect(ok).toBe(true);
-    expect(await loadConfig('work')).toEqual(config);
+    expect(await loadConfig('work')).toEqual(withLegacyToken(config));
   });
 
   it('should copy named to default', async () => {
-    const config: TossConfig = { endpoint: 'https://work.workers.dev', ownerToken: 't', subdomain: 's' };
+    const config: TossConfig = { endpoint: 'https://work.workers.dev', token: 't', subdomain: 's' };
     await writeProfiles('work', { work: config });
 
     const ok = await copyProfile('work', 'default');
     expect(ok).toBe(true);
-    expect(await loadConfig('default')).toEqual(config);
+    expect(await loadConfig('default')).toEqual(withLegacyToken(config));
   });
 
   it('should copy named to named', async () => {
-    const config: TossConfig = { endpoint: 'https://a.workers.dev', ownerToken: 't', subdomain: 's' };
+    const config: TossConfig = { endpoint: 'https://a.workers.dev', token: 't', subdomain: 's' };
     await writeProfiles('a', { a: config });
 
     const ok = await copyProfile('a', 'b');
     expect(ok).toBe(true);
-    expect(await loadConfig('b')).toEqual(config);
+    expect(await loadConfig('b')).toEqual(withLegacyToken(config));
   });
 
   it('should fail if source does not exist', async () => {

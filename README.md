@@ -1,11 +1,23 @@
 # toss
 
-Share HTML artifacts with access-controlled links. Self-hosted on **Cloudflare** or **Vercel** — your choice.
+Publish HTML files and folders with a simple share link.
 
+```bash
+toss ./report.html
+# → https://your-toss-domain/s/report-AbC1
 ```
-toss share ./report.html --expires 24h
-# → https://your-domain.com/s/report-AbC1
+
+From the repo during development, use:
+
+```bash
+npm run build
+./toss ./report.html
 ```
+
+`toss` now has two clearly separate modes:
+
+- Everyday usage: `toss`, `toss publish`, `toss list`, `toss revoke`, `toss login`
+- Owner setup: `toss admin setup`, `toss admin deploy`, `toss admin token ...`
 
 ## Install
 
@@ -13,265 +25,152 @@ toss share ./report.html --expires 24h
 curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
 ```
 
-The installer detects your OS/arch, downloads the latest binary from [GitHub Releases](https://github.com/piyush0609/toss/releases), and installs it to `/usr/local/bin` (or `~/.local/bin` with PATH auto-configured).
+The installer downloads the CLI and installs the `toss` binary. If compatible AI tool skill folders exist, it can also install `SKILL.md` guidance there.
 
-**Note:** `npm install -g toss-cli` is not yet available. Use the install script or build from source.
+If you are testing locally from source instead of installing globally, use `./toss ...` after `npm run build`.
 
-If `~/.claude/skills/` (Claude Code) or `~/.agents/skills/` (Codex/generic) exists, the installer also drops `SKILL.md` into it so any AI agent can guide you through setup, sharing, and tenant onboarding. Opt out with `TOSS_SKIP_SKILL=1 curl ... | sh`.
+## Simple Usage
 
----
-
-## Backends
-
-| Backend | Stack | Best For |
-|---------|-------|----------|
-| **Cloudflare** | Workers + D1 + KV | Free tier, no credit card |
-| **Vercel** | Edge Function + Neon + Blob | Postgres-native, larger files |
-
-Switch backends with `toss deploy --backend cloudflare` or `toss deploy --backend vercel`.
-
----
-
-## Quick Start (Cloudflare)
-
-### 1. Set up prerequisites
+If someone has already deployed toss for you, all you need is the endpoint and your upload token:
 
 ```bash
-toss setup
+toss login https://share.example.com --token <your-token>
+toss ./report.html
+toss ./site --expires 7d
+toss list
+toss revoke <slug-or-id>
+toss whoami
 ```
 
-- Checks Node.js version
-- Installs Wrangler if missing
-- Authenticates with Cloudflare (browser OAuth or API token)
-- Verifies your workers.dev subdomain
-
-### 2. Deploy
+### Default publish behavior
 
 ```bash
-toss deploy
-# Choose a subdomain, e.g. "you"
+toss
 ```
 
-Creates:
-- A Cloudflare Worker (`toss-you`)
-- A D1 database (`toss-db-you`)
-- A KV namespace (`toss-kv-you`)
+Running `toss` with no subcommand publishes the current directory. That makes the common flow work more like `surge`.
 
-### 3. Share
+### Publish options
 
 ```bash
-toss share ./index.html --expires 24h
+toss ./report.html --expires 24h
+toss ./site --password
+toss ./site --clipboard
+toss publish ./dist --json
 ```
 
----
+Available flags:
 
-## Quick Start (Vercel)
-
-### 1. Set up prerequisites
-
-```bash
-toss setup --backend vercel
-```
-
-- Checks Node.js and Vercel CLI
-- Authenticates with Vercel
-
-### 2. Deploy
-
-```bash
-toss deploy --backend vercel
-```
-
-Auto-provisions:
-- Vercel project
-- Neon Postgres database
-- Vercel Blob store
-
-### 3. Add a custom domain (optional)
-
-```bash
-# In Vercel dashboard: Project → Settings → Domains
-# Then update toss config:
-toss endpoint https://share.yourdomain.com
-```
-
----
-
-## Sharing
-
-### Basic share
-
-```bash
-toss share ./report.html --expires 24h
-```
-
-### Password-protected
-
-```bash
-toss share ./report.html --expires 7d --password
-# Secure interactive prompt (hidden input)
-```
-
-### Folder share
-
-```bash
-toss share ./my-site --expires 7d
-```
-
-Uploads all files recursively. First `index.html` (or first `.html`) becomes the entry point. All other files are served as static assets with proper MIME types and cookie-based auth.
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `--expires 1h\|24h\|7d\|30d` | Link lifetime (required) |
-| `--password` | Password-protect (secure prompt) |
-| `--password <value>` | Password via CLI (visible in history) |
-| `--clipboard` | Copy link to clipboard |
-| `--json` | Output JSON |
-| `--profile <name>` | Use a specific profile |
-
----
-
-## Management Commands
-
-```bash
-toss list                    # Show all shared artifacts
-toss revoke <slug>           # Delete an artifact
-toss info                    # Show endpoint, count, backend
-toss destroy                 # Tear down everything
-toss doctor                  # Check prerequisites
-```
-
----
+- `--expires 1h|24h|7d|30d` defaults to `24h`
+- `--password` prompts securely
+- `--password <value>` passes the password directly
+- `--clipboard` copies the URL
+- `--json` prints machine-readable output
+- `--profile <name>` uses a specific saved profile
 
 ## Profiles
 
-Manage multiple deployments (personal, work, client, tenant).
+Profiles let one machine talk to multiple toss services.
 
 ```bash
-toss profile list                        # List all profiles
-toss profile switch work                 # Switch active profile
-toss profile default work                # Set active profile
-toss share ./file.html --profile work    # One-off profile use
+toss profile list
+toss profile switch work
+toss profile show
+toss ./report.html --profile work
 ```
 
-**Storage:**
-- `~/.toss/config.json` — default profile
-- `~/.toss/profiles.json` — named profiles + active marker
+Owner deployments also use the profile name as the stable service name by default:
 
----
+- `owner` or no profile -> `toss`
+- `company-a` -> `toss-company-a`
+- `acme_team` -> `toss-acme-team`
 
-## Multi-Tenant Team Mode
+## Owner Setup
 
-Enable during `toss deploy` by selecting "Multi-tenant team".
+Use these commands only if you are the person deploying and managing the toss service.
 
-**Admin commands:**
+If you are running from source locally, the same commands become:
+
 ```bash
-toss token create --label "alice"        # Create a tenant token
-toss token list                          # List all tokens
-toss token revoke <hash>                 # Revoke a token
-toss token rotate                        # Regenerate admin token
+./toss admin setup
+./toss admin deploy
 ```
-
-**Tenant onboarding:**
-```bash
-# Admin creates token, sends to teammate
-toss token create --label "alice"
-
-# Teammate joins
-toss join https://your-domain.com --token <their-token> --profile alice
-
-# Or manually create a profile:
-toss profile switch alice
-toss endpoint https://your-domain.com
-toss token <their-token>
-```
-
-**Tenant isolation:**
-- Tenants can only see/upload/revoke their own artifacts
-- Admins see all artifacts across all tenants
-- Each artifact is tagged with the uploader's token hash
-
----
-
-## How It Works
 
 ### Cloudflare
 
-| Component | Purpose |
-|-----------|---------|
-| **Worker** | Edge compute — upload, serve, list, delete |
-| **D1** | SQLite metadata (id, slug, name, size, expiry) |
-| **KV** | File storage (25MB/value limit) |
+```bash
+toss admin setup
+toss admin deploy
+```
 
 ### Vercel
 
-| Component | Purpose |
-|-----------|---------|
-| **Edge Function** | Edge compute — upload, serve, list, delete |
-| **Neon** | Postgres metadata (id, slug, name, size, expiry) |
-| **Blob** | File storage via REST API |
+```bash
+toss admin setup --backend vercel
+toss admin deploy --backend vercel
+```
 
-### Auth Model
+For multiple separate deployments, use different owner profiles instead of passing extra naming flags:
 
-- **Upload** — hex owner token (stored in `~/.toss/config.json`, chmod 600)
-- **Share links** — Short slug URLs (`/s/:slug`) with optional password
-- **Legacy links** — HS256 JWT with `sub` (artifact ID) and `exp` (expiry)
-- **Passwords** — SHA-256 hashed with artifact ID as salt
-- **Folder sub-files** — HttpOnly cookie scoped to `/s/:slug`
+```bash
+toss admin deploy --backend vercel --profile owner
+toss admin deploy --backend vercel --profile company-a
+toss admin deploy --backend vercel --profile company-b
+```
 
-### Security Headers
+Backend choice is now an owner concern. Regular users should not need to know whether the service is running on Cloudflare or Vercel.
 
-- `Content-Security-Policy` — strict CSP for React apps
-- `X-Content-Type-Options: nosniff`
-- `Referrer-Policy: no-referrer`
-- `Cache-Control: private, no-store` (HTML never cached)
+## Team Tokens
 
-Static assets get `Cache-Control: public, max-age=86400, immutable`.
+Owners can create upload tokens for teammates:
 
----
+```bash
+toss admin token create --label alice
+toss admin token list
+toss admin token revoke <hash>
+toss admin members
+toss admin cleanup
+```
+
+Teammates then connect with:
+
+```bash
+toss login https://share.example.com --token <their-token>
+```
+
+## Other Commands
+
+```bash
+toss info
+toss whoami
+toss doctor
+toss skill install
+toss admin destroy
+```
 
 ## Configuration
 
-Stored in `~/.toss/config.json`:
+Toss stores connection details in `~/.toss/`.
+
+- `config.json` stores the default profile
+- `profiles.json` stores named profiles and the active profile marker
+
+Example config:
 
 ```json
 {
-  "endpoint": "https://your-domain.com",
-  "ownerToken": "...",
-  "subdomain": "you",
-  "backend": "vercel",
-  "vercelProjectId": "..."
+  "endpoint": "https://share.example.com",
+  "token": "your-upload-token",
+  "subdomain": "team",
+  "role": "member"
 }
 ```
 
----
+Owner profiles may also include backend-specific deployment metadata.
 
-## Limitations
+## Notes
 
-- **25MB total per upload** (Cloudflare KV / Vercel Blob limit)
-- **Max expiry 30d**
-- **No background cleanup** — expired artifacts stay in storage until revoked or destroyed
-- Cloudflare KV has eventual consistency (1–60s delay in some regions)
-
----
-
-## Development
-
-```bash
-git clone https://github.com/piyush0609/toss.git
-cd toss
-npm install
-npm run build
-npm test
-```
-
-Build standalone binaries:
-```bash
-npm run build:bin   # or ./build.sh
-```
-
-## License
-
-MIT
+- Cloudflare remains the default backend.
+- Vercel owner deployments can provision Neon and Blob resources.
+- Legacy commands like `toss share`, `toss deploy`, and `toss join` still work for compatibility, but the preferred interface is the simplified one above.
+- For local repo testing, prefer `./toss ...` over `node dist/index.js ...`.

@@ -1,19 +1,19 @@
-import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
+import { requireOwnerProfile } from '../lib/owner.js';
 
 export async function tokenCreateCommand(options: { label: string; profile?: string } = { label: '' }) {
-  const config = await loadConfig(options.profile);
-  if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
-    process.exit(1);
-  }
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   const api = new TossAPI(config);
   try {
     const res = await fetch(`${config.endpoint}/tokens`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${config.ownerToken}`,
+        Authorization: `Bearer ${config.token || config.ownerToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ label: options.label }),
@@ -28,7 +28,7 @@ export async function tokenCreateCommand(options: { label: string; profile?: str
     const data = await res.json() as { token: string; label: string };
     console.log(`✓ Token created for ${data.label}`);
     console.log(`  Token: ${data.token}`);
-    console.log(`  Setup: toss join ${config.endpoint} --token ${data.token}`);
+    console.log(`  Setup: toss login ${config.endpoint} --token ${data.token}`);
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -36,15 +36,15 @@ export async function tokenCreateCommand(options: { label: string; profile?: str
 }
 
 export async function tokenListCommand(options: { profile?: string } = {}) {
-  const config = await loadConfig(options.profile);
-  if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
-    process.exit(1);
-  }
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   try {
     const res = await fetch(`${config.endpoint}/tokens`, {
-      headers: { Authorization: `Bearer ${config.ownerToken}` },
+      headers: { Authorization: `Bearer ${config.token || config.ownerToken}` },
     });
 
     if (!res.ok) {
@@ -74,16 +74,16 @@ export async function tokenListCommand(options: { profile?: string } = {}) {
 }
 
 export async function tokenRevokeCommand(hash: string, options: { profile?: string } = {}) {
-  const config = await loadConfig(options.profile);
-  if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
-    process.exit(1);
-  }
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   try {
     const res = await fetch(`${config.endpoint}/tokens/${hash}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${config.ownerToken}` },
+      headers: { Authorization: `Bearer ${config.token || config.ownerToken}` },
     });
 
     if (!res.ok) {
@@ -100,13 +100,13 @@ export async function tokenRevokeCommand(hash: string, options: { profile?: stri
 }
 
 export async function tokenRotateCommand(options: { profile?: string } = {}) {
-  const config = await loadConfig(options.profile);
-  if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
-    process.exit(1);
-  }
+  const config = await requireOwnerProfile(
+    options.profile,
+    'Error: No toss connection found. Run "toss admin deploy" first.',
+    'Error: This profile is a member profile and cannot run admin token commands.'
+  );
 
   console.log('Token rotation requires re-deploying the worker with a new OWNER_TOKEN.');
-  console.log('Run: toss destroy && toss deploy --multi-tenant');
-  console.log('Then re-create user tokens with toss token create.');
+  console.log('Run: toss admin destroy && toss admin deploy --multi-tenant');
+  console.log('Then re-create user tokens with toss admin token create.');
 }

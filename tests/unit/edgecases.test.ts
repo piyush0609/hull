@@ -27,7 +27,7 @@ describe('Edge Cases & Failure Modes', () => {
     });
 
     it('should handle missing fields gracefully', async () => {
-      await saveConfig({ endpoint: 'http://test', ownerToken: 'abc', subdomain: 'test' });
+      await saveConfig({ endpoint: 'http://test', token: 'abc', subdomain: 'test' });
       // Should load without crashing
       const config = await loadConfig();
       expect(config).not.toBeNull();
@@ -50,7 +50,7 @@ describe('Edge Cases & Failure Modes', () => {
       });
 
       // Mock config so it passes config check but fails on file read
-      await saveConfig({ endpoint: 'http://test', ownerToken: 'abc', subdomain: 'test' });
+      await saveConfig({ endpoint: 'http://test', token: 'abc', subdomain: 'test' });
       await expect(shareCommand('/nonexistent/file.html', { expires: '1h' })).rejects.toThrow();
     });
   });

@@ -100,7 +100,6 @@ function getEmailFromWhoami(stdout: string): string | null {
 
 export async function setupCommand(options: { profile?: string; subdomain?: string; yes?: boolean } = {}) {
   const profileName = options.profile;
-  const presetSubdomain = options.subdomain;
   const autoYes = options.yes || !process.stdin.isTTY;
 
   if (profileName) {
@@ -120,19 +119,19 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     console.log('Toss Setup\n==========\n');
   }
 
-  // Prompt for subdomain if not provided and in TTY mode
-  let subdomain = presetSubdomain;
-  if (!subdomain && process.stdin.isTTY && !autoYes) {
-    subdomain = await prompt('Choose a deploy subdomain (e.g., rf, share, team): ');
-    if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
-      console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
-      process.exit(1);
-    }
-  }
+  const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
+  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → existing config → derived default.
+  const subdomain = options.subdomain
+    || process.env.TOSS_SUBDOMAIN
+    || existingConfig?.subdomain
+    || (!profileName || profileName === 'default' || profileName === 'owner'
+      ? 'toss'
+      : profileName.toLowerCase().replace(/_/g, '-'));
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
+  console.log(`Using deployment suffix: ${subdomain}`);
 
   // Check Node.js
   const nodeVersion = process.version;
@@ -361,13 +360,13 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
 
   // If profile mode: save auth to profile
   if (profileName) {
-    const existingConfig = await loadConfig(profileName);
-    const config = existingConfig || { endpoint: '', ownerToken: '', subdomain: '' };
+    const config = existingConfig || { endpoint: '', token: '', subdomain: '', role: 'owner' as const };
 
     // Update auth fields
     if (apiToken) config.apiToken = apiToken;
     if (accountId) config.accountId = accountId;
-    if (subdomain) config.subdomain = subdomain;
+    config.subdomain = subdomain;
+    config.role = 'owner';
 
     await saveConfig(config, profileName);
     await switchProfile(profileName);
@@ -382,10 +381,10 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     if (subdomain) {
       console.log(`   Subdomain: ${subdomain}`);
     }
-    console.log(`\n   Next: toss deploy --profile ${profileName}`);
+    console.log(`\n   Next: toss admin deploy --profile ${profileName}`);
   } else {
     console.log('\n✅ Setup complete. You can now run:');
-    console.log('   toss deploy');
+    console.log('   toss admin deploy');
   }
 
   if (process.stdin.isTTY) {

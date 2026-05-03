@@ -16,8 +16,10 @@ function profilesFile(): string {
 
 export interface TossConfig {
   endpoint: string;
-  ownerToken: string;
+  token?: string;
+  ownerToken?: string;
   subdomain: string;
+  role?: 'owner' | 'member';
   backend?: 'cloudflare' | 'vercel';
   kvId?: string;
   accountId?: string;
@@ -51,31 +53,49 @@ async function writeProfiles(data: ProfilesData): Promise<void> {
   await chmod(profilesFile(), 0o600);
 }
 
+function normalizeConfig(raw: TossConfig | null | undefined): TossConfig | null {
+  if (!raw) return null;
+  const token = raw.token || raw.ownerToken || '';
+  return {
+    ...raw,
+    token,
+    ownerToken: token,
+  };
+}
+
+function serializeConfig(config: TossConfig): TossConfig {
+  const normalized = normalizeConfig(config);
+  if (!normalized) throw new Error('Invalid config');
+
+  const { ownerToken, ...rest } = normalized;
+  return rest;
+}
+
 export async function loadConfig(profile?: string): Promise<TossConfig | null> {
   // If a specific profile is requested, load it directly
   if (profile) {
     if (profile === 'default') {
       try {
         const raw = await readFile(configFile(), 'utf-8');
-        return JSON.parse(raw);
+        return normalizeConfig(JSON.parse(raw));
       } catch {
         return null;
       }
     }
     const profiles = await readProfiles();
-    return profiles?.profiles[profile] ?? null;
+    return normalizeConfig(profiles?.profiles[profile] ?? null);
   }
 
   // Otherwise, check if there's an active profile
   const profiles = await readProfiles();
   if (profiles?.active && profiles.active !== 'default') {
-    return profiles.profiles[profiles.active] ?? null;
+    return normalizeConfig(profiles.profiles[profiles.active] ?? null);
   }
 
   // Fall back to default config
   try {
     const raw = await readFile(configFile(), 'utf-8');
-    return JSON.parse(raw);
+    return normalizeConfig(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -89,10 +109,12 @@ export async function getActiveProfile(): Promise<string | undefined> {
 }
 
 export async function saveConfig(config: TossConfig, profile?: string): Promise<void> {
+  const serializable = serializeConfig(config);
+
   // If explicit profile given, save directly
   if (profile && profile !== 'default') {
     const profiles = (await readProfiles()) || { profiles: {} };
-    profiles.profiles[profile] = config;
+    profiles.profiles[profile] = serializable;
     await writeProfiles(profiles);
     return;
   }
@@ -102,7 +124,7 @@ export async function saveConfig(config: TossConfig, profile?: string): Promise<
   if (!profile) {
     const profiles = await readProfiles();
     if (profiles?.active && profiles.active !== 'default') {
-      profiles.profiles[profiles.active] = config;
+      profiles.profiles[profiles.active] = serializable;
       await writeProfiles(profiles);
       return;
     }
@@ -111,7 +133,7 @@ export async function saveConfig(config: TossConfig, profile?: string): Promise<
   // Save to default config.json
   const dir = getTossDir();
   await mkdir(dir, { recursive: true });
-  await writeFile(configFile(), JSON.stringify(config, null, 2));
+  await writeFile(configFile(), JSON.stringify(serializable, null, 2));
   await chmod(configFile(), 0o600);
 }
 
@@ -122,11 +144,14 @@ export async function listProfiles(): Promise<{ active?: string; profiles: Recor
   const allProfiles: Record<string, TossConfig> = {};
   if (defaultExists) {
     try {
-      allProfiles.default = JSON.parse(await readFile(configFile(), 'utf-8'));
+      allProfiles.default = normalizeConfig(JSON.parse(await readFile(configFile(), 'utf-8')))!;
     } catch {}
   }
   if (profilesData) {
-    Object.assign(allProfiles, profilesData.profiles);
+    for (const [name, config] of Object.entries(profilesData.profiles)) {
+      const normalized = normalizeConfig(config);
+      if (normalized) allProfiles[name] = normalized;
+    }
   }
 
   return {
@@ -199,13 +224,13 @@ export async function copyProfile(from: string, to: string): Promise<boolean> {
   if (from === 'default') {
     try {
       const raw = await readFile(configFile(), 'utf-8');
-      sourceConfig = JSON.parse(raw);
+      sourceConfig = normalizeConfig(JSON.parse(raw));
     } catch {
       return false;
     }
   } else {
     if (!profiles || !profiles.profiles[from]) return false;
-    sourceConfig = profiles.profiles[from];
+    sourceConfig = normalizeConfig(profiles.profiles[from]);
   }
 
   if (!sourceConfig) return false;
@@ -213,11 +238,11 @@ export async function copyProfile(from: string, to: string): Promise<boolean> {
   if (to === 'default') {
     const dir = getTossDir();
     await mkdir(dir, { recursive: true });
-    await writeFile(configFile(), JSON.stringify(sourceConfig, null, 2));
+    await writeFile(configFile(), JSON.stringify(serializeConfig(sourceConfig), null, 2));
     await chmod(configFile(), 0o600);
   } else {
     const p = profiles || { profiles: {} };
-    p.profiles[to] = sourceConfig;
+    p.profiles[to] = serializeConfig(sourceConfig);
     await writeProfiles(p);
   }
   return true;

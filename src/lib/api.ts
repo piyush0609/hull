@@ -11,6 +11,10 @@ async function safeFetch(url: string, init: RequestInit): Promise<Response> {
 export class TossAPI {
   constructor(private config: TossConfig) {}
 
+  private authHeader(): string {
+    return `Bearer ${this.config.token || this.config.ownerToken || ''}`;
+  }
+
   async upload(html: Buffer, name: string, expiresSeconds: number, password?: string, id?: string): Promise<{ id: string; slug: string; url: string; legacyUrl: string; updated?: boolean }> {
     const url = new URL('/artifacts', this.config.endpoint);
     // expiresSeconds === 0 signals "never expires"
@@ -22,7 +26,7 @@ export class TossAPI {
     const res = await safeFetch(url.href, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.config.ownerToken}`,
+        Authorization: this.authHeader(),
         'Content-Type': 'text/html',
       },
       body: new Uint8Array(html),
@@ -42,7 +46,7 @@ export class TossAPI {
     const res = await safeFetch(url.href, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.config.ownerToken}`,
+        Authorization: this.authHeader(),
         'Content-Type': 'application/octet-stream',
       },
       body: new Uint8Array(data),
@@ -56,7 +60,7 @@ export class TossAPI {
 
   async list(): Promise<Array<{ id: string; slug?: string; name: string; size_bytes: number; created_at: number; expires_at: number }>> {
     const res = await safeFetch(`${this.config.endpoint}/artifacts`, {
-      headers: { Authorization: `Bearer ${this.config.ownerToken}` },
+      headers: { Authorization: this.authHeader() },
     });
     if (!res.ok) throw new Error(`List failed: ${res.status}`);
     return res.json();
@@ -65,7 +69,7 @@ export class TossAPI {
   async revoke(id: string): Promise<void> {
     const res = await safeFetch(`${this.config.endpoint}/artifacts/${id}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${this.config.ownerToken}` },
+      headers: { Authorization: this.authHeader() },
     });
     if (!res.ok) throw new Error(`Revoke failed: ${res.status}`);
   }

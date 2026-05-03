@@ -18,7 +18,7 @@ function fmtExpiry(msLeft: number): string {
 export async function listCommand(options: { profile?: string } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
+    console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
     process.exit(1);
   }
 

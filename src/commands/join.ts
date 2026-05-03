@@ -32,12 +32,13 @@ export async function joinCommand(endpoint: string, options: { token: string; pr
 
   await saveConfig({
     endpoint: url,
-    ownerToken: options.token,
+    token: options.token,
     subdomain,
+    role: 'member',
   }, options.profile);
 
   const profileLabel = options.profile ? ` (${options.profile})` : '';
   console.log(`✓ Connected to ${url}${profileLabel}`);
-  console.log('  toss share ./file.html --expires 24h');
+  console.log('  toss ./file.html');
   console.log('  toss list');
 }

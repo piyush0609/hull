@@ -72,7 +72,7 @@ async function walkDir(dir: string): Promise<string[]> {
 export async function shareCommand(file: string, options: { expires?: string; id?: string; clipboard?: boolean; json?: boolean; password?: string | true; profile?: string } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
-    console.error('Error: No toss found. Run "toss deploy" first.');
+    console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
     process.exit(1);
   }
 

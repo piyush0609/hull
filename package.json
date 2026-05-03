@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc && rm -rf dist/templates && cp -r src/templates dist/templates && cp SKILL.md dist/SKILL.md",
     "build:bin": "./build.sh",
+    "cli": "./toss",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "prepublishOnly": "npm run build"
