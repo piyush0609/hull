@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod, access } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod, access, rename } from 'fs/promises';
 import { join } from 'path';
 
 function getTossDir(): string {
@@ -37,10 +37,41 @@ async function fileExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
 }
 
+function isTransientJsonReadError(error: unknown): boolean {
+  return error instanceof SyntaxError;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readJsonWithRetry<T>(path: string, attempts = 3): Promise<T | null> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const raw = await readFile(path, 'utf-8');
+      return JSON.parse(raw) as T;
+    } catch (error) {
+      if (attempt === attempts || !isTransientJsonReadError(error)) {
+        return null;
+      }
+      await sleep(10);
+    }
+  }
+
+  return null;
+}
+
+async function writeJsonAtomically(path: string, data: unknown): Promise<void> {
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, JSON.stringify(data, null, 2));
+  await chmod(tempPath, 0o600);
+  await rename(tempPath, path);
+  await chmod(path, 0o600);
+}
+
 async function readProfiles(): Promise<ProfilesData | null> {
   try {
-    const raw = await readFile(profilesFile(), 'utf-8');
-    return JSON.parse(raw);
+    return await readJsonWithRetry<ProfilesData>(profilesFile());
   } catch {
     return null;
   }
@@ -49,8 +80,7 @@ async function readProfiles(): Promise<ProfilesData | null> {
 async function writeProfiles(data: ProfilesData): Promise<void> {
   const dir = getTossDir();
   await mkdir(dir, { recursive: true });
-  await writeFile(profilesFile(), JSON.stringify(data, null, 2));
-  await chmod(profilesFile(), 0o600);
+  await writeJsonAtomically(profilesFile(), data);
 }
 
 function normalizeConfig(raw: TossConfig | null | undefined): TossConfig | null {
@@ -76,8 +106,7 @@ export async function loadConfig(profile?: string): Promise<TossConfig | null> {
   if (profile) {
     if (profile === 'default') {
       try {
-        const raw = await readFile(configFile(), 'utf-8');
-        return normalizeConfig(JSON.parse(raw));
+        return normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
       } catch {
         return null;
       }
@@ -94,8 +123,7 @@ export async function loadConfig(profile?: string): Promise<TossConfig | null> {
 
   // Fall back to default config
   try {
-    const raw = await readFile(configFile(), 'utf-8');
-    return normalizeConfig(JSON.parse(raw));
+    return normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
   } catch {
     return null;
   }
@@ -133,8 +161,7 @@ export async function saveConfig(config: TossConfig, profile?: string): Promise<
   // Save to default config.json
   const dir = getTossDir();
   await mkdir(dir, { recursive: true });
-  await writeFile(configFile(), JSON.stringify(serializable, null, 2));
-  await chmod(configFile(), 0o600);
+  await writeJsonAtomically(configFile(), serializable);
 }
 
 export async function listProfiles(): Promise<{ active?: string; profiles: Record<string, TossConfig> }> {
@@ -144,7 +171,7 @@ export async function listProfiles(): Promise<{ active?: string; profiles: Recor
   const allProfiles: Record<string, TossConfig> = {};
   if (defaultExists) {
     try {
-      allProfiles.default = normalizeConfig(JSON.parse(await readFile(configFile(), 'utf-8')))!;
+      allProfiles.default = normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()))!;
     } catch {}
   }
   if (profilesData) {
@@ -223,8 +250,7 @@ export async function copyProfile(from: string, to: string): Promise<boolean> {
 
   if (from === 'default') {
     try {
-      const raw = await readFile(configFile(), 'utf-8');
-      sourceConfig = normalizeConfig(JSON.parse(raw));
+      sourceConfig = normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
     } catch {
       return false;
     }

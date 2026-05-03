@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readFile, writeFile, mkdir } from 'fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -185,6 +185,38 @@ describe('Config', () => {
 
     const loaded = await loadConfig('default');
     expect(loaded).toEqual(withLegacyToken(updatedConfig));
+  });
+
+  it('should retry when profiles.json is temporarily invalid during login/save handoff', async () => {
+    const memberConfig: TossConfig = {
+      endpoint: 'https://team.workers.dev',
+      token: 'token-member',
+      subdomain: 'team',
+      role: 'member',
+    };
+    await mkdir(join(tempDir, '.toss'), { recursive: true });
+    await writeFile(profilesFile(), '{"active":');
+    setTimeout(() => {
+      void writeProfiles(undefined, { member: memberConfig });
+    }, 1);
+
+    const loaded = await loadConfig('member');
+    expect(loaded).toEqual(withLegacyToken(memberConfig));
+  });
+
+  it('should write named profiles atomically without leaving temp files behind', async () => {
+    const memberConfig: TossConfig = {
+      endpoint: 'https://team.workers.dev',
+      token: 'token-member',
+      subdomain: 'team',
+      role: 'member',
+    };
+
+    await saveConfig(memberConfig, 'member');
+
+    const entries = await readdir(join(tempDir, '.toss'));
+    expect(entries.filter((name) => name.includes('.tmp'))).toEqual([]);
+    expect(await loadConfig('member')).toEqual(withLegacyToken(memberConfig));
   });
 });
 
