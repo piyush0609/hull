@@ -142,12 +142,15 @@ toss login https://share.example.com --token <alice-token>
 
 ## Cloudflare Setup
 
-Cloudflare is the default backend.
+When you run `toss admin setup` interactively, you'll be asked which backend
+to use (Cloudflare or Vercel). Pick Cloudflare here. In non-interactive
+contexts (`--yes`, CI), Cloudflare is used by default. To skip the prompt,
+pass `--backend cloudflare` explicitly.
 
 ### Happy path
 
 ```bash
-toss admin setup
+toss admin setup --backend cloudflare
 toss admin deploy --multi-tenant
 ```
 

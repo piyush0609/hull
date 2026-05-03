@@ -47,10 +47,33 @@ const backendHandlers = createBackendHandlers({
   },
 });
 
+export class BackendValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackendValidationError';
+  }
+}
+
 export function isBackendName(value: unknown): value is BackendName {
   return value === 'cloudflare' || value === 'vercel';
 }
 
+// Coerce a missing/empty value to undefined; otherwise return a valid backend
+// or throw. Used for explicit caller input (e.g. --backend) where a typo must
+// fail fast rather than silently fall through to a default.
+export function parseBackendName(value: string | undefined, source: string): BackendName | undefined {
+  if (value === undefined || value === '') return undefined;
+  const normalized = value.toLowerCase();
+  if (!isBackendName(normalized)) {
+    throw new BackendValidationError(
+      `Invalid backend "${value}" from ${source}. Must be one of: cloudflare, vercel.`
+    );
+  }
+  return normalized;
+}
+
+// Lenient variant for stored values (e.g. an old profile written before we
+// validated): unknown values become undefined so the caller can fall back.
 export function normalizeBackendName(value?: string): BackendName | undefined {
   if (!value) return undefined;
   const normalized = value.toLowerCase();
@@ -62,7 +85,7 @@ export function getBackendHandler(name: BackendName): BackendHandler {
 }
 
 export function resolveBackendForCommand(requestedBackend?: string, profileBackend?: string): BackendName {
-  const requested = normalizeBackendName(requestedBackend);
+  const requested = parseBackendName(requestedBackend, '--backend');
   if (requested) return requested;
 
   const saved = normalizeBackendName(profileBackend);
@@ -76,7 +99,7 @@ export async function resolveBackendForSetup(options: {
   profileBackend?: string;
   promptOnMissing?: boolean;
 } = {}): Promise<BackendName> {
-  const requested = normalizeBackendName(options.requestedBackend);
+  const requested = parseBackendName(options.requestedBackend, '--backend');
   if (requested) return requested;
 
   const saved = normalizeBackendName(options.profileBackend);

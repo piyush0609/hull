@@ -6,6 +6,7 @@ vi.mock('../../src/lib/prompt.js', () => ({
 
 import { promptSelect } from '../../src/lib/prompt.js';
 import {
+  BackendValidationError,
   createBackendHandlers,
   getBackendHandler,
   resolveBackendForCommand,
@@ -91,5 +92,52 @@ describe('Backend Router', () => {
   it('should expose real backend handlers', () => {
     expect(getBackendHandler('cloudflare').name).toBe('cloudflare');
     expect(getBackendHandler('vercel').name).toBe('vercel');
+  });
+
+  describe('invalid --backend handling', () => {
+    it('should throw BackendValidationError on typo in command resolution', () => {
+      expect(() => resolveBackendForCommand('cloudflrae', 'vercel')).toThrow(BackendValidationError);
+    });
+
+    it('should throw on typo in setup resolution', async () => {
+      await expect(resolveBackendForSetup({
+        requestedBackend: 'verkel',
+        profileBackend: 'cloudflare',
+        promptOnMissing: false,
+      })).rejects.toThrow(BackendValidationError);
+    });
+
+    it('should accept case-insensitive valid backend names', () => {
+      expect(resolveBackendForCommand('CLOUDFLARE', undefined)).toBe('cloudflare');
+      expect(resolveBackendForCommand('Vercel', undefined)).toBe('vercel');
+    });
+
+    it('should NOT throw when invalid value is in the saved profile (lenient fallback)', () => {
+      // Old/corrupted profiles must not crash CLI commands; the resolver
+      // should fall through to the cloudflare default instead.
+      expect(resolveBackendForCommand(undefined, 'mystery-backend')).toBe('cloudflare');
+    });
+  });
+
+  describe('backend switching', () => {
+    it('should let explicit cloudflare override a saved vercel profile', () => {
+      expect(resolveBackendForCommand('cloudflare', 'vercel')).toBe('cloudflare');
+    });
+
+    it('should let explicit cloudflare override a saved vercel profile during setup', async () => {
+      await expect(resolveBackendForSetup({
+        requestedBackend: 'cloudflare',
+        profileBackend: 'vercel',
+        promptOnMissing: false,
+      })).resolves.toBe('cloudflare');
+    });
+
+    it('should let explicit vercel override a saved cloudflare profile during setup', async () => {
+      await expect(resolveBackendForSetup({
+        requestedBackend: 'vercel',
+        profileBackend: 'cloudflare',
+        promptOnMissing: false,
+      })).resolves.toBe('vercel');
+    });
   });
 });

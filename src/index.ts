@@ -13,26 +13,44 @@ import { loadConfig } from './lib/config.js';
 import { whoamiCommand } from './commands/whoami.js';
 import { membersListCommand } from './commands/members.js';
 import { cleanupCommand } from './commands/cleanup.js';
-import { getBackendHandler, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-router.js';
+import { BackendValidationError, getBackendHandler, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-router.js';
+
+async function withBackendErrors<T>(fn: () => Promise<T>): Promise<T | void> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof BackendValidationError) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
+}
 
 async function routeDeploy(options: any) {
-  const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
-  await getBackendHandler(backend).deploy({ ...options, backend });
+  await withBackendErrors(async () => {
+    const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
+    await getBackendHandler(backend).deploy({ ...options, backend });
+  });
 }
 
 async function routeSetup(options: any) {
-  const profileBackend = (await loadConfig(options.profile))?.backend;
-  const backend = await resolveBackendForSetup({
-    requestedBackend: options.backend,
-    profileBackend,
-    promptOnMissing: process.stdin.isTTY && !options.yes,
+  await withBackendErrors(async () => {
+    const profileBackend = (await loadConfig(options.profile))?.backend;
+    const backend = await resolveBackendForSetup({
+      requestedBackend: options.backend,
+      profileBackend,
+      promptOnMissing: process.stdin.isTTY && !options.yes,
+    });
+    await getBackendHandler(backend).setup({ ...options, backend });
   });
-  await getBackendHandler(backend).setup({ ...options, backend });
 }
 
 async function routeDestroy(options: any) {
-  const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
-  await getBackendHandler(backend).destroy({ ...options, backend });
+  await withBackendErrors(async () => {
+    const backend = resolveBackendForCommand(options.backend, (await loadConfig(options.profile))?.backend);
+    await getBackendHandler(backend).destroy({ ...options, backend });
+  });
 }
 
 type PublishOptions = {

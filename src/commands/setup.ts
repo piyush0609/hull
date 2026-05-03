@@ -367,6 +367,10 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     if (accountId) config.accountId = accountId;
     config.subdomain = subdomain;
     config.role = 'owner';
+    // Persist the backend so a subsequent `admin deploy/destroy` (without
+    // --backend) routes to Cloudflare even if the profile was previously
+    // marked Vercel.
+    config.backend = 'cloudflare';
 
     await saveConfig(config, profileName);
     await switchProfile(profileName);
