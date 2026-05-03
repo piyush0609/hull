@@ -17,7 +17,13 @@ export async function cleanupCommand(options: { profile?: string; yes?: boolean 
     process.exit(1);
   }
 
-  const expired = artifacts.filter((artifact) => Number(artifact.expires_at) * 1000 < Date.now());
+  // expires_at = 0 means permanent (never expires) — must NEVER be cleaned up.
+  // Only rows with a positive expiry whose deadline has passed are eligible.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expired = artifacts.filter((artifact) => {
+    const exp = Number(artifact.expires_at);
+    return exp > 0 && exp < nowSec;
+  });
   if (expired.length === 0) {
     console.log('No expired artifacts found.');
     return;
