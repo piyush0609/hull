@@ -120,7 +120,10 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
   }
 
   const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
-  const subdomain = existingConfig?.subdomain
+  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → existing config → derived default.
+  const subdomain = options.subdomain
+    || process.env.TOSS_SUBDOMAIN
+    || existingConfig?.subdomain
     || (!profileName || profileName === 'default' || profileName === 'owner'
       ? 'toss'
       : profileName.toLowerCase().replace(/_/g, '-'));

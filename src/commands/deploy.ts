@@ -113,7 +113,7 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
   });
 }
 
-export async function deployCommand(options: { domain?: string; multiTenant?: boolean; profile?: string }) {
+export async function deployCommand(options: { domain?: string; multiTenant?: boolean; profile?: string; subdomain?: string }) {
   console.log('Setting up your toss on Cloudflare...\n');
 
   // Quick prereq check — direct to setup if anything is missing
@@ -220,7 +220,10 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     }
   }
 
-  const subdomain = deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
+  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → saved profile → derived default.
+  const subdomain = options.subdomain
+    || process.env.TOSS_SUBDOMAIN
+    || deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);

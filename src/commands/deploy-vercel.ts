@@ -126,6 +126,7 @@ export async function deployVercelCommand(options: {
   domain?: string;
   multiTenant?: boolean;
   profile?: string;
+  subdomain?: string;
   yes?: boolean;
   postgresUrl?: string;
   blobToken?: string;
@@ -196,7 +197,10 @@ export async function deployVercelCommand(options: {
   }
 
   // Stable service name comes from the profile by default.
-  const subdomain = deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
+  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → saved profile → derived default.
+  const subdomain = options.subdomain
+    || process.env.TOSS_SUBDOMAIN
+    || deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
   if (!/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
     process.exit(1);

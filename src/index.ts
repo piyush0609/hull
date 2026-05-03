@@ -242,19 +242,21 @@ admin
   .option('-d, --domain <domain>', 'Custom domain')
   .option('--multi-tenant', 'Enable multi-user team mode')
   .option('--profile <name>', 'Deploy to a specific profile')
+  .option('--subdomain <name>', 'Deployment suffix (overrides TOSS_SUBDOMAIN env)')
   .option('--backend <backend>', 'Deployment backend: cloudflare or vercel', 'cloudflare')
   .option('--postgres-url <url>', 'Postgres connection string (Vercel only)')
   .option('--blob-token <token>', 'Vercel Blob read-write token (Vercel only)')
   .option('-y, --yes', 'Skip interactive prompts')
-  .action((...args) => routeDeploy(getCommandOptions(args, ['domain', 'multiTenant', 'profile', 'backend', 'postgresUrl', 'blobToken', 'yes'])));
+  .action((...args) => routeDeploy(getCommandOptions(args, ['domain', 'multiTenant', 'profile', 'subdomain', 'backend', 'postgresUrl', 'blobToken', 'yes'])));
 
 admin
   .command('setup')
   .description('One-time owner setup: login and verify prerequisites')
   .option('--profile <name>', 'Configure auth for a specific profile')
+  .option('--subdomain <name>', 'Set the deployment suffix (overrides TOSS_SUBDOMAIN env)')
   .option('-y, --yes', 'Auto-accept defaults (non-interactive)')
   .option('--backend <backend>', 'Target backend: cloudflare or vercel', 'cloudflare')
-  .action((...args) => routeSetup(getCommandOptions(args, ['profile', 'yes', 'backend'])));
+  .action((...args) => routeSetup(getCommandOptions(args, ['profile', 'subdomain', 'yes', 'backend'])));
 
 admin
   .command('destroy')
@@ -341,6 +343,7 @@ program
   .option('-d, --domain <domain>')
   .option('--multi-tenant')
   .option('--profile <name>')
+  .option('--subdomain <name>')
   .option('--backend <backend>', 'Deployment backend: cloudflare or vercel', 'cloudflare')
   .option('--postgres-url <url>')
   .option('--blob-token <token>')
@@ -350,6 +353,7 @@ program
 program
   .command('setup', { hidden: true })
   .option('--profile <name>')
+  .option('--subdomain <name>')
   .option('-y, --yes')
   .option('--backend <backend>', 'Target backend: cloudflare or vercel', 'cloudflare')
   .action(routeSetup);

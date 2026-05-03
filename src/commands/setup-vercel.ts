@@ -33,7 +33,10 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
   }
 
   const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
-  const subdomain = deriveDeploymentSuffix(profileName, existingConfig?.subdomain);
+  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → existing config → derived default.
+  const subdomain = options.subdomain
+    || process.env.TOSS_SUBDOMAIN
+    || deriveDeploymentSuffix(profileName, existingConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
