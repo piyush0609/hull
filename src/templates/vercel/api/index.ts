@@ -325,6 +325,26 @@ async function requireViewerForArtifact(request: Request, artifactId: string): P
   }
 }
 
+// A viewer JWT can outlive the artifact (revoke leaves a still-valid token).
+// Every comment route runs this after the viewer check so a leaked URL can't
+// keep reading/posting against a deleted or expired artifact.
+async function requireLiveArtifact(artifactId: string): Promise<true | Response> {
+  const sql = getSQL();
+  const rows = await sql`SELECT expires_at FROM artifacts WHERE id = ${artifactId}`;
+  if (!rows[0]) return new Response('Not found', { status: 404 });
+  if (isArtifactExpired(rows[0].expires_at)) return new Response('Link expired', { status: 410 });
+  return true;
+}
+
+// Comment-API contract: caller must hold a valid viewer JWT scoped to the
+// artifact AND the artifact must still be live (not revoked, not expired).
+// Returns the first failing Response, or true.
+async function requireCommentAccess(request: Request, artifactId: string): Promise<true | Response> {
+  const viewer = await requireViewerForArtifact(request, artifactId);
+  if (viewer !== true) return viewer;
+  return requireLiveArtifact(artifactId);
+}
+
 type CommentScope = 'artifact' | 'element' | 'selection';
 
 function normalizePagePath(value: unknown): string | Response {
@@ -695,6 +715,11 @@ export default async function handler(request: Request): Promise<Response> {
       for (const p of paths) {
         await blobDelete(p);
       }
+      // Cascade comments before the artifact row so a half-failed revoke
+      // doesn't leave orphans with no way to find them again. Delete
+      // messages first (they reference threads via thread_id).
+      await sql`DELETE FROM comment_messages WHERE thread_id IN (SELECT id FROM comment_threads WHERE artifact_id = ${id})`;
+      await sql`DELETE FROM comment_threads WHERE artifact_id = ${id}`;
       await sql`DELETE FROM artifacts WHERE id = ${id}`;
 
       return authJson({ revoked: id });
@@ -704,8 +729,8 @@ export default async function handler(request: Request): Promise<Response> {
     if (commentListMatch && request.method === 'GET') {
       if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
-      const viewerCheck = await requireViewerForArtifact(request, artifactId);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, artifactId);
+      if (access instanceof Response) return access;
       const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
       if (pagePath instanceof Response) return pagePath;
       const includeActivity = url.searchParams.get('includeActivity') === '1';
@@ -753,8 +778,8 @@ export default async function handler(request: Request): Promise<Response> {
     if (commentListMatch && request.method === 'POST') {
       if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
-      const viewerCheck = await requireViewerForArtifact(request, artifactId);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, artifactId);
+      if (access instanceof Response) return access;
 
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -810,8 +835,8 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
       if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const viewerCheck = await requireViewerForArtifact(request, threadRows[0].artifact_id);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      if (access instanceof Response) return access;
 
       const message = normalizeMessageInput(await request.json().catch(() => null));
       if (message instanceof Response) return message;
@@ -849,8 +874,8 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
       if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const viewerCheck = await requireViewerForArtifact(request, threadRows[0].artifact_id);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      if (access instanceof Response) return access;
 
       const now = Math.floor(Date.now() / 1000);
       if (action === 'resolve') {
@@ -877,8 +902,8 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const threadRows = await sql`SELECT artifact_id, created_by_token_hash, deleted_at FROM comment_threads WHERE id = ${threadId}`;
       if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const viewerCheck = await requireViewerForArtifact(request, threadRows[0].artifact_id);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      if (access instanceof Response) return access;
       if (!auth.isAdmin && !constantTimeEqual(String(threadRows[0].created_by_token_hash), auth.tokenHash)) {
         return new Response('Forbidden', { status: 403 });
       }
@@ -898,8 +923,8 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
       if (!rows[0] || rows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const viewerCheck = await requireViewerForArtifact(request, rows[0].artifact_id);
-      if (viewerCheck instanceof Response) return viewerCheck;
+      const access = await requireCommentAccess(request, String(rows[0].artifact_id));
+      if (access instanceof Response) return access;
       if (!auth.isAdmin && !constantTimeEqual(String(rows[0].author_token_hash), auth.tokenHash)) {
         return new Response('Forbidden', { status: 403 });
       }

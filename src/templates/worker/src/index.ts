@@ -221,6 +221,27 @@ async function requireViewerForArtifact(request: Request, artifactId: string, en
   }
 }
 
+// A viewer JWT can outlive the artifact (revoke leaves a still-valid token).
+// Every comment route runs this after the viewer check so a leaked URL can't
+// keep reading/posting against a deleted or expired artifact.
+async function requireLiveArtifact(env: Env, artifactId: string): Promise<true | Response> {
+  const row = await env.TOSS_DB.prepare('SELECT expires_at FROM artifacts WHERE id = ?')
+    .bind(artifactId)
+    .first<{ expires_at: number }>();
+  if (!row) return new Response('Not found', { status: 404 });
+  if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
+  return true;
+}
+
+// Comment-API contract: caller must hold a valid viewer JWT scoped to the
+// artifact AND the artifact must still be live (not revoked, not expired).
+// Returns the first failing Response, or true.
+async function requireCommentAccess(request: Request, env: Env, artifactId: string): Promise<true | Response> {
+  const viewer = await requireViewerForArtifact(request, artifactId, env);
+  if (viewer !== true) return viewer;
+  return requireLiveArtifact(env, artifactId);
+}
+
 type CommentScope = 'artifact' | 'element' | 'selection';
 
 function normalizePagePath(value: unknown): string | Response {
@@ -1709,6 +1730,13 @@ export default {
           }
           cursor = list.list_complete ? undefined : list.cursor;
         } while (cursor);
+        // Cascade comments before the artifact row so a half-failed revoke
+        // doesn't leave orphans with no way to find them again. Delete
+        // messages first (they reference threads via thread_id).
+        await env.TOSS_DB.prepare(
+          'DELETE FROM comment_messages WHERE thread_id IN (SELECT id FROM comment_threads WHERE artifact_id = ?)'
+        ).bind(id).run();
+        await env.TOSS_DB.prepare('DELETE FROM comment_threads WHERE artifact_id = ?').bind(id).run();
         await env.TOSS_DB.prepare('DELETE FROM artifacts WHERE id = ?').bind(id).run();
 
         return new Response(JSON.stringify({ revoked: id }), {
@@ -1721,8 +1749,8 @@ export default {
       if (commentListMatch && request.method === 'GET') {
         if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const artifactId = commentListMatch[1];
-        const viewerCheck = await requireViewerForArtifact(request, artifactId, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, artifactId);
+        if (access instanceof Response) return access;
         const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
         if (pagePath instanceof Response) return pagePath;
         const includeActivity = url.searchParams.get('includeActivity') === '1';
@@ -1798,8 +1826,8 @@ export default {
       if (commentListMatch && request.method === 'POST') {
         if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
         const artifactId = commentListMatch[1];
-        const viewerCheck = await requireViewerForArtifact(request, artifactId, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, artifactId);
+        if (access instanceof Response) return access;
 
         const auth = await requireUser(request, env);
         if (auth instanceof Response) return auth;
@@ -1875,8 +1903,8 @@ export default {
         ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
         if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
 
-        const viewerCheck = await requireViewerForArtifact(request, threadRow.artifact_id, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
 
         const message = normalizeMessageInput(await request.json().catch(() => null));
         if (message instanceof Response) return message;
@@ -1919,8 +1947,8 @@ export default {
         ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
         if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
 
-        const viewerCheck = await requireViewerForArtifact(request, threadRow.artifact_id, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
 
         const now = Math.floor(Date.now() / 1000);
         if (action === 'resolve') {
@@ -1953,8 +1981,8 @@ export default {
         ).bind(threadId).first<{ artifact_id: string; created_by_token_hash: string; deleted_at: number | null }>();
         if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
 
-        const viewerCheck = await requireViewerForArtifact(request, threadRow.artifact_id, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
         if (!auth.isAdmin && !constantTimeEqual(threadRow.created_by_token_hash, auth.tokenHash)) {
           return new Response('Forbidden', { status: 403 });
         }
@@ -1978,8 +2006,8 @@ export default {
         ).bind(messageId).first<{ thread_id: string; author_token_hash: string; deleted_at: number | null; artifact_id: string; thread_status: string }>();
         if (!row || row.deleted_at) return new Response('Not found', { status: 404 });
 
-        const viewerCheck = await requireViewerForArtifact(request, row.artifact_id, env);
-        if (viewerCheck instanceof Response) return viewerCheck;
+        const access = await requireCommentAccess(request, env, row.artifact_id);
+        if (access instanceof Response) return access;
         if (!auth.isAdmin && !constantTimeEqual(row.author_token_hash, auth.tokenHash)) {
           return new Response('Forbidden', { status: 403 });
         }

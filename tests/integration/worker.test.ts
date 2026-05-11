@@ -146,6 +146,21 @@ class StatefulMockD1 {
       return { success: true };
     }
 
+    if (query.includes('DELETE FROM comment_messages WHERE thread_id IN (SELECT id FROM comment_threads WHERE artifact_id = ?)')) {
+      const artifactId = String(values[0]);
+      const threadIds = new Set(
+        this.commentThreads.filter((t) => t.artifact_id === artifactId).map((t) => t.id),
+      );
+      this.commentMessages = this.commentMessages.filter((m) => !threadIds.has(m.thread_id));
+      return { success: true };
+    }
+
+    if (query.includes('DELETE FROM comment_threads WHERE artifact_id = ?')) {
+      const artifactId = String(values[0]);
+      this.commentThreads = this.commentThreads.filter((t) => t.artifact_id !== artifactId);
+      return { success: true };
+    }
+
     if (query.includes('UPDATE comment_threads SET updated_at = ? WHERE id = ?')) {
       const updatedAt = Number(values[0]);
       const id = String(values[1]);
@@ -316,6 +331,12 @@ class StatefulMockD1 {
       const id = String(values[0]);
       const artifact = this.artifacts.find((a) => a.id === id);
       return (artifact ? { token_hash: artifact.token_hash } : null) as T | null;
+    }
+
+    if (query.includes('SELECT expires_at FROM artifacts WHERE id = ?')) {
+      const id = String(values[0]);
+      const artifact = this.artifacts.find((a) => a.id === id);
+      return (artifact ? { expires_at: artifact.expires_at } : null) as T | null;
     }
 
     if (query.includes('SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?')) {
@@ -855,6 +876,81 @@ describe('Worker Routes', () => {
         body: JSON.stringify({ body: 'Anonymous should not work', pagePath: 'index.html', scopeType: 'artifact' }),
       }), env);
       expect(anonymousCreate.status).toBe(401);
+    });
+
+    it('revoking an artifact blocks comment API access and cascades to comment rows', async () => {
+      // HIGH #2 from codex review: deleting an artifact left orphaned comment_threads
+      // and comment_messages rows, and a still-valid viewer JWT (up to 30 days of life)
+      // could keep reading and posting against the deleted artifact's comments.
+      // Two contracts get locked here:
+      //   1. Any comment-API hit for a missing artifact returns 404 — viewer-JWT
+      //      scope is necessary but not sufficient.
+      //   2. DELETE /artifacts/:id cascades to comment_threads + comment_messages.
+      const statefulDb = new StatefulMockD1();
+      const ownerHash = await sha256(OWNER);
+      statefulDb.users.push({ token_hash: ownerHash, label: 'admin', created_at: 1, is_admin: 1 });
+
+      const kv = new MockKV();
+      const env = {
+        ...createEnv(kv, statefulDb as unknown as MockD1),
+        MULTI_TENANT: 'true',
+      };
+
+      // Create an artifact and post a thread on it.
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site.html', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OWNER}` },
+        body: '<html><body><h1>Live</h1></body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string };
+
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      const viewerToken = await signJWT(
+        { sub: artifact.id, iat: now, exp: now + 3600 },
+        SECRET,
+      );
+
+      const threadCreate = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OWNER}`,
+          'X-Toss-Viewer': viewerToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ body: 'first thought', pagePath: 'index.html', scopeType: 'artifact' }),
+      }), env);
+      expect(threadCreate.status).toBe(201);
+      expect(statefulDb.commentThreads.filter((t) => t.artifact_id === artifact.id)).toHaveLength(1);
+      expect(statefulDb.commentMessages).toHaveLength(1);
+
+      // Revoke the artifact. The viewer JWT remains valid by signature/scope.
+      const revoke = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${OWNER}` },
+      }), env);
+      expect(revoke.status).toBe(200);
+
+      // Contract 1: comment-API hit for a now-missing artifact returns 404.
+      const list = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${OWNER}` },
+      }), env);
+      expect(list.status).toBe(404);
+
+      const postAttempt = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OWNER}`,
+          'X-Toss-Viewer': viewerToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ body: 'should not land', pagePath: 'index.html', scopeType: 'artifact' }),
+      }), env);
+      expect(postAttempt.status).toBe(404);
+
+      // Contract 2: comment rows for the revoked artifact are gone.
+      expect(statefulDb.commentThreads.filter((t) => t.artifact_id === artifact.id)).toHaveLength(0);
+      expect(statefulDb.commentMessages).toHaveLength(0);
     });
 
     it('isolates comment threads by page path while still exposing artifact-wide activity', async () => {
