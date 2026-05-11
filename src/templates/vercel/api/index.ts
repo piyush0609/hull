@@ -46,6 +46,55 @@ async function verifyJWT(token: string, secret: string): Promise<Record<string, 
   return JSON.parse(payload);
 }
 
+// --- Artifact expiry primitives ---
+// Single source of truth for "permanent vs time-bound" logic. Every place that
+// looks at expires_at, builds an artifact JWT, or sets a session cookie's
+// max-age routes through these helpers — keeps the permanent sentinel from
+// drifting across handlers.
+
+// expires_at = 0 in the DB and JWT payloads (alongside `permanent: true`) means
+// "never expires". Time-bound rows store a unix-seconds deadline.
+const PERMANENT = 0;
+// Session cookies for permanent shares can't borrow `expires_at - now`, so we
+// cap them at 30 days. Recipients re-auth after this window.
+const PERMANENT_COOKIE_MAX_AGE = 30 * 86400;
+
+function nowSeconds(): number { return Math.floor(Date.now() / 1000); }
+
+function isArtifactExpired(expiresAt: number, now = nowSeconds()): boolean {
+  return expiresAt > PERMANENT && expiresAt < now;
+}
+
+function artifactCookieMaxAge(expiresAt: number, now = nowSeconds()): number {
+  return expiresAt === PERMANENT
+    ? PERMANENT_COOKIE_MAX_AGE
+    : Math.max(0, expiresAt - now);
+}
+
+// Sign a JWT that scopes access to a single artifact. Permanent artifacts get
+// `permanent: true` plus a far-future `exp` (some clients require it); time-
+// bound artifacts get a real `exp`.
+async function issueArtifactJWT(artifactId: string, expiresAt: number, secret: string): Promise<string> {
+  const now = nowSeconds();
+  const payload = expiresAt === PERMANENT
+    ? { sub: artifactId, iat: now, permanent: true, exp: now + 100 * 365 * 86400 }
+    : { sub: artifactId, iat: now, exp: expiresAt };
+  return signJWT(payload, secret);
+}
+
+// Parse a previously-issued artifact JWT payload. Returns the normalized
+// expires_at (PERMANENT for permanent tokens, the original exp otherwise), or
+// null if the time-bound token has expired. Caller has already verified the
+// JWT signature and the `sub` field.
+function readArtifactJWT(payload: Record<string, unknown>, now = nowSeconds()): { expiresAt: number } | null {
+  if (payload.permanent === true) return { expiresAt: PERMANENT };
+  if (typeof payload.exp === 'number') {
+    if (payload.exp < now) return null;
+    return { expiresAt: payload.exp };
+  }
+  return null;
+}
+
 // --- Config from env ---
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const OWNER_TOKEN = process.env.OWNER_TOKEN || '';
@@ -262,20 +311,14 @@ function passwordForm(slug: string, error: boolean): string {
 </html>`;
 }
 
-async function createViewerToken(artifactId: string, expiresAt: number, secret: string): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  return signJWT({ sub: artifactId, iat: now, exp: expiresAt }, secret);
-}
-
 async function requireViewerForArtifact(request: Request, artifactId: string): Promise<true | Response> {
   const token = request.headers.get('X-Toss-Viewer');
   if (!token) return new Response('Missing viewer token', { status: 401 });
   try {
     const payload = await verifyJWT(token, JWT_SECRET);
     if (payload.sub !== artifactId) return new Response('Forbidden', { status: 403 });
-    if (typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) {
-      return new Response('Link expired', { status: 410 });
-    }
+    // readArtifactJWT handles both permanent (no exp check) and time-bound tokens uniformly.
+    if (!readArtifactJWT(payload)) return new Response('Link expired', { status: 410 });
     return true;
   } catch {
     return new Response('Invalid viewer token', { status: 401 });
@@ -404,8 +447,7 @@ async function serveArtifact(
   request: Request,
   routeConfig: { artifactBasePath: string }
 ): Promise<Response> {
-  // expires_at = 0 means permanent (never expires).
-  if (meta.expires_at > 0 && meta.expires_at < Math.floor(Date.now() / 1000)) {
+  if (isArtifactExpired(meta.expires_at)) {
     return new Response('Link expired', { status: 410 });
   }
 
@@ -438,11 +480,8 @@ async function serveArtifact(
       headers['Cache-Control'] = 'private, no-store, max-age=0';
       return new Response(html, { status: 200, headers });
     }
-    const viewerToken = await createViewerToken(meta.id, meta.expires_at, JWT_SECRET);
-    // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
-    const maxAge = meta.expires_at === 0
-      ? 30 * 86400
-      : Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
+    const viewerToken = await issueArtifactJWT(meta.id, meta.expires_at, JWT_SECRET);
+    const maxAge = artifactCookieMaxAge(meta.expires_at);
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
     headers['Cache-Control'] = 'private, no-store, max-age=0';
     return new Response(
@@ -571,22 +610,12 @@ export default async function handler(request: Request): Promise<Response> {
 
       await blobPut(`artifacts/${id}/files/index.html`, html, 'text/html');
 
-      // expires_at = 0 in the row signals "never expires".
-      const expiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
+      const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
       await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash})`;
 
-      // Legacy /a/:id?t=jwt URL — for permanent shares we mark the JWT with
-      // `permanent: true` so the verifier can normalize expires_at = 0 instead
-      // of treating the far-future `exp` as a real expiry (which would cause
-      // a 100-year cookie max-age).
-      const jwtPayload: Record<string, unknown> = { sub: id, iat: now };
-      if (expiresSeconds === 0) {
-        jwtPayload.permanent = true;
-        jwtPayload.exp = now + (100 * 365 * 86400);
-      } else {
-        jwtPayload.exp = now + expiresSeconds;
-      }
-      const jwt = await signJWT(jwtPayload, JWT_SECRET);
+      // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
+      // time-bound distinction so the verifier can normalize correctly.
+      const jwt = await issueArtifactJWT(id, expiresAt, JWT_SECRET);
       const legacyUrl = `${url.origin}/a/${id}?t=${jwt}`;
       const shortUrl = `${url.origin}/s/${slug}`;
 
@@ -938,8 +967,7 @@ export default async function handler(request: Request): Promise<Response> {
 
       if (!rows[0]) return new Response('Not found', { status: 404 });
 
-      // expires_at = 0 means permanent (never expires).
-      if (rows[0].expires_at > 0 && rows[0].expires_at < Math.floor(Date.now() / 1000)) {
+      if (isArtifactExpired(rows[0].expires_at)) {
         return new Response('Link expired', { status: 410 });
       }
 
@@ -955,10 +983,9 @@ export default async function handler(request: Request): Promise<Response> {
             const providedHash = password ? await sha256(password + rows[0].id) : '';
 
             if (constantTimeEqual(providedHash, rows[0].password_hash)) {
-              // Permanent shares: give the cookie a 30d life; time-bound shares: scope to remaining lifetime.
-              const maxAge = rows[0].expires_at === 0
-                ? 30 * 86400
-                : Math.max(0, rows[0].expires_at - Math.floor(Date.now() / 1000));
+              // Correct password: redirect with a session cookie scoped to
+              // this share's lifetime (capped at 30d for permanent shares).
+              const maxAge = artifactCookieMaxAge(rows[0].expires_at);
               return new Response(null, {
                 status: 302,
                 headers: {
@@ -1013,18 +1040,15 @@ export default async function handler(request: Request): Promise<Response> {
       }
       if (!token) return new Response('Missing token', { status: 401 });
 
-      let payload: Record<string, unknown>;
+      let verified: { expiresAt: number } | null;
       try {
-        payload = await verifyJWT(token, JWT_SECRET);
+        const payload = await verifyJWT(token, JWT_SECRET);
         if (payload.sub !== id) return new Response('Invalid token scope', { status: 403 });
-        // Permanent JWTs skip the exp check; everything else uses exp as before.
-        const isPermanent = payload.permanent === true;
-        if (!isPermanent && typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) {
-          return new Response('Link expired', { status: 410 });
-        }
+        verified = readArtifactJWT(payload);
       } catch {
         return new Response('Invalid token', { status: 401 });
       }
+      if (!verified) return new Response('Link expired', { status: 410 });
 
       let filePath = serveMatch[2] || 'index.html';
       if (filePath.endsWith('/')) filePath += 'index.html';
@@ -1036,12 +1060,9 @@ export default async function handler(request: Request): Promise<Response> {
       }
       filePath = parts.join('/');
 
-      // Normalize permanent tokens to expires_at = 0 so the cookie max-age
-      // and 410 guard in serveArtifact() take the permanent branch.
-      const meta: ArtifactMeta = {
-        id,
-        expires_at: payload.permanent === true ? 0 : (payload.exp as number),
-      };
+      // readArtifactJWT already returned PERMANENT (0) for permanent tokens,
+      // so meta.expires_at carries the canonical sentinel into serveArtifact.
+      const meta: ArtifactMeta = { id, expires_at: verified.expiresAt };
       return serveArtifact(meta, filePath, request, { artifactBasePath: `/a/${id}/` });
     }
 
