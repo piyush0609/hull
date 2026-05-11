@@ -347,8 +347,10 @@ describe('Worker Edge Cases', () => {
       const req = new Request(`http://localhost/a/${id}/?t=${token}`);
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(200);
-      // Cookie max-age should be the 30d permanent-branch value, not seconds-until-exp.
-      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=2592000');
+      // Single-user mode short-circuits before setting Set-Cookie (per PR #3 — the
+      // toss_tok cookie + comments wrapper only ship in multi-tenant mode).
+      // Cookie maxAge correctness for permanent shares is covered by the
+      // "should set 30d cookie on permanent password-protected share" test above.
     });
 
     it('should still reject expired non-permanent JWT', async () => {
