@@ -19,6 +19,51 @@ npm run build
 - Owner setup: you deploy and manage the shared toss service
 - Everyday usage: you connect to an existing toss service and publish files
 
+## Quick Start
+
+### Single-user
+
+Use this when you are publishing for yourself.
+
+```bash
+toss admin setup --backend cloudflare
+toss admin deploy --backend cloudflare
+toss ./report.html
+```
+
+or on Vercel:
+
+```bash
+toss admin setup --backend vercel
+toss admin deploy --backend vercel
+toss ./report.html
+```
+
+Single-user mode is the simplest path:
+
+- one owner token
+- no teammate tokens
+- no member isolation layer
+- no share-page comments UI
+
+### Team / Multi-tenant
+
+Use this when one deployed toss service is shared by multiple people.
+
+```bash
+toss admin setup --backend vercel
+toss admin deploy --backend vercel --multi-tenant
+toss admin token create --label alice
+toss login https://share.example.com --token <alice-token>
+```
+
+Multi-tenant mode adds:
+
+- member tokens
+- per-user artifact isolation
+- admin visibility across all members
+- share-page comments, replies, and notification UI
+
 ## Install
 
 ```bash
@@ -86,7 +131,7 @@ toss publish ./dist --json
 
 Available flags:
 
-- `--expires 1h|24h|7d|30d` defaults to `24h`
+- `--expires 1h|24h|7d|30d` sets link lifetime; omit it for a permanent link
 - `--password` prompts securely
 - `--password <value>` passes the password directly
 - `--clipboard` copies the URL
@@ -130,6 +175,12 @@ Recommended owner flow:
 
 ```bash
 toss admin setup
+toss admin deploy
+```
+
+If this toss service is for a team instead of just you:
+
+```bash
 toss admin deploy --multi-tenant
 toss admin token create --label alice
 ```
@@ -140,6 +191,25 @@ Then a teammate joins with:
 toss login https://share.example.com --token <alice-token>
 ```
 
+## Share-Page Collaboration
+
+Comments, threaded replies, and notification badges are available only in multi-tenant mode.
+
+What is supported:
+
+- page-level comments on shared HTML pages
+- text-selection comments on the shared page itself
+- threaded replies
+- resolve / reopen
+- notification bell for new activity from other viewers
+
+Important behavior:
+
+- single-user deployments do not expose the collaboration UI
+- comments are tied to the shared artifact
+- on multi-page folder shares, comments and replies are isolated per page
+- notifications can still point you across pages to the exact thread that changed
+
 ## Cloudflare Setup
 
 When you run `toss admin setup` interactively, you'll be asked which backend
@@ -149,9 +219,18 @@ pass `--backend cloudflare` explicitly.
 
 ### Happy path
 
+Single-user:
+
 ```bash
 toss admin setup --backend cloudflare
-toss admin deploy --multi-tenant
+toss admin deploy --backend cloudflare
+```
+
+Team / multi-tenant:
+
+```bash
+toss admin setup --backend cloudflare
+toss admin deploy --backend cloudflare --multi-tenant
 ```
 
 ### What `toss admin setup` does on Cloudflare
@@ -218,14 +297,14 @@ toss admin deploy
 ### Cloudflare owner commands
 
 ```bash
-toss admin setup
-toss admin deploy
-toss admin deploy --multi-tenant
-toss admin destroy
-toss admin members
-toss admin cleanup
-toss admin token create --label alice
-toss admin token list
+toss admin setup --backend cloudflare
+toss admin deploy --backend cloudflare
+toss admin deploy --backend cloudflare --multi-tenant
+toss admin destroy --backend cloudflare
+toss admin members --profile owner
+toss admin cleanup --profile owner
+toss admin token create --profile owner --label alice
+toss admin token list --profile owner
 ```
 
 ## Vercel Setup
@@ -233,6 +312,15 @@ toss admin token list
 Use Vercel when you want toss deployed on Vercel instead of Cloudflare.
 
 ### Happy path
+
+Single-user:
+
+```bash
+toss admin setup --backend vercel
+toss admin deploy --backend vercel
+```
+
+Team / multi-tenant:
 
 ```bash
 toss admin setup --backend vercel
@@ -329,6 +417,13 @@ Owner can inspect team state with:
 toss admin members
 toss admin token list
 toss list
+```
+
+For a personal deployment, you can stop after:
+
+```bash
+toss admin setup
+toss admin deploy
 ```
 
 ## Profiles

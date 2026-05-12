@@ -1,6 +1,11 @@
 const { neon } = require('@neondatabase/serverless');
 const fs = require('fs');
 const path = require('path');
+const {
+  ensureSchemaMigrationsTable,
+  getAppliedMigrations,
+  applyMigrationFile,
+} = require('./migration-runner.cjs');
 
 async function run() {
   const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
@@ -12,16 +17,18 @@ async function run() {
   try {
     const migrationsDir = path.join(__dirname, 'migrations');
     const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+    await ensureSchemaMigrationsTable(sql);
+    const applied = await getAppliedMigrations(sql);
     for (const file of files) {
-      const sqlText = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
-      const statements = sqlText
-        .split(';')
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
-      for (const stmt of statements) {
-        await sql.query(stmt);
+      if (applied.has(file)) {
+        console.log(`Skipped: ${file}`);
+        continue;
       }
-      console.log(`Applied: ${file}`);
+      const sqlText = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
+      const appliedNow = await applyMigrationFile(sql, file, sqlText);
+      if (appliedNow) {
+        console.log(`Applied: ${file}`);
+      }
     }
     console.log('Migrations complete.');
   } catch (err) {
