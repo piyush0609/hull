@@ -8,6 +8,55 @@ export interface Env {
   MULTI_TENANT?: string;
 }
 
+// --- Artifact expiry primitives ---
+// Single source of truth for "permanent vs time-bound" logic. Every place that
+// looks at expires_at, builds an artifact JWT, or sets a session cookie's
+// max-age routes through these helpers — keeps the permanent sentinel from
+// drifting across handlers.
+
+// expires_at = 0 in the DB and JWT payloads (alongside `permanent: true`) means
+// "never expires". Time-bound rows store a unix-seconds deadline.
+const PERMANENT = 0;
+// Session cookies for permanent shares can't borrow `expires_at - now`, so we
+// cap them at 30 days. Recipients re-auth after this window.
+const PERMANENT_COOKIE_MAX_AGE = 30 * 86400;
+
+function nowSeconds(): number { return Math.floor(Date.now() / 1000); }
+
+function isArtifactExpired(expiresAt: number, now = nowSeconds()): boolean {
+  return expiresAt > PERMANENT && expiresAt < now;
+}
+
+function artifactCookieMaxAge(expiresAt: number, now = nowSeconds()): number {
+  return expiresAt === PERMANENT
+    ? PERMANENT_COOKIE_MAX_AGE
+    : Math.max(0, expiresAt - now);
+}
+
+// Sign a JWT that scopes access to a single artifact. Permanent artifacts get
+// `permanent: true` plus a far-future `exp` (some clients require it); time-
+// bound artifacts get a real `exp`.
+async function issueArtifactJWT(artifactId: string, expiresAt: number, secret: string): Promise<string> {
+  const now = nowSeconds();
+  const payload = expiresAt === PERMANENT
+    ? { sub: artifactId, iat: now, permanent: true, exp: now + 100 * 365 * 86400 }
+    : { sub: artifactId, iat: now, exp: expiresAt };
+  return signJWT(payload, secret);
+}
+
+// Parse a previously-issued artifact JWT payload. Returns the normalized
+// expires_at (PERMANENT for permanent tokens, the original exp otherwise), or
+// null if the time-bound token has expired. Caller has already verified the
+// JWT signature and the `sub` field.
+function readArtifactJWT(payload: Record<string, unknown>, now = nowSeconds()): { expiresAt: number } | null {
+  if (payload.permanent === true) return { expiresAt: PERMANENT };
+  if (typeof payload.exp === 'number') {
+    if (payload.exp < now) return null;
+    return { expiresAt: payload.exp };
+  }
+  return null;
+}
+
 // --- Crypto helpers ---
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -32,6 +81,7 @@ async function sha256(text: string): Promise<string> {
 interface AuthUser {
   tokenHash: string;
   isAdmin: boolean;
+  label: string;
 }
 
 async function resolveUser(request: Request, env: Env): Promise<AuthUser | null> {
@@ -43,16 +93,16 @@ async function resolveUser(request: Request, env: Env): Promise<AuthUser | null>
   // Always check admin token first
   const adminHash = await sha256(env.OWNER_TOKEN);
   if (constantTimeEqual(tokenHash, adminHash)) {
-    return { tokenHash, isAdmin: true };
+    return { tokenHash, isAdmin: true, label: 'admin' };
   }
 
   // Multi-tenant mode: check registered users table
   if (env.MULTI_TENANT === 'true') {
-    const row = await env.TOSS_DB.prepare('SELECT is_admin FROM users WHERE token_hash = ?')
+    const row = await env.TOSS_DB.prepare('SELECT is_admin, label FROM users WHERE token_hash = ?')
       .bind(tokenHash)
-      .first<{ is_admin: number }>();
+      .first<{ is_admin: number; label?: string }>();
     if (row) {
-      return { tokenHash, isAdmin: row.is_admin === 1 };
+      return { tokenHash, isAdmin: row.is_admin === 1, label: row.label || 'member' };
     }
   }
 
@@ -141,6 +191,1233 @@ function passwordForm(slug: string, error: boolean): string {
 </html>`;
 }
 
+function jsonResponse(data: unknown, init: ResponseInit = {}): Response {
+  const headers = new Headers(init.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  return new Response(JSON.stringify(data), { ...init, headers });
+}
+
+function htmlEscape(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function requireViewerForArtifact(request: Request, artifactId: string, env: Env): Promise<true | Response> {
+  const token = request.headers.get('X-Toss-Viewer');
+  if (!token) return new Response('Missing viewer token', { status: 401 });
+
+  try {
+    const payload = await verifyJWT(token, env.JWT_SECRET);
+    if (payload.sub !== artifactId) return new Response('Forbidden', { status: 403 });
+    // readArtifactJWT handles both permanent (no exp check) and time-bound tokens uniformly.
+    if (!readArtifactJWT(payload)) return new Response('Link expired', { status: 410 });
+    return true;
+  } catch {
+    return new Response('Invalid viewer token', { status: 401 });
+  }
+}
+
+// A viewer JWT can outlive the artifact (revoke leaves a still-valid token).
+// Every comment route runs this after the viewer check so a leaked URL can't
+// keep reading/posting against a deleted or expired artifact.
+async function requireLiveArtifact(env: Env, artifactId: string): Promise<true | Response> {
+  const row = await env.TOSS_DB.prepare('SELECT expires_at FROM artifacts WHERE id = ?')
+    .bind(artifactId)
+    .first<{ expires_at: number }>();
+  if (!row) return new Response('Not found', { status: 404 });
+  if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
+  return true;
+}
+
+// Comment-API contract: caller must hold a valid viewer JWT scoped to the
+// artifact AND the artifact must still be live (not revoked, not expired).
+// Returns the first failing Response, or true.
+async function requireCommentAccess(request: Request, env: Env, artifactId: string): Promise<true | Response> {
+  const viewer = await requireViewerForArtifact(request, artifactId, env);
+  if (viewer !== true) return viewer;
+  return requireLiveArtifact(env, artifactId);
+}
+
+type CommentScope = 'artifact' | 'element' | 'selection';
+
+function normalizePagePath(value: unknown): string | Response {
+  if (typeof value !== 'string') return new Response('Page path is required', { status: 400 });
+  let pagePath = value.trim().replace(/\\/g, '/');
+  if (!pagePath) pagePath = 'index.html';
+  if (pagePath.endsWith('/')) pagePath += 'index.html';
+  const parts = pagePath.split('/').filter((part) => part !== '' && part !== '.');
+  if (parts.some((part) => part === '..')) {
+    return new Response('Invalid page path', { status: 400 });
+  }
+  pagePath = parts.join('/') || 'index.html';
+  if (pagePath.length > 512) return new Response('Page path is too long', { status: 400 });
+  return pagePath;
+}
+
+function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null; pagePath: string } | Response {
+  if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
+  const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown; pagePath?: unknown };
+  const message = typeof payload.body === 'string' ? payload.body.trim() : '';
+  if (!message) return new Response('Comment body is required', { status: 400 });
+  if (message.length > 4000) return new Response('Comment is too long', { status: 400 });
+  const pagePath = normalizePagePath(payload.pagePath ?? 'index.html');
+  if (pagePath instanceof Response) return pagePath;
+
+  const scopeType = payload.scopeType === 'element' || payload.scopeType === 'selection' || payload.scopeType === 'artifact'
+    ? payload.scopeType
+    : null;
+  if (!scopeType) return new Response('Invalid scope type', { status: 400 });
+
+  if (scopeType === 'artifact') {
+    return { body: message, scopeType, anchorJson: null, pagePath };
+  }
+
+  if (!payload.anchor || typeof payload.anchor !== 'object') {
+    return new Response('Anchor is required', { status: 400 });
+  }
+
+  const anchorJson = JSON.stringify(payload.anchor);
+  if (anchorJson.length > 6000) return new Response('Anchor is too large', { status: 400 });
+  return { body: message, scopeType, anchorJson, pagePath };
+}
+
+function normalizeMessageInput(body: unknown): string | Response {
+  if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
+  const message = typeof (body as { body?: unknown }).body === 'string' ? (body as { body: string }).body.trim() : '';
+  if (!message) return new Response('Comment body is required', { status: 400 });
+  if (message.length > 4000) return new Response('Comment is too long', { status: 400 });
+  return message;
+}
+
+function injectCommentsUI(html: string, config: {
+  artifactId: string;
+  viewerToken: string;
+  origin: string;
+  artifactBasePath: string;
+  currentPagePath: string;
+}): string {
+  const payload = JSON.stringify(config);
+  const shell = `
+<div id="toss-comments-root"></div>
+<script>
+(() => {
+  const cfg = ${payload};
+  const storageKey = 'toss-comment-token:' + cfg.artifactId;
+  const state = {
+    token: localStorage.getItem(storageKey) || '',
+    threads: [],
+    activeThreadId: '',
+    pendingScope: 'artifact',
+    pendingAnchor: null,
+    pendingRects: [],
+    currentLabel: '',
+    busy: false,
+    loaded: false,
+    loading: false,
+    unreadCount: 0,
+    activityFeed: [],
+    lastDigest: '',
+    activityThreads: [],
+    pollTimer: null,
+    replyThreadId: '',
+    replyDraft: '',
+  };
+
+  const esc = (text) => String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const root = document.getElementById('toss-comments-root');
+  const targetStorageKey = 'toss-comment-target:' + cfg.artifactId;
+  root.innerHTML = '<style>' +
+    '#toss-comments-root{position:fixed;top:0;right:0;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;color:#111827}' +
+    '#toss-comments-root *{box-sizing:border-box}' +
+    '.toss-comments-shell{display:flex;align-items:flex-start;gap:10px;margin:12px 0 0 auto}' +
+    '.toss-comments-toggle,.toss-comments-notify-toggle{background:#111827;color:#fff;border:none;border-radius:999px;padding:10px 14px;cursor:pointer;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}' +
+    '.toss-comments-notify-toggle{position:relative;padding:10px 12px;min-width:44px}' +
+    '.toss-comments-notify-toggle.has-unread{background:#1d4ed8;box-shadow:0 10px 28px rgba(37,99,235,.26)}' +
+    '.toss-comments-badge{display:none;margin-left:8px;min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:#facc15;color:#111827;font-size:11px;font-weight:800;line-height:18px;text-align:center}' +
+    '.toss-comments-notify-toggle .toss-comments-badge{position:absolute;top:-6px;right:-2px;margin-left:0}' +
+    '.toss-comments-notify-toggle.has-unread .toss-comments-badge{display:inline-block}' +
+    '.toss-comments-panel{width:360px;max-width:calc(100vw - 24px);height:100vh;background:#fff;border-left:1px solid #e5e7eb;box-shadow:-12px 0 32px rgba(15,23,42,.12);display:none;flex-direction:column}' +
+    '.toss-comments-panel.open{display:flex}' +
+    '.toss-notify-panel{position:fixed;top:58px;right:12px;width:320px;max-width:calc(100vw - 24px);max-height:320px;overflow:auto;background:#fff;border:1px solid #dbeafe;border-radius:16px;box-shadow:0 20px 40px rgba(15,23,42,.18);padding:10px;display:none;z-index:2147483647}' +
+    '.toss-notify-panel.open{display:block}' +
+    '.toss-comments-header{padding:16px;border-bottom:1px solid #e5e7eb;background:#f8fafc;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}' +
+    '.toss-comments-header-copy{min-width:0}' +
+    '.toss-comments-close{border:none;background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 10px;font-size:12px;font-weight:700;cursor:pointer}' +
+    '.toss-comments-title{font-weight:700;font-size:16px;margin:0 0 4px}' +
+    '.toss-comments-sub{font-size:12px;color:#64748b}' +
+    '.toss-comments-body{padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px}' +
+    '.toss-comments-card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff}' +
+    '.toss-comments-card.resolved{background:#f8fafc}' +
+    '.toss-comments-card.focused{border-color:#0f172a;box-shadow:0 0 0 3px rgba(15,23,42,.12)}' +
+    '.toss-comments-meta,.toss-comments-message-meta{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#64748b;margin-bottom:8px}' +
+    '.toss-comments-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}' +
+    '.toss-comments-actions button,.toss-comments-auth button,.toss-comments-context button{background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:7px 11px;font-size:12px;font-weight:600;cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease,background .15s ease}' +
+    '.toss-comments-actions button:hover,.toss-comments-auth button:hover,.toss-comments-context button:hover{transform:translateY(-1px);box-shadow:0 10px 20px rgba(15,23,42,.08);border-color:#94a3b8}' +
+    '.toss-comments-actions button.primary{background:linear-gradient(135deg,#111827,#2563eb);color:#fff;border-color:#111827;box-shadow:0 10px 22px rgba(37,99,235,.16)}' +
+    '.toss-comments-actions button.primary:hover{box-shadow:0 14px 26px rgba(37,99,235,.22)}' +
+    '.toss-comments-actions button.warn{color:#b91c1c;border-color:#fecaca;background:linear-gradient(180deg,#fff5f5,#ffe4e6)}' +
+    '.toss-comments-actions button[data-action=\"reply-thread\"],.toss-comments-actions button[data-action=\"reopen-thread\"],.toss-comments-actions button[data-action=\"edit-message\"]{background:linear-gradient(180deg,#f8fbff,#eef4ff);border-color:#bfdbfe;color:#1d4ed8}' +
+    '.toss-comments-actions button[data-action=\"resolve-thread\"]{background:linear-gradient(135deg,#0f766e,#10b981);border-color:#0f766e;color:#fff;box-shadow:0 10px 22px rgba(16,185,129,.18)}' +
+    '.toss-comments-actions button[data-action=\"resolve-thread\"]:hover{box-shadow:0 14px 26px rgba(16,185,129,.24)}' +
+    '.toss-comments-submit{width:100%;border:none;border-radius:12px;padding:12px 14px;background:linear-gradient(135deg,#2563eb,#111827);color:#fff;font-size:13px;font-weight:700;letter-spacing:.01em;cursor:pointer;box-shadow:0 14px 28px rgba(37,99,235,.22);transition:transform .15s ease,box-shadow .15s ease}' +
+    '.toss-comments-submit:hover{transform:translateY(-1px);box-shadow:0 18px 34px rgba(37,99,235,.28)}' +
+    '.toss-comments-submit:disabled{opacity:.65;transform:none;box-shadow:none;cursor:not-allowed}' +
+    '.toss-comments-input,.toss-comments-auth input,.toss-comments-textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:13px;background:#fff}' +
+    '.toss-comments-textarea{min-height:92px;resize:vertical}' +
+    '.toss-comments-auth{display:flex;gap:8px;flex-wrap:wrap}' +
+    '.toss-comments-auth input{flex:1 1 180px}' +
+    '.toss-comments-status{font-size:12px;color:#475569;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px;padding:10px}' +
+    '.toss-comments-notifications-title{font-size:11px;font-weight:800;letter-spacing:.08em;color:#1d4ed8;text-transform:uppercase;padding:2px 4px 8px}' +
+    '.toss-comments-section-title{font-size:11px;font-weight:800;letter-spacing:.08em;color:#64748b;text-transform:uppercase;padding:2px 4px 4px}' +
+    '.toss-comments-notification{width:100%;text-align:left;border:none;background:#fff;border-radius:10px;padding:10px 12px;cursor:pointer;box-shadow:0 6px 14px rgba(15,23,42,.06);margin-bottom:8px}' +
+    '.toss-comments-notification:last-child{margin-bottom:0}' +
+    '.toss-comments-notification:hover{transform:translateY(-1px);box-shadow:0 10px 20px rgba(15,23,42,.1)}' +
+    '.toss-comments-notification.unread{background:#dbeafe;box-shadow:inset 0 0 0 1px #93c5fd,0 6px 14px rgba(15,23,42,.06)}' +
+    '.toss-comments-notification strong{display:block;font-size:12px;color:#0f172a;margin-bottom:4px}' +
+    '.toss-comments-notification span{display:block;font-size:12px;color:#475569;line-height:1.4}' +
+    '.toss-comments-context{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid #dbe4f0;border-radius:10px;background:#fff;font-size:12px;color:#334155}' +
+    '.toss-comments-context strong{display:block;color:#0f172a;font-size:12px}' +
+    '.toss-comments-context span{display:block;color:#64748b;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}' +
+    '.toss-comments-thread-list{display:flex;flex-direction:column;gap:12px}' +
+    '.toss-comment-draft-highlight{position:absolute;z-index:2147483645;background:rgba(250,204,21,.35);outline:1px solid rgba(202,138,4,.8);border-radius:4px;pointer-events:none}' +
+    '.toss-comment-focus-highlight{position:absolute;z-index:2147483644;background:rgba(59,130,246,.16);outline:2px solid rgba(37,99,235,.8);border-radius:6px;pointer-events:none}' +
+    '.toss-comment-pin{position:absolute;z-index:2147483646;width:18px;height:18px;border-radius:999px;background:#111827;color:#fff;border:2px solid #fff;box-shadow:0 8px 24px rgba(15,23,42,.25);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer}' +
+    '.toss-comment-pin.active{background:#2563eb}' +
+    '.toss-comment-chip{position:absolute;z-index:2147483647;border:none;border-radius:999px;background:#111827;color:#fff;padding:8px 12px;font-size:12px;font-weight:600;box-shadow:0 10px 30px rgba(15,23,42,.28);cursor:pointer}' +
+    '.toss-comments-thread-anchor{font-size:12px;color:#475569;background:#f8fafc;border-radius:8px;padding:8px;margin-bottom:8px}' +
+    '.toss-comments-message{padding:8px 0;border-top:1px solid #f1f5f9}' +
+    '.toss-comments-message:first-child{border-top:none;padding-top:0}' +
+    '.toss-comments-message.parent{padding:10px 12px 12px;border:1px solid #dbeafe;border-radius:12px;background:linear-gradient(180deg,#ffffff,#f8fbff)}' +
+    '.toss-comments-message.reply{margin-left:18px;padding-left:12px;border-left:3px solid #dbeafe}' +
+    '.toss-comments-replying-to{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:999px;padding:4px 8px;margin-bottom:8px}' +
+    '.toss-comments-empty{font-size:13px;color:#64748b}' +
+    '</style>' +
+    '<div class="toss-comments-shell">' +
+      '<button class="toss-comments-notify-toggle" type="button" aria-label="Open notifications">🔔 <span class="toss-comments-badge">0</span></button>' +
+      '<button class="toss-comments-toggle" type="button">Comments</button>' +
+      '<div class="toss-notify-panel" aria-label="Notifications"><div class="toss-comments-notifications-title">Notifications</div><div class="toss-comments-notification-list"></div></div>' +
+      '<aside class="toss-comments-panel" aria-label="Comments sidebar">' +
+        '<div class="toss-comments-header"><div class="toss-comments-header-copy"><div class="toss-comments-title">Comments</div><div class="toss-comments-sub">Discuss this shared page</div></div><button class="toss-comments-close" type="button" aria-label="Close comments">Close</button></div>' +
+        '<div class="toss-comments-body">' +
+          '<div class="toss-comments-auth">' +
+            '<input class="toss-comments-token" placeholder="Paste your toss token to comment" />' +
+            '<button class="toss-comments-save-token primary" type="button">Save Token</button>' +
+            '<button class="toss-comments-clear-token" type="button">Clear</button>' +
+          '</div>' +
+          '<div class="toss-comments-status"></div>' +
+          '<div class="toss-comments-section-title">Threads</div>' +
+          '<div class="toss-comments-context">' +
+            '<div><strong>Comment target</strong><span class="toss-comments-context-label">Whole page</span></div>' +
+            '<button class="toss-comments-context-clear" type="button">Use whole page</button>' +
+          '</div>' +
+          '<textarea class="toss-comments-textarea" placeholder="Write a comment..."></textarea>' +
+          '<button class="toss-comments-submit primary" type="button">Post Comment →</button>' +
+          '<div class="toss-comments-thread-list"></div>' +
+        '</div>' +
+      '</aside>' +
+    '</div>' +
+    '</div>';
+
+  const panel = root.querySelector('.toss-comments-panel');
+  const toggle = root.querySelector('.toss-comments-toggle');
+  const notifyToggle = root.querySelector('.toss-comments-notify-toggle');
+  const badge = root.querySelector('.toss-comments-badge');
+  const status = root.querySelector('.toss-comments-status');
+  const notifications = root.querySelector('.toss-notify-panel');
+  const notificationList = root.querySelector('.toss-comments-notification-list');
+  const tokenInput = root.querySelector('.toss-comments-token');
+  const textarea = root.querySelector('.toss-comments-textarea');
+  const submitButton = root.querySelector('.toss-comments-submit');
+  const list = root.querySelector('.toss-comments-thread-list');
+  const contextLabel = root.querySelector('.toss-comments-context-label');
+  tokenInput.value = state.token;
+  const currentPagePath = cfg.currentPagePath || 'index.html';
+  const currentPageLabel = () => {
+    const tail = (currentPagePath.split('/').pop() || 'index.html').replace(/\.html?$/i, '');
+    if (!tail || tail === 'index') return 'Overview';
+    return tail.replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  };
+  const buildCommentsPath = (includeActivity = false) => {
+    const params = new URLSearchParams();
+    params.set('pagePath', currentPagePath);
+    if (includeActivity) params.set('includeActivity', '1');
+    return '/artifacts/' + cfg.artifactId + '/comment-threads?' + params.toString();
+  };
+  const buildPageUrl = (pagePath) => {
+    if (!pagePath || pagePath === 'index.html') return cfg.origin + cfg.artifactBasePath;
+    return cfg.origin + cfg.artifactBasePath + pagePath;
+  };
+  const setPendingTarget = (target) => {
+    try { sessionStorage.setItem(targetStorageKey, JSON.stringify(target)); } catch {}
+  };
+  const readPendingTarget = () => {
+    try {
+      const raw = sessionStorage.getItem(targetStorageKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+  const consumePendingTarget = () => {
+    const parsed = readPendingTarget();
+    if (!parsed || parsed.pagePath !== currentPagePath) return null;
+    try { sessionStorage.removeItem(targetStorageKey); } catch {}
+    return parsed;
+  };
+
+  const selectorFor = (el) => {
+    if (!(el instanceof Element)) return 'unknown';
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === 1 && node !== document.body) {
+      if (node.id) {
+        parts.unshift('#' + node.id);
+        break;
+      }
+      const parent = node.parentElement;
+      let part = node.tagName.toLowerCase();
+      if (parent) {
+        const sameTagSiblings = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        if (sameTagSiblings.length > 1) {
+          const index = sameTagSiblings.indexOf(node) + 1;
+          part += ':nth-of-type(' + index + ')';
+        }
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    return parts.join(' > ') || 'unknown';
+  };
+  const selectionRectFromAnchor = (anchor) => {
+    if (!anchor || !anchor.selector || !anchor.selectedText) return null;
+    const host = document.querySelector(anchor.selector);
+    if (!(host instanceof Element)) return null;
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let node;
+    let fullText = '';
+    while ((node = walker.nextNode())) {
+      const text = node.textContent || '';
+      if (!text) continue;
+      textNodes.push({ node, start: fullText.length, end: fullText.length + text.length });
+      fullText += text;
+    }
+    if (!fullText) return null;
+    const selectedText = String(anchor.selectedText);
+    let startIndex = fullText.indexOf(selectedText);
+    if (startIndex < 0 && anchor.textSnippet) {
+      startIndex = fullText.indexOf(String(anchor.textSnippet));
+    }
+    if (startIndex < 0) return null;
+    const endIndex = startIndex + selectedText.length;
+    const startNodeMeta = textNodes.find((item) => startIndex >= item.start && startIndex <= item.end);
+    const endNodeMeta = textNodes.find((item) => endIndex >= item.start && endIndex <= item.end) || textNodes[textNodes.length - 1];
+    if (!startNodeMeta || !endNodeMeta) return null;
+    const range = document.createRange();
+    range.setStart(startNodeMeta.node, Math.max(0, startIndex - startNodeMeta.start));
+    range.setEnd(endNodeMeta.node, Math.max(0, Math.min((endNodeMeta.node.textContent || '').length, endIndex - endNodeMeta.start)));
+    const rect = range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) return null;
+    return {
+      x: Math.round(rect.left + window.scrollX),
+      y: Math.round(rect.top + window.scrollY),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  };
+  const rectFromAnchor = (anchor) => {
+    if (!anchor) return null;
+    if (anchor.selectedText) {
+      const selectionRect = selectionRectFromAnchor(anchor);
+      if (selectionRect) return selectionRect;
+    }
+    if (anchor.selector) {
+      const node = document.querySelector(anchor.selector);
+      if (node instanceof Element) {
+        const rect = node.getBoundingClientRect();
+        return {
+          x: Math.round(rect.left + window.scrollX),
+          y: Math.round(rect.top + window.scrollY),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+      }
+    }
+    return anchor.rect || null;
+  };
+
+  const setStatus = (message) => { status.textContent = message; };
+  const threadsDigest = (threads) => JSON.stringify((threads || []).map((thread) => ({
+    id: thread.id,
+    status: thread.status,
+    updated_at: thread.updated_at,
+    deleted_at: thread.deleted_at || null,
+    resolved_by_label: thread.resolved_by_label || '',
+    messages: (thread.messages || []).map((message) => ({
+      id: message.id,
+      author_label: message.author_label,
+      body: message.body,
+      updated_at: message.updated_at,
+      deleted_at: message.deleted_at || null,
+    })),
+  })));
+  const shortSnippet = (text) => {
+    const value = String(text || '').trim();
+    if (!value) return 'No preview';
+    return value.length > 10 ? value.slice(0, 10) + '...' : value;
+  };
+  const replySnippet = (text) => {
+    const value = String(text || '').trim();
+    if (!value) return 'No preview';
+    return value.length > 72 ? value.slice(0, 72) + '...' : value;
+  };
+  const renderNotifications = () => {
+    if (!state.activityFeed.length) {
+      notifications.classList.remove('open');
+      notificationList.innerHTML = '';
+      return;
+    }
+    notificationList.innerHTML = state.activityFeed.map((activity, index) =>
+      '<button type="button" class="toss-comments-notification' + (activity.unread ? ' unread' : '') + '" data-thread-id="' + esc(activity.threadId || '') + '" data-activity-id="' + esc(activity.id || '') + '" data-page-path="' + esc(activity.pagePath || 'index.html') + '">' +
+        '<strong>' + esc(String(index + 1) + '. ' + (activity.actor || 'Someone') + ' · ' + (activity.pageLabel || 'Overview')) + '</strong>' +
+        '<span>' + esc(activity.snippet || activity.message || 'New activity') + '</span>' +
+      '</button>'
+    ).join('');
+  };
+  const recalcUnread = () => {
+    state.unreadCount = state.activityFeed.filter((item) => item.unread).length;
+  };
+  const renderUnread = () => {
+    recalcUnread();
+    const hasUnread = state.unreadCount > 0;
+    notifyToggle.classList.toggle('has-unread', hasUnread);
+    badge.textContent = String(state.unreadCount);
+  };
+  const markThreadNotificationsRead = (threadId) => {
+    if (!threadId) return;
+    state.activityFeed = state.activityFeed.map((item) => item.threadId === threadId ? { ...item, unread: false } : item);
+    renderUnread();
+    renderNotifications();
+  };
+  const markNotificationRead = (activityId) => {
+    if (!activityId) return;
+    state.activityFeed = state.activityFeed.filter((item) => item.id !== activityId);
+    renderUnread();
+    renderNotifications();
+  };
+  const latestActorForThread = (thread) => {
+    const messages = thread.messages || [];
+    const latestMessage = messages.reduce((best, message) => (!best || message.updated_at > best.updated_at ? message : best), null);
+    if (latestMessage && latestMessage.author_label) return latestMessage.author_label;
+    if (thread.resolved_by_label) return thread.resolved_by_label;
+    return thread.created_by_label || '';
+  };
+  const labelForPagePath = (pagePath) => {
+    const tail = String(pagePath || 'index.html').split('/').pop() || 'index.html';
+    const base = tail.replace(/\.html?$/i, '');
+    if (!base || base === 'index') return 'Overview';
+    return base.replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+  };
+  const describeActivities = (previousThreads, nextThreads) => {
+    const previousById = new Map((previousThreads || []).map((thread) => [thread.id, thread]));
+    const candidates = [];
+    (nextThreads || []).forEach((thread) => {
+      const previous = previousById.get(thread.id);
+      const pagePath = thread.page_path || 'index.html';
+      const pageLabel = labelForPagePath(pagePath);
+      if (!previous) {
+        const actor = latestActorForThread(thread);
+        const newestMessage = (thread.messages || []).slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))[0];
+        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':create', updated_at: thread.updated_at || 0, actor, threadId: thread.id, pagePath, pageLabel, message: (actor || 'Someone') + ' added a comment.', snippet: shortSnippet(newestMessage ? newestMessage.body : 'New comment on this page'), unread: true });
+        return;
+      }
+      const previousMessages = new Map((previous.messages || []).map((message) => [message.id, message]));
+      const newMessage = (thread.messages || []).find((message) => !previousMessages.has(message.id));
+      if (newMessage) {
+        candidates.push({ id: thread.id + ':' + String(newMessage.updated_at || thread.updated_at || 0) + ':reply', updated_at: newMessage.updated_at || thread.updated_at || 0, actor: newMessage.author_label || '', threadId: thread.id, pagePath, pageLabel, message: (newMessage.author_label || 'Someone') + ' replied to a comment.', snippet: shortSnippet(newMessage.body || 'New reply'), unread: true });
+        return;
+      }
+      if (thread.status !== previous.status) {
+        const actor = thread.resolved_by_label || latestActorForThread(thread);
+        candidates.push({ id: thread.id + ':' + String(thread.updated_at || 0) + ':status:' + thread.status, updated_at: thread.updated_at || 0, actor, threadId: thread.id, pagePath, pageLabel, message: (actor || 'Someone') + (thread.status === 'resolved' ? ' resolved a comment.' : ' reopened a comment.'), snippet: shortSnippet(anchorLabel(thread)), unread: true });
+        return;
+      }
+      const editedMessage = (thread.messages || []).find((message) => {
+        const before = previousMessages.get(message.id);
+        return before && (before.body !== message.body || before.deleted_at !== message.deleted_at || before.updated_at !== message.updated_at);
+      });
+      if (editedMessage) {
+        const suffix = editedMessage.deleted_at ? ' deleted a comment.' : ' updated a comment.';
+        candidates.push({ id: thread.id + ':' + String(editedMessage.updated_at || thread.updated_at || 0) + ':edit', updated_at: editedMessage.updated_at || thread.updated_at || 0, actor: editedMessage.author_label || '', threadId: thread.id, pagePath, pageLabel, message: (editedMessage.author_label || 'Someone') + suffix, snippet: shortSnippet(editedMessage.deleted_at ? 'Comment deleted' : editedMessage.body), unread: true });
+      }
+    });
+    candidates.sort((a, b) => b.updated_at - a.updated_at);
+    return candidates.filter((candidate) => candidate.actor && candidate.actor !== state.currentLabel);
+  };
+  const clearDraftHighlight = () => {
+    document.querySelectorAll('.toss-comment-draft-highlight').forEach((node) => node.remove());
+  };
+  const clearFocusHighlight = () => {
+    document.querySelectorAll('.toss-comment-focus-highlight').forEach((node) => node.remove());
+  };
+  const clearDraftChip = () => {
+    document.querySelectorAll('.toss-comment-chip').forEach((node) => node.remove());
+  };
+  const renderDraftHighlight = () => {
+    clearDraftHighlight();
+    state.pendingRects.forEach((rect) => {
+      const marker = document.createElement('div');
+      marker.className = 'toss-comment-draft-highlight';
+      marker.style.left = rect.x + 'px';
+      marker.style.top = rect.y + 'px';
+      marker.style.width = Math.max(rect.width, 8) + 'px';
+      marker.style.height = Math.max(rect.height, 16) + 'px';
+      document.body.appendChild(marker);
+    });
+  };
+  const renderDraftChip = () => {
+    clearDraftChip();
+    if (state.pendingScope !== 'selection' || !state.pendingRects.length) return;
+    const firstRect = state.pendingRects[0];
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'toss-comment-chip';
+    chip.textContent = 'Comment';
+    chip.style.left = firstRect.x + 'px';
+    chip.style.top = Math.max(firstRect.y - 40, 12) + 'px';
+    chip.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openPanelForComment();
+      setStatus('Selection captured. Add your comment.');
+      setTimeout(() => textarea.focus(), 0);
+    });
+    document.body.appendChild(chip);
+  };
+  const renderFocusHighlight = () => {
+    clearFocusHighlight();
+    if (!state.activeThreadId) return;
+    const thread = state.threads.find((item) => item.id === state.activeThreadId);
+    if (!thread || !thread.anchor) return;
+    const rect = rectFromAnchor(thread.anchor);
+    if (!rect) return;
+    const marker = document.createElement('div');
+    marker.className = 'toss-comment-focus-highlight';
+    marker.style.left = (rect.x || 0) + 'px';
+    marker.style.top = (rect.y || 0) + 'px';
+    marker.style.width = Math.max(rect.width || 0, 8) + 'px';
+    marker.style.height = Math.max(rect.height || 0, 16) + 'px';
+    document.body.appendChild(marker);
+  };
+  const activateThread = (threadId) => {
+    state.activeThreadId = threadId;
+    markThreadNotificationsRead(threadId);
+    render();
+    renderFocusHighlight();
+    const node = root.querySelector('[data-thread-id="' + threadId + '"]');
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+  const updateContext = () => {
+    if (state.pendingScope === 'selection' && state.pendingAnchor) {
+      contextLabel.textContent = 'Selected text: ' + (state.pendingAnchor.selectedText || state.pendingAnchor.textSnippet || 'Selection');
+      return;
+    }
+    contextLabel.textContent = 'Whole page';
+  };
+  const resetPendingAnchor = () => {
+    state.pendingScope = 'artifact';
+    state.pendingAnchor = null;
+    state.pendingRects = [];
+    clearDraftHighlight();
+    clearDraftChip();
+    updateContext();
+  };
+  const setBusy = (busy) => {
+    state.busy = busy;
+    tokenInput.disabled = busy;
+    textarea.disabled = busy;
+    submitButton.disabled = busy;
+    root.querySelectorAll('button').forEach((button) => {
+      if (button.classList.contains('toss-comments-toggle') || button.classList.contains('toss-comments-notify-toggle')) return;
+      button.disabled = busy;
+    });
+  };
+  const tempId = (prefix) => prefix + '-' + Math.random().toString(36).slice(2, 10);
+  const scrollThreadIntoView = (threadId) => {
+    const node = root.querySelector('[data-thread-id="' + threadId + '"]');
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+
+  const authHeaders = (needsAuth) => {
+    const headers = { 'X-Toss-Viewer': cfg.viewerToken };
+    if (state.token) headers.Authorization = 'Bearer ' + state.token;
+    if (needsAuth) headers['Content-Type'] = 'application/json';
+    return headers;
+  };
+
+  const api = async (path, init = {}, needsAuth = false) => {
+    const res = await fetch(cfg.origin + path, {
+      ...init,
+      headers: { ...(init.headers || {}), ...authHeaders(needsAuth) },
+    });
+    if (res.status === 204) return null;
+    const text = await res.text();
+    let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text ? { error: text } : null; }
+    if (!res.ok) throw new Error((data && data.error) || text || ('Request failed: ' + res.status));
+    return data;
+  };
+
+  const anchorLabel = (thread) => {
+    if (thread.scope_type === 'artifact') return 'General page comment';
+    const anchor = thread.anchor || {};
+    if (thread.scope_type === 'selection') return 'Selection: ' + (anchor.selectedText || anchor.textSnippet || 'Selected text');
+    return 'Element: ' + (anchor.selector || anchor.textSnippet || 'Selected element');
+  };
+  const normalizeMessage = (message) => ({
+    ...message,
+    can_edit: !!message.can_edit,
+    can_delete: !!message.can_delete,
+  });
+  const normalizeThread = (thread) => ({
+    ...thread,
+    anchor: thread.anchor || null,
+    can_delete: !!thread.can_delete,
+    can_resolve: !!thread.can_resolve,
+    messages: (thread.messages || []).map(normalizeMessage),
+  });
+  const upsertThread = (thread, options = {}) => {
+    const normalized = normalizeThread(thread);
+    const existingIndex = state.threads.findIndex((item) => item.id === normalized.id);
+    if (existingIndex >= 0) {
+      state.threads.splice(existingIndex, 1, normalized);
+      return;
+    }
+    if (options.prepend) {
+      state.threads.unshift(normalized);
+      return;
+    }
+    state.threads.push(normalized);
+  };
+  const removeThread = (threadId) => {
+    state.threads = state.threads.filter((thread) => thread.id !== threadId);
+  };
+  const updateThread = (threadId, updater) => {
+    state.threads = state.threads.map((thread) => thread.id === threadId ? updater(thread) : thread);
+  };
+
+  const renderPins = () => {
+    document.querySelectorAll('.toss-comment-pin').forEach((node) => node.remove());
+    state.threads.forEach((thread, index) => {
+      if (thread.deleted_at || thread.scope_type === 'artifact' || !thread.anchor) return;
+      const rect = rectFromAnchor(thread.anchor);
+      if (!rect) return;
+      const pin = document.createElement('button');
+      pin.type = 'button';
+      pin.className = 'toss-comment-pin' + (thread.id === state.activeThreadId ? ' active' : '');
+      pin.textContent = String(index + 1);
+      pin.style.left = (rect.x || 0) + 'px';
+      pin.style.top = (rect.y || 0) + 'px';
+      pin.title = anchorLabel(thread);
+      pin.addEventListener('click', () => {
+        panel.classList.add('open');
+        ensureThreadsLoaded();
+        activateThread(thread.id);
+      });
+      document.body.appendChild(pin);
+    });
+  };
+
+  const render = () => {
+    list.innerHTML = '';
+    if (!state.threads.length) {
+      list.innerHTML = '<div class="toss-comments-empty">No comments on ' + esc(currentPageLabel()) + ' yet.</div>';
+      renderNotifications();
+      renderPins();
+      return;
+    }
+
+    state.threads.forEach((thread) => {
+      const article = document.createElement('article');
+      article.className = 'toss-comments-card' + (thread.status === 'resolved' ? ' resolved' : '');
+      if (thread.id === state.activeThreadId) article.className += ' focused';
+      article.dataset.threadId = thread.id;
+
+      const meta = document.createElement('div');
+      meta.className = 'toss-comments-meta';
+      meta.innerHTML = '<span>' + esc(thread.created_by_label) + '</span><span>' + esc(thread.status) + '</span>';
+      article.appendChild(meta);
+
+      const anchor = document.createElement('div');
+      anchor.className = 'toss-comments-thread-anchor';
+      anchor.textContent = anchorLabel(thread);
+      article.appendChild(anchor);
+
+      (thread.messages || []).forEach((message) => {
+        const box = document.createElement('div');
+        const messageIndex = (thread.messages || []).indexOf(message);
+        const replyTarget = messageIndex > 0 ? ((thread.messages || [])[messageIndex - 1]?.author_label || thread.created_by_label || '') : '';
+        box.className = 'toss-comments-message ' + (messageIndex === 0 ? 'parent' : 'reply');
+        const replyMeta = messageIndex > 0 ? '<div class="toss-comments-replying-to">Replying to ' + esc(replyTarget) + '</div>' : '';
+        box.innerHTML = '<div class="toss-comments-message-meta"><span>' + esc(message.author_label) + '</span><span>' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span></div>' +
+          replyMeta +
+          '<div>' + esc(message.deleted_at ? 'Message deleted' : message.body) + '</div>';
+        if (!message.deleted_at && (message.can_edit || message.can_delete)) {
+          const actions = document.createElement('div');
+          actions.className = 'toss-comments-actions';
+          if (message.can_edit) {
+            const edit = document.createElement('button');
+            edit.type = 'button';
+            edit.textContent = 'Edit';
+            edit.dataset.action = 'edit-message';
+            edit.dataset.messageId = message.id;
+            edit.dataset.body = message.body;
+            actions.appendChild(edit);
+          }
+          if (message.can_delete) {
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.textContent = 'Delete';
+            del.className = 'warn';
+            del.dataset.action = 'delete-message';
+            del.dataset.messageId = message.id;
+            actions.appendChild(del);
+          }
+          box.appendChild(actions);
+        }
+        article.appendChild(box);
+      });
+
+      const actions = document.createElement('div');
+      actions.className = 'toss-comments-actions';
+      actions.innerHTML = '<button type="button" data-action="reply-thread" data-thread-id="' + thread.id + '">Reply</button>';
+      if (thread.can_resolve && thread.status !== 'resolved') {
+        actions.innerHTML += '<button type="button" class="primary" data-action="resolve-thread" data-thread-id="' + thread.id + '">Resolve</button>';
+      }
+      if (thread.can_resolve && thread.status === 'resolved') {
+        actions.innerHTML += '<button type="button" data-action="reopen-thread" data-thread-id="' + thread.id + '">Reopen</button>';
+      }
+      if (thread.can_delete) {
+        actions.innerHTML += '<button type="button" class="warn" data-action="delete-thread" data-thread-id="' + thread.id + '">Delete Thread</button>';
+      }
+      article.appendChild(actions);
+      if (state.replyThreadId === thread.id) {
+        const replyTargetMessage = [...(thread.messages || [])].reverse().find((message) => !message.deleted_at) || null;
+        const replyBox = document.createElement('div');
+        replyBox.className = 'toss-comments-card';
+        replyBox.innerHTML =
+          '<div class="toss-comments-replying-to">Replying to ' + esc(replyTargetMessage?.author_label || thread.created_by_label || 'thread') + ': ' + esc(replySnippet(replyTargetMessage?.body || thread.messages?.[0]?.body || 'Comment')) + '</div>' +
+          '<textarea class="toss-comments-textarea toss-comments-reply-input" data-thread-id="' + thread.id + '" placeholder="Write a reply...">' + esc(state.replyDraft) + '</textarea>' +
+          '<div class="toss-comments-actions">' +
+            '<button type="button" class="primary" data-action="submit-reply" data-thread-id="' + thread.id + '">Post Reply</button>' +
+            '<button type="button" data-action="cancel-reply" data-thread-id="' + thread.id + '">Cancel</button>' +
+          '</div>';
+        article.appendChild(replyBox);
+      }
+      article.addEventListener('click', (event) => {
+        const target = event.target;
+        if (target instanceof HTMLElement && target.closest('button, textarea, input, label')) return;
+        state.activeThreadId = thread.id;
+        markThreadNotificationsRead(thread.id);
+        render();
+        renderFocusHighlight();
+      });
+      list.appendChild(article);
+    });
+
+    renderNotifications();
+    renderPins();
+    renderFocusHighlight();
+    renderUnread();
+  };
+
+  const loadThreads = async (options = {}) => {
+    const { silent = false, applyThreads = !silent } = options;
+    state.loading = true;
+    try {
+      const data = await api(buildCommentsPath(true));
+      const nextThreads = (data.threads || []).map(normalizeThread);
+      const nextActivityThreads = (data.activityThreads || data.threads || []).map(normalizeThread);
+      const previousThreads = state.activityThreads;
+      const previousDigest = state.lastDigest;
+      const nextLabel = data.viewer && data.viewer.label ? data.viewer.label : '';
+      state.currentLabel = nextLabel;
+      if (applyThreads) {
+        state.threads = nextThreads;
+        state.loaded = true;
+      }
+      const nextDigest = threadsDigest(nextActivityThreads);
+      if (!previousDigest) {
+        state.lastDigest = nextDigest;
+      } else if (previousDigest !== nextDigest) {
+        state.lastDigest = nextDigest;
+        const activities = describeActivities(previousThreads, nextActivityThreads);
+        if (activities.length) {
+          const incomingIds = new Set(activities.map((item) => item.id));
+          state.activityFeed = [
+            ...activities,
+            ...state.activityFeed.filter((item) => !incomingIds.has(item.id)),
+          ].sort((a, b) => b.updated_at - a.updated_at).slice(0, 25);
+        }
+      }
+      state.activityThreads = nextActivityThreads;
+      if (!silent && state.token) {
+        setStatus(state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.');
+      } else if (!silent) {
+        setStatus('Paste your toss token to create comments, reply, resolve, edit, or delete.');
+      }
+      if (applyThreads) {
+        render();
+        const pendingTarget = consumePendingTarget();
+        if (pendingTarget && pendingTarget.threadId) {
+          markNotificationRead(pendingTarget.activityId || '');
+          markThreadNotificationsRead(pendingTarget.threadId);
+          activateThread(pendingTarget.threadId);
+          setStatus('Jumped to the latest activity.');
+        }
+      } else {
+        renderNotifications();
+        renderUnread();
+      }
+    } catch (error) {
+      if (!silent) setStatus(error.message || 'Failed to load comments.');
+    } finally {
+      state.loading = false;
+    }
+  };
+  const ensureThreadsLoaded = async (force = false) => {
+    if (state.loading) return;
+    if (!force && state.loaded) return;
+    await loadThreads();
+  };
+  const startPolling = () => {
+    if (state.pollTimer) return;
+    state.pollTimer = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
+      loadThreads({ silent: true, applyThreads: false });
+    }, 2000);
+  };
+  const syncNotificationsNow = () => {
+    if (document.visibilityState === 'hidden') return;
+    loadThreads({ silent: true, applyThreads: false });
+  };
+
+  const openPanelForComment = () => {
+    panel.classList.add('open');
+    ensureThreadsLoaded();
+  };
+  const openPanelForNotifications = () => {
+    panel.classList.add('open');
+    ensureThreadsLoaded();
+    notifications.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const captureSelectionAnchor = (options = {}) => {
+    const { openPanel = false, silent = false } = options;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+      if (!silent) setStatus('Select some text on the page first.');
+      return false;
+    }
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    const rects = Array.from(range.getClientRects()).map((clientRect) => ({
+      x: Math.round(clientRect.left + window.scrollX),
+      y: Math.round(clientRect.top + window.scrollY),
+      width: Math.round(clientRect.width),
+      height: Math.round(clientRect.height),
+    })).filter((clientRect) => clientRect.width > 0 && clientRect.height > 0);
+    const selectedText = selection.toString().trim();
+    state.pendingScope = 'selection';
+    state.pendingAnchor = {
+      selector: selectorFor(range.startContainer && range.startContainer.parentElement),
+      selectedText,
+      textSnippet: selectedText.slice(0, 240),
+      rect: {
+        x: Math.round(rect.left + window.scrollX),
+        y: Math.round(rect.top + window.scrollY),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      startOffset: range.startOffset,
+      endOffset: range.endOffset,
+    };
+    state.pendingRects = rects.length ? rects : [{
+      x: Math.round(rect.left + window.scrollX),
+      y: Math.round(rect.top + window.scrollY),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    }];
+    renderDraftHighlight();
+    renderDraftChip();
+    updateContext();
+    setStatus('Selection captured. Add your comment.');
+    if (openPanel) openPanelForComment();
+    return true;
+  };
+
+  document.addEventListener('mouseup', (event) => {
+    const target = event.target;
+    if (target instanceof Node && root.contains(target)) return;
+    captureSelectionAnchor({ openPanel: false, silent: true });
+  });
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (target instanceof Node && root.contains(target)) return;
+    if (target instanceof HTMLElement && (target.classList.contains('toss-comment-chip') || target.classList.contains('toss-comment-pin'))) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString().trim()) return;
+    if (state.pendingScope === 'selection' || state.pendingRects.length) {
+      resetPendingAnchor();
+      setStatus('Selection cleared.');
+    }
+    notifications.classList.remove('open');
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    const selection = window.getSelection();
+    if (selection) selection.removeAllRanges();
+    if (state.pendingScope === 'selection' || state.pendingRects.length) {
+      resetPendingAnchor();
+      setStatus('Selection cleared.');
+    }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') syncNotificationsNow();
+  });
+  window.addEventListener('focus', syncNotificationsNow);
+  root.addEventListener('input', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLTextAreaElement)) return;
+    if (target.classList.contains('toss-comments-reply-input')) {
+      state.replyDraft = target.value;
+    }
+  });
+
+  root.addEventListener('click', async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const action = target.dataset.action;
+    if (state.busy && !target.classList.contains('toss-comments-toggle')) return;
+    const notificationItem = target.closest('.toss-comments-notification');
+
+    if (target.classList.contains('toss-comments-notify-toggle')) {
+      if (notifications.classList.contains('open')) notifications.classList.remove('open');
+      else {
+        notifications.classList.add('open');
+        ensureThreadsLoaded();
+      }
+      return;
+    }
+    if (target.classList.contains('toss-comments-toggle') || target.classList.contains('toss-comments-close')) {
+      panel.classList.toggle('open');
+      notifications.classList.remove('open');
+      if (panel.classList.contains('open')) {
+        ensureThreadsLoaded();
+      } else {
+        resetPendingAnchor();
+        state.activeThreadId = '';
+        clearFocusHighlight();
+        setStatus('Comments closed.');
+      }
+      return;
+    }
+    if (notificationItem instanceof HTMLElement) {
+      const threadId = notificationItem.dataset.threadId;
+      const activityId = notificationItem.dataset.activityId;
+      const pagePath = notificationItem.dataset.pagePath || 'index.html';
+      if (pagePath !== currentPagePath) {
+        setPendingTarget({ threadId, activityId, pagePath });
+        notifications.classList.remove('open');
+        window.location.href = buildPageUrl(pagePath);
+        return;
+      }
+      panel.classList.add('open');
+      notifications.classList.remove('open');
+      markNotificationRead(activityId);
+      markThreadNotificationsRead(threadId);
+      await loadThreads({ silent: false, applyThreads: true });
+      if (threadId) activateThread(threadId);
+      setStatus('Jumped to the latest activity.');
+      return;
+    }
+    if (target.classList.contains('toss-comments-save-token')) {
+      state.token = tokenInput.value.trim();
+      if (state.token) localStorage.setItem(storageKey, state.token);
+      setStatus('Token saved. Loading comment permissions...');
+      setBusy(true);
+      try {
+        await ensureThreadsLoaded(true);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    if (target.classList.contains('toss-comments-clear-token')) {
+      state.token = '';
+      tokenInput.value = '';
+      localStorage.removeItem(storageKey);
+      setStatus('Comment token cleared.');
+      setBusy(true);
+      try {
+        await ensureThreadsLoaded(true);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    if (target.classList.contains('toss-comments-context-clear')) {
+      resetPendingAnchor();
+      setStatus('Comment will be posted on the whole page.');
+      return;
+    }
+    if (target.classList.contains('toss-comments-submit')) {
+      if (!state.token) {
+        setStatus('Paste your toss token first.');
+        return;
+      }
+      const body = textarea.value.trim();
+      if (!body) {
+        setStatus('Write a comment first.');
+        return;
+      }
+      const draft = textarea.value;
+      textarea.value = '';
+      captureSelectionAnchor({ silent: true });
+      const optimisticThreadId = tempId('thread');
+      const optimisticMessageId = tempId('message');
+      const now = Math.floor(Date.now() / 1000);
+      upsertThread({
+        id: optimisticThreadId,
+        artifact_id: cfg.artifactId,
+        created_by_label: state.currentLabel || 'You',
+        scope_type: state.pendingScope,
+        anchor: state.pendingScope === 'artifact' ? null : state.pendingAnchor,
+        status: 'open',
+        resolved_by_label: null,
+        resolved_at: null,
+        deleted_at: null,
+        created_at: now,
+        updated_at: now,
+        can_delete: true,
+        can_resolve: true,
+        messages: [{
+          id: optimisticMessageId,
+          thread_id: optimisticThreadId,
+          author_label: state.currentLabel || 'You',
+          body,
+          created_at: now,
+          updated_at: now,
+          deleted_at: null,
+          can_edit: true,
+          can_delete: true,
+        }],
+      }, { prepend: true });
+      render();
+      scrollThreadIntoView(optimisticThreadId);
+      try {
+        const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', {
+          method: 'POST',
+          body: JSON.stringify({
+            body,
+            pagePath: currentPagePath,
+            scopeType: state.pendingScope,
+            anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor,
+          }),
+        }, true);
+        if (data && data.thread) {
+          removeThread(optimisticThreadId);
+          upsertThread(data.thread, { prepend: true });
+          render();
+        }
+        resetPendingAnchor();
+        setStatus('Comment posted.');
+      } catch (error) {
+        removeThread(optimisticThreadId);
+        render();
+        textarea.value = draft;
+        setStatus(error.message || 'Failed to post comment.');
+      }
+      return;
+    }
+
+    if (!action) return;
+    if (!state.token) {
+      setStatus('Paste your toss token first.');
+      return;
+    }
+
+    try {
+      if (action === 'reply-thread') {
+        state.replyThreadId = target.dataset.threadId || '';
+        state.replyDraft = '';
+        render();
+        setStatus('Reply box opened.');
+        return;
+      } else if (action === 'cancel-reply') {
+        state.replyThreadId = '';
+        state.replyDraft = '';
+        render();
+        setStatus('Reply cancelled.');
+        return;
+      } else if (action === 'submit-reply') {
+        const body = state.replyDraft.trim();
+        if (!body) {
+          setStatus('Write a reply first.');
+          return;
+        }
+        const threadId = target.dataset.threadId;
+        const optimisticMessageId = tempId('reply');
+        const now = Math.floor(Date.now() / 1000);
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          updated_at: now,
+          messages: [...(thread.messages || []), normalizeMessage({
+            id: optimisticMessageId,
+            thread_id: threadId,
+            author_label: state.currentLabel || 'You',
+            body,
+            created_at: now,
+            updated_at: now,
+            deleted_at: null,
+            can_edit: true,
+            can_delete: true,
+          })],
+        }));
+        state.replyThreadId = '';
+        state.replyDraft = '';
+        render();
+        scrollThreadIntoView(threadId);
+        const data = await api('/comment-threads/' + target.dataset.threadId + '/messages', {
+          method: 'POST',
+          body: JSON.stringify({ body }),
+        }, true);
+        if (data && data.message) {
+          updateThread(threadId, (thread) => ({
+            ...thread,
+            updated_at: data.threadUpdatedAt || thread.updated_at,
+            messages: (thread.messages || []).map((message) =>
+              message.id === optimisticMessageId ? normalizeMessage(data.message) : message),
+          }));
+        }
+      } else if (action === 'resolve-thread') {
+        updateThread(target.dataset.threadId, (thread) => ({
+          ...thread,
+          status: 'resolved',
+          resolved_by_label: state.currentLabel || 'You',
+          resolved_at: Math.floor(Date.now() / 1000),
+          messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })),
+        }));
+        render();
+        const data = await api('/comment-threads/' + target.dataset.threadId + '/resolve', { method: 'POST' }, true);
+        updateThread(target.dataset.threadId, (thread) => ({
+          ...thread,
+          status: data.status,
+          resolved_by_label: data.resolvedByLabel,
+          resolved_at: data.resolvedAt,
+          updated_at: data.updatedAt || thread.updated_at,
+        }));
+      } else if (action === 'reopen-thread') {
+        updateThread(target.dataset.threadId, (thread) => ({
+          ...thread,
+          status: 'open',
+          resolved_by_label: null,
+          resolved_at: null,
+          messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })),
+        }));
+        render();
+        const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST' }, true);
+        updateThread(target.dataset.threadId, (thread) => ({
+          ...thread,
+          status: data.status,
+          resolved_by_label: null,
+          resolved_at: null,
+          updated_at: data.updatedAt || thread.updated_at,
+        }));
+      } else if (action === 'delete-thread') {
+        if (!window.confirm('Delete this thread?')) return;
+        if (state.activeThreadId === target.dataset.threadId) {
+          state.activeThreadId = '';
+          clearFocusHighlight();
+        }
+        removeThread(target.dataset.threadId);
+        render();
+        await api('/comment-threads/' + target.dataset.threadId, { method: 'DELETE' }, true);
+      } else if (action === 'edit-message') {
+        const nextBody = window.prompt('Edit comment', target.dataset.body || '');
+        if (!nextBody) return;
+        const threadNode = target.closest('[data-thread-id]');
+        const threadId = threadNode ? threadNode.dataset.threadId : '';
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          messages: (thread.messages || []).map((message) =>
+            message.id === target.dataset.messageId
+              ? { ...message, body: nextBody, updated_at: Math.floor(Date.now() / 1000) }
+              : message),
+        }));
+        render();
+        const data = await api('/comment-messages/' + target.dataset.messageId, {
+          method: 'PATCH',
+          body: JSON.stringify({ body: nextBody }),
+        }, true);
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          updated_at: data.threadUpdatedAt || thread.updated_at,
+          messages: (thread.messages || []).map((message) =>
+            message.id === target.dataset.messageId
+              ? { ...message, body: data.body, updated_at: data.updatedAt || message.updated_at }
+              : message),
+        }));
+      } else if (action === 'delete-message') {
+        if (!window.confirm('Delete this comment?')) return;
+        const threadNode = target.closest('[data-thread-id]');
+        const threadId = threadNode ? threadNode.dataset.threadId : '';
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          messages: (thread.messages || []).map((message) =>
+            message.id === target.dataset.messageId
+              ? { ...message, deleted_at: Math.floor(Date.now() / 1000), body: '' }
+              : message),
+        }));
+        render();
+        await api('/comment-messages/' + target.dataset.messageId, { method: 'DELETE' }, true);
+      }
+      render();
+    } catch (error) {
+      setStatus(error.message || 'Action failed.');
+    }
+  });
+
+  updateContext();
+  startPolling();
+  const bootTarget = readPendingTarget();
+  if (bootTarget && bootTarget.pagePath === currentPagePath) {
+    panel.classList.add('open');
+    loadThreads({ silent: true, applyThreads: true });
+  } else {
+    loadThreads({ silent: true });
+  }
+  setStatus('Select text on the page to anchor a comment, or write to comment on the whole page.');
+})();
+</script>`;
+
+  if (html.includes('</body>')) return html.replace('</body>', `${shell}</body>`);
+  return `${html}${shell}`;
+}
+
 function mimeType(path: string): string {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const map: Record<string, string> = {
@@ -182,10 +1459,10 @@ async function serveArtifact(
   meta: ArtifactMeta,
   filePath: string,
   request: Request,
-  env: Env
+  env: Env,
+  routeConfig: { artifactBasePath: string }
 ): Promise<Response> {
-  // expires_at = 0 means permanent (never expires).
-  if (meta.expires_at > 0 && meta.expires_at < Math.floor(Date.now() / 1000)) {
+  if (isArtifactExpired(meta.expires_at)) {
     return new Response('Link expired', { status: 410 });
   }
 
@@ -210,18 +1487,30 @@ async function serveArtifact(
   };
 
   if (filePath.endsWith('.html')) {
-    // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
-    const maxAge = meta.expires_at === 0
-      ? 30 * 86400
-      : Math.max(0, meta.expires_at - Math.floor(Date.now() / 1000));
-    headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+    const html = typeof obj === 'string' ? obj : new TextDecoder().decode(obj);
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
+    if (env.MULTI_TENANT !== 'true') {
+      headers['Cache-Control'] = 'private, no-store, max-age=0';
+      return new Response(html, { status: 200, headers });
+    }
+    const viewerToken = await issueArtifactJWT(meta.id, meta.expires_at, env.JWT_SECRET);
+    const maxAge = artifactCookieMaxAge(meta.expires_at);
+    headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
     headers['Cache-Control'] = 'private, no-store, max-age=0';
+    return new Response(
+      injectCommentsUI(html, {
+        artifactId: meta.id,
+        viewerToken,
+        origin: new URL(request.url).origin,
+        artifactBasePath: routeConfig.artifactBasePath,
+        currentPagePath: filePath,
+      }),
+      { status: 200, headers }
+    );
   } else {
     headers['Cache-Control'] = 'public, max-age=86400, immutable';
+    return new Response(obj, { status: 200, headers });
   }
-
-  return new Response(obj, { status: 200, headers });
 }
 
 // --- Main handler ---
@@ -333,26 +1622,16 @@ export default {
 
         await env.TOSS_KV.put(`artifacts/${id}/files/index.html`, html);
 
-        // expires_at = 0 in the row signals "never expires".
-        const expiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
+        const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
         await env.TOSS_DB.prepare(
           'INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         )
           .bind(id, slug, name, html.length, now, expiresAt, auth.tokenHash, passwordHash)
           .run();
 
-        // Legacy /a/:id?t=jwt URL — for permanent shares we mark the JWT with
-        // `permanent: true` so the verifier can normalize expires_at = 0 instead
-        // of treating the far-future `exp` as a real expiry (which would cause
-        // a 100-year cookie max-age).
-        const jwtPayload: Record<string, unknown> = { sub: id, iat: now };
-        if (expiresSeconds === 0) {
-          jwtPayload.permanent = true;
-          jwtPayload.exp = now + (100 * 365 * 86400);
-        } else {
-          jwtPayload.exp = now + expiresSeconds;
-        }
-        const jwt = await signJWT(jwtPayload, env.JWT_SECRET);
+        // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
+        // time-bound distinction so the verifier can normalize correctly.
+        const jwt = await issueArtifactJWT(id, expiresAt, env.JWT_SECRET);
         const legacyUrl = `${url.origin}/a/${id}?t=${jwt}`;
         const shortUrl = `${url.origin}/s/${slug}`;
 
@@ -451,11 +1730,305 @@ export default {
           }
           cursor = list.list_complete ? undefined : list.cursor;
         } while (cursor);
+        // Cascade comments before the artifact row so a half-failed revoke
+        // doesn't leave orphans with no way to find them again. Delete
+        // messages first (they reference threads via thread_id).
+        await env.TOSS_DB.prepare(
+          'DELETE FROM comment_messages WHERE thread_id IN (SELECT id FROM comment_threads WHERE artifact_id = ?)'
+        ).bind(id).run();
+        await env.TOSS_DB.prepare('DELETE FROM comment_threads WHERE artifact_id = ?').bind(id).run();
         await env.TOSS_DB.prepare('DELETE FROM artifacts WHERE id = ?').bind(id).run();
 
         return new Response(JSON.stringify({ revoked: id }), {
           headers: { 'Content-Type': 'application/json' },
         });
+      }
+
+      // ===== COMMENT THREADS =====
+      const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
+      if (commentListMatch && request.method === 'GET') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const artifactId = commentListMatch[1];
+        const access = await requireCommentAccess(request, env, artifactId);
+        if (access instanceof Response) return access;
+        const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
+        if (pagePath instanceof Response) return pagePath;
+        const includeActivity = url.searchParams.get('includeActivity') === '1';
+
+        const auth = await resolveUser(request, env);
+        const threadQuery = await env.TOSS_DB.prepare(
+          'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+        ).bind(artifactId, pagePath).all();
+        const messageQuery = await env.TOSS_DB.prepare(
+          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+        ).bind(artifactId, pagePath).all();
+        let activityThreadQuery: { results?: unknown[] } | null = null;
+        let activityMessageQuery: { results?: unknown[] } | null = null;
+        if (includeActivity) {
+          activityThreadQuery = await env.TOSS_DB.prepare(
+            'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+          ).bind(artifactId).all();
+          activityMessageQuery = await env.TOSS_DB.prepare(
+            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+          ).bind(artifactId).all();
+        }
+
+        const hydrateThreads = (
+          threadRows: Array<Record<string, unknown>>,
+          messageRows: Array<Record<string, unknown>>
+        ) => {
+          const threads = threadRows.map((thread) => ({
+            ...thread,
+            anchor: thread.anchor_json ? JSON.parse(String(thread.anchor_json)) : null,
+            can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
+            can_resolve: !!auth,
+            messages: [],
+          })) as Array<Record<string, unknown>>;
+
+          const byThread = new Map<string, Array<Record<string, unknown>>>();
+          for (const row of messageRows) {
+            const items = byThread.get(String(row.thread_id)) || [];
+            items.push({
+              ...row,
+              can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
+              can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
+            });
+            byThread.set(String(row.thread_id), items);
+          }
+
+          for (const thread of threads) {
+            thread.messages = byThread.get(String(thread.id)) || [];
+            delete thread.anchor_json;
+            delete thread.created_by_token_hash;
+          }
+          return threads;
+        };
+
+        const threads = hydrateThreads(
+          (threadQuery.results || []) as Array<Record<string, unknown>>,
+          (messageQuery.results || []) as Array<Record<string, unknown>>
+        );
+        const activityThreads = includeActivity
+          ? hydrateThreads(
+            (activityThreadQuery?.results || []) as Array<Record<string, unknown>>,
+            (activityMessageQuery?.results || []) as Array<Record<string, unknown>>
+          )
+          : threads;
+
+        return jsonResponse({
+          pagePath,
+          viewer: { authenticated: !!auth, label: auth?.label || null },
+          threads,
+          activityThreads,
+        });
+      }
+
+      if (commentListMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const artifactId = commentListMatch[1];
+        const access = await requireCommentAccess(request, env, artifactId);
+        if (access instanceof Response) return access;
+
+        const auth = await requireUser(request, env);
+        if (auth instanceof Response) return auth;
+
+        const normalized = normalizeThreadInput(await request.json().catch(() => null));
+        if (normalized instanceof Response) return normalized;
+
+        const now = Math.floor(Date.now() / 1000);
+        const threadId = generateId();
+        const messageId = generateId();
+
+        await env.TOSS_DB.prepare(
+          'INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          threadId,
+          artifactId,
+          normalized.pagePath,
+          auth.tokenHash,
+          auth.label,
+          normalized.scopeType,
+          normalized.anchorJson,
+          'open',
+          now,
+          now,
+        ).run();
+
+        await env.TOSS_DB.prepare(
+          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).bind(messageId, threadId, auth.tokenHash, auth.label, normalized.body, now, now).run();
+
+        return jsonResponse({
+          id: threadId,
+          messageId,
+          thread: {
+            id: threadId,
+            artifact_id: artifactId,
+            page_path: normalized.pagePath,
+            created_by_label: auth.label,
+            scope_type: normalized.scopeType,
+            anchor: normalized.anchorJson ? JSON.parse(normalized.anchorJson) : null,
+            status: 'open',
+            resolved_by_label: null,
+            resolved_at: null,
+            deleted_at: null,
+            created_at: now,
+            updated_at: now,
+            can_delete: true,
+            can_resolve: true,
+            messages: [{
+              id: messageId,
+              thread_id: threadId,
+              author_label: auth.label,
+              body: normalized.body,
+              created_at: now,
+              updated_at: now,
+              deleted_at: null,
+              can_edit: true,
+              can_delete: true,
+            }],
+          },
+        }, { status: 201 });
+      }
+
+      const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
+      if (threadMessageMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const threadId = threadMessageMatch[1];
+        const auth = await requireUser(request, env);
+        if (auth instanceof Response) return auth;
+
+        const threadRow = await env.TOSS_DB.prepare(
+          'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
+        ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
+        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
+
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
+
+        const message = normalizeMessageInput(await request.json().catch(() => null));
+        if (message instanceof Response) return message;
+
+        const now = Math.floor(Date.now() / 1000);
+        const messageId = generateId();
+        await env.TOSS_DB.prepare(
+          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).bind(messageId, threadId, auth.tokenHash, auth.label, message, now, now).run();
+        await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, threadId).run();
+
+        return jsonResponse({
+          id: messageId,
+          threadId,
+          threadUpdatedAt: now,
+          message: {
+            id: messageId,
+            thread_id: threadId,
+            author_label: auth.label,
+            body: message,
+            created_at: now,
+            updated_at: now,
+            deleted_at: null,
+            can_edit: true,
+            can_delete: true,
+          },
+        }, { status: 201 });
+      }
+
+      const threadResolveMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/(resolve|reopen)$/);
+      if (threadResolveMatch && request.method === 'POST') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const threadId = threadResolveMatch[1];
+        const action = threadResolveMatch[2];
+        const auth = await requireUser(request, env);
+        if (auth instanceof Response) return auth;
+
+        const threadRow = await env.TOSS_DB.prepare(
+          'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
+        ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
+        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
+
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
+
+        const now = Math.floor(Date.now() / 1000);
+        if (action === 'resolve') {
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = ?, resolved_by_label = ?, resolved_at = ?, updated_at = ? WHERE id = ?'
+          ).bind('resolved', auth.tokenHash, auth.label, now, now, threadId).run();
+        } else {
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ? WHERE id = ?'
+          ).bind('open', now, threadId).run();
+        }
+        return jsonResponse({
+          id: threadId,
+          status: action === 'resolve' ? 'resolved' : 'open',
+          resolvedByLabel: action === 'resolve' ? auth.label : null,
+          resolvedAt: action === 'resolve' ? now : null,
+          updatedAt: now,
+        });
+      }
+
+      const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
+      if (threadDeleteMatch && request.method === 'DELETE') {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const threadId = threadDeleteMatch[1];
+        const auth = await requireUser(request, env);
+        if (auth instanceof Response) return auth;
+
+        const threadRow = await env.TOSS_DB.prepare(
+          'SELECT artifact_id, created_by_token_hash, deleted_at FROM comment_threads WHERE id = ?'
+        ).bind(threadId).first<{ artifact_id: string; created_by_token_hash: string; deleted_at: number | null }>();
+        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
+
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
+        if (!auth.isAdmin && !constantTimeEqual(threadRow.created_by_token_hash, auth.tokenHash)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        await env.TOSS_DB.prepare(
+          'UPDATE comment_threads SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?'
+        ).bind(now, auth.tokenHash, now, threadId).run();
+        return new Response(null, { status: 204 });
+      }
+
+      const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
+      if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
+        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
+        const messageId = messageMatch[1];
+        const auth = await requireUser(request, env);
+        if (auth instanceof Response) return auth;
+
+        const row = await env.TOSS_DB.prepare(
+          'SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
+        ).bind(messageId).first<{ thread_id: string; author_token_hash: string; deleted_at: number | null; artifact_id: string; thread_status: string }>();
+        if (!row || row.deleted_at) return new Response('Not found', { status: 404 });
+
+        const access = await requireCommentAccess(request, env, row.artifact_id);
+        if (access instanceof Response) return access;
+        if (!auth.isAdmin && !constantTimeEqual(row.author_token_hash, auth.tokenHash)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        if (request.method === 'PATCH') {
+          if (row.thread_status === 'resolved') return new Response('Resolved comments cannot be edited', { status: 409 });
+          const message = normalizeMessageInput(await request.json().catch(() => null));
+          if (message instanceof Response) return message;
+          await env.TOSS_DB.prepare('UPDATE comment_messages SET body = ?, updated_at = ? WHERE id = ?')
+            .bind(message, now, messageId)
+            .run();
+          await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, row.thread_id).run();
+          return jsonResponse({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
+        }
+
+        await env.TOSS_DB.prepare('UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?')
+          .bind(now, auth.tokenHash, now, messageId)
+          .run();
+        await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, row.thread_id).run();
+        return new Response(null, { status: 204 });
       }
 
       // ===== TOKEN MANAGEMENT (admin only) =====
@@ -512,14 +2085,16 @@ export default {
       const slugMatch = url.pathname.match(/^\/s\/([a-zA-Z0-9-]+)(?:\/(.*))?$/);
       if (slugMatch) {
         const slug = slugMatch[1];
+        if (!url.pathname.endsWith('/') && slugMatch[2] === undefined) {
+          return Response.redirect(`${url.origin}${url.pathname}/`, 302);
+        }
         const row = await env.TOSS_DB.prepare(
           'SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?'
         ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null }>();
 
         if (!row) return new Response('Not found', { status: 404 });
 
-        // expires_at = 0 means permanent (never expires).
-        if (row.expires_at > 0 && row.expires_at < Math.floor(Date.now() / 1000)) {
+        if (isArtifactExpired(row.expires_at)) {
           return new Response('Link expired', { status: 410 });
         }
 
@@ -536,11 +2111,9 @@ export default {
               const providedHash = password ? await sha256(password + row.id) : '';
 
               if (constantTimeEqual(providedHash, row.password_hash)) {
-                // Correct password: redirect with cookie.
-                // Permanent shares: 30d cookie life. Time-bound shares: scope to remaining lifetime.
-                const maxAge = row.expires_at === 0
-                  ? 30 * 86400
-                  : Math.max(0, row.expires_at - Math.floor(Date.now() / 1000));
+                // Correct password: redirect with a session cookie scoped to
+                // this share's lifetime (capped at 30d for permanent shares).
+                const maxAge = artifactCookieMaxAge(row.expires_at);
                 return new Response(null, {
                   status: 302,
                   headers: {
@@ -576,7 +2149,7 @@ export default {
         }
         filePath = parts.join('/');
 
-        return serveArtifact(row, filePath, request, env);
+        return serveArtifact(row, filePath, request, env, { artifactBasePath: `/s/${slug}/` });
       }
 
       // ===== SERVE by ID + JWT (/a/:id) =====
@@ -598,18 +2171,15 @@ export default {
         }
         if (!token) return new Response('Missing token', { status: 401 });
 
-        let payload: Record<string, unknown>;
+        let verified: { expiresAt: number } | null;
         try {
-          payload = await verifyJWT(token, env.JWT_SECRET);
+          const payload = await verifyJWT(token, env.JWT_SECRET);
           if (payload.sub !== id) return new Response('Invalid token scope', { status: 403 });
-          // Permanent JWTs skip the exp check; everything else uses exp as before.
-          const isPermanent = payload.permanent === true;
-          if (!isPermanent && typeof payload.exp === 'number' && payload.exp < Math.floor(Date.now() / 1000)) {
-            return new Response('Link expired', { status: 410 });
-          }
+          verified = readArtifactJWT(payload);
         } catch {
           return new Response('Invalid token', { status: 401 });
         }
+        if (!verified) return new Response('Link expired', { status: 410 });
 
         let filePath = serveMatch[2] || 'index.html';
         if (filePath.endsWith('/')) filePath += 'index.html';
@@ -621,13 +2191,15 @@ export default {
         }
         filePath = parts.join('/');
 
-        // Normalize permanent tokens to expires_at = 0 so the cookie max-age
-        // and 410 guard in serveArtifact() take the permanent branch.
-        const meta = {
-          id,
-          expires_at: payload.permanent === true ? 0 : (payload.exp as number),
-        };
-        return serveArtifact(meta, filePath, request, env);
+        // readArtifactJWT already returned PERMANENT (0) for permanent tokens,
+        // so meta.expires_at carries the canonical sentinel into serveArtifact.
+        return serveArtifact(
+          { id, expires_at: verified.expiresAt },
+          filePath,
+          request,
+          env,
+          { artifactBasePath: `/a/${id}/` },
+        );
       }
 
       // Root (/)

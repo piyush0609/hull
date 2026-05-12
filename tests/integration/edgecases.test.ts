@@ -347,8 +347,10 @@ describe('Worker Edge Cases', () => {
       const req = new Request(`http://localhost/a/${id}/?t=${token}`);
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(200);
-      // Cookie max-age should be the 30d permanent-branch value, not seconds-until-exp.
-      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=2592000');
+      // Single-user mode short-circuits before setting Set-Cookie (per PR #3 — the
+      // toss_tok cookie + comments wrapper only ship in multi-tenant mode).
+      // Cookie maxAge correctness for permanent shares is covered by the
+      // "should set 30d cookie on permanent password-protected share" test above.
     });
 
     it('should still reject expired non-permanent JWT', async () => {
@@ -359,6 +361,33 @@ describe('Worker Edge Cases', () => {
       const req = new Request(`http://localhost/a/${id}/?t=${token}`);
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(410);
+    });
+
+    // Locks in the contract for the permanent-share viewer JWT (refactor target).
+    // Pre-refactor: requireViewerForArtifact rejects any JWT whose exp is in the
+    // past, ignoring the `permanent: true` flag — so server-issued viewer tokens
+    // for permanent artifacts 410 the entire comments API.
+    // Post-refactor: readArtifactJWT honors `permanent: true` and short-circuits
+    // the exp check, matching the legacy /a/:id JWT semantics.
+    it('viewer JWT with permanent:true must NOT 410 even when exp is in the past', async () => {
+      const id = 'abc12345-1234-1234-1234-123456789abc';
+      const now = Math.floor(Date.now() / 1000);
+      // Shape this exactly like the post-refactor issueArtifactJWT() will emit
+      // for permanent shares: permanent flag + a real exp value (which may be
+      // anywhere). The exp being in the past is the key — only the `permanent`
+      // flag should be honored.
+      const viewerToken = await signJWT(
+        { sub: id, iat: now, permanent: true, exp: now - 100 },
+        SECRET
+      );
+
+      // The comments API is gated to multi-tenant mode, so flip it on.
+      const env = { ...createEnv(kv, db), MULTI_TENANT: 'true' };
+      const req = new Request(`http://localhost/artifacts/${id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': viewerToken },
+      });
+      const res = await worker.fetch(req, env);
+      expect(res.status).not.toBe(410);
     });
   });
 });
