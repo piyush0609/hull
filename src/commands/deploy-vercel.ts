@@ -1,4 +1,4 @@
-import { mkdir, writeFile, rm, readdir, copyFile, readFile } from 'fs/promises';
+import { mkdir, rm, readdir, copyFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -7,15 +7,11 @@ import { promisify } from 'util';
 import { homedir } from 'os';
 import { saveConfig, loadConfig, listProfiles, switchProfile } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
+import { deriveDeploymentSuffix, getVercelProjectName } from '../lib/deployment-target.js';
+import { extractVercelStorageEnv } from '../lib/vercel-env.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-function deriveDeploymentSuffix(profileName?: string, savedSubdomain?: string): string {
-  if (savedSubdomain) return savedSubdomain;
-  if (!profileName || profileName === 'default' || profileName === 'owner') return 'toss';
-  return profileName.toLowerCase().replace(/_/g, '-');
-}
 
 function generateToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -37,54 +33,36 @@ async function copyDir(src: string, dest: string): Promise<void> {
 }
 
 async function vercelExec(cmd: string, cwd?: string): Promise<string> {
-  const { stdout, stderr } = await execAsync(cmd, cwd ? { cwd, maxBuffer: 10 * 1024 * 1024 } : { maxBuffer: 10 * 1024 * 1024 });
+  const { stdout, stderr } = await execAsync(
+    cmd,
+    cwd ? { cwd, maxBuffer: 10 * 1024 * 1024 } : { maxBuffer: 10 * 1024 * 1024 }
+  );
   return stdout + '\n' + (stderr || '');
 }
 
 async function setVercelEnv(cwd: string, name: string, value: string): Promise<void> {
   const environments = ['production', 'development'];
   for (const env of environments) {
-    // Remove existing env var first to avoid "already exists" errors
     try {
       await execAsync(`vercel env rm ${name} ${env} --yes --non-interactive`, { cwd });
     } catch {
-      // Ignore if it doesn't exist
+      // Ignore if it doesn't exist.
     }
-    await execAsync(`printf "%s\\n" "${value.replace(/"/g, '\\"')}" | vercel env add ${name} ${env} --non-interactive`, { cwd });
+    await execAsync(
+      `printf "%s\\n" "${value.replace(/"/g, '\\"')}" | vercel env add ${name} ${env} --non-interactive`,
+      { cwd }
+    );
   }
 }
 
-async function projectHasVercelEnv(cwd: string, name: string): Promise<boolean> {
-  try {
-    const envList = await vercelExec('vercel env ls --non-interactive', cwd);
-    return envList.includes(name);
-  } catch {
-    return false;
-  }
-}
-
-async function pullVercelEnvFile(cwd: string): Promise<string | null> {
+async function pullVercelStorageEnv(cwd: string): Promise<{ databaseUrl?: string; blobToken?: string }> {
   try {
     await vercelExec('vercel env pull --yes --non-interactive', cwd);
-    return await readFile(join(cwd, '.env.local'), 'utf-8');
+    const envContent = await readFile(join(cwd, '.env.local'), 'utf-8');
+    return extractVercelStorageEnv(envContent);
   } catch {
-    return null;
+    return {};
   }
-}
-
-function readEnvVar(envContent: string, name: string): string | null {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const quoted = envContent.match(new RegExp(`^${escaped}="([^"]*)"$`, 'm'));
-  if (quoted) return quoted[1];
-  const plain = envContent.match(new RegExp(`^${escaped}=(.+)$`, 'm'));
-  return plain ? plain[1].trim() : null;
-}
-
-function extractDatabaseUrl(envContent: string): string | null {
-  return readEnvVar(envContent, 'DATABASE_URL')
-    || readEnvVar(envContent, 'POSTGRES_URL')
-    || readEnvVar(envContent, 'POSTGRES_PRISMA_URL')
-    || null;
 }
 
 async function getVercelToken(): Promise<string | null> {
@@ -133,7 +111,6 @@ export async function deployVercelCommand(options: {
 }) {
   console.log('Setting up your toss on Vercel...\n');
 
-  // Check vercel CLI
   try {
     const out = await vercelExec('vercel --version');
     console.log(`✅ Vercel CLI ${out.trim()}`);
@@ -142,7 +119,6 @@ export async function deployVercelCommand(options: {
     process.exit(1);
   }
 
-  // Check auth
   let vercelUser: string | null = null;
   try {
     const out = await vercelExec('vercel whoami');
@@ -154,7 +130,6 @@ export async function deployVercelCommand(options: {
     process.exit(1);
   }
 
-  // Interactive profile selection
   let profileName = options.profile;
   if (!profileName && process.stdin.isTTY && !options.yes) {
     const { profiles, active } = await listProfiles();
@@ -179,13 +154,11 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Load profile
   let profileConfig = null;
   if (profileName) {
     profileConfig = await loadConfig(profileName);
   }
 
-  // Interactive deployment mode
   let multiTenant = options.multiTenant;
   if (multiTenant === undefined && process.stdin.isTTY && !options.yes) {
     const mode = await promptSelect('Deployment mode:', [
@@ -196,45 +169,45 @@ export async function deployVercelCommand(options: {
     console.log();
   }
 
-  // Stable service name comes from the profile by default.
-  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → saved profile → derived default.
-  const subdomain = options.subdomain
-    || process.env.TOSS_SUBDOMAIN
-    || deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
+  const subdomain =
+    options.subdomain ||
+    process.env.TOSS_SUBDOMAIN ||
+    deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
   if (!/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
   console.log(`Using project suffix: ${subdomain}`);
 
-  // Save early
-  const earlyConfig = await loadConfig(profileName) || { endpoint: '', token: '', subdomain, role: 'owner' as const, backend: 'vercel' as const };
+  const earlyConfig =
+    (await loadConfig(profileName)) || {
+      endpoint: '',
+      token: '',
+      subdomain,
+      role: 'owner' as const,
+      backend: 'vercel' as const,
+    };
   earlyConfig.subdomain = subdomain;
   earlyConfig.role = 'owner';
   earlyConfig.backend = 'vercel';
   await saveConfig(earlyConfig, profileName);
 
-  // Custom domain
   const customDomain = options.domain || process.env.TOSS_DOMAIN || undefined;
-  if (customDomain) {
-    if (!/^[a-z0-9][a-z0-9-]*\.[a-z]{2,}(\.[a-z]{2,})?$/i.test(customDomain)) {
-      console.error('Error: Invalid domain format.');
-      process.exit(1);
-    }
+  if (customDomain && !/^[a-z0-9][a-z0-9-]*\.[a-z]{2,}(\.[a-z]{2,})?$/i.test(customDomain)) {
+    console.error('Error: Invalid domain format.');
+    process.exit(1);
   }
 
-  const projectName = subdomain === 'toss' ? 'toss' : `toss-${subdomain}`;
+  const projectName = getVercelProjectName(subdomain);
   const deployDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'vercel', projectName);
   const ownerToken = generateToken();
   const jwtSecret = generateToken();
 
-  // Prepare project files
   console.log('Preparing project files...');
   await rm(deployDir, { recursive: true, force: true });
   await mkdir(deployDir, { recursive: true });
   await copyDir(join(__dirname, '..', 'templates', 'vercel'), deployDir);
 
-  // Create or ensure project exists
   console.log(`Creating Vercel project "${projectName}"...`);
   try {
     await vercelExec(`vercel project add ${projectName} --non-interactive`);
@@ -246,10 +219,8 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Link project
   await vercelExec(`vercel link --project ${projectName} --yes --non-interactive`, deployDir);
 
-  // Read project ID
   let projectId: string | null = null;
   try {
     const projectJson = await readFile(join(deployDir, '.vercel', 'project.json'), 'utf-8');
@@ -257,7 +228,6 @@ export async function deployVercelCommand(options: {
     projectId = parsed.projectId || null;
   } catch {}
 
-  // Disable SSO protection so shared links are publicly accessible
   if (projectId) {
     const token = await getVercelToken();
     if (token) {
@@ -266,7 +236,6 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Set environment variables
   console.log('Setting secrets...');
   await setVercelEnv(deployDir, 'JWT_SECRET', jwtSecret);
   await setVercelEnv(deployDir, 'OWNER_TOKEN', ownerToken);
@@ -274,24 +243,28 @@ export async function deployVercelCommand(options: {
     await setVercelEnv(deployDir, 'MULTI_TENANT', 'true');
   }
 
-  // Auto-provision Neon Postgres if not provided
-  let databaseUrl = options.postgresUrl || process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
+  const existingStorageEnv = await pullVercelStorageEnv(deployDir);
+
+  let databaseUrl =
+    options.postgresUrl ||
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    existingStorageEnv.databaseUrl ||
+    '';
+  if (databaseUrl && !options.postgresUrl && !process.env.DATABASE_URL && !process.env.POSTGRES_URL) {
+    console.log('✅ Reusing existing Postgres database from project environment.');
+  }
   if (!databaseUrl) {
     console.log('Provisioning Neon Postgres database...');
     try {
       await vercelExec('vercel integration add neon --non-interactive', deployDir);
-      const envContent = await pullVercelEnvFile(deployDir);
-      if (envContent) {
-        const extracted = extractDatabaseUrl(envContent);
-        if (extracted) {
-          databaseUrl = extracted;
-          await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
-          console.log('✅ Postgres database provisioned and linked.');
-        } else {
-          console.warn('Warning: Could not read DATABASE_URL or POSTGRES_URL from provisioned Neon database.');
-        }
+      const storageEnv = await pullVercelStorageEnv(deployDir);
+      if (storageEnv.databaseUrl) {
+        databaseUrl = storageEnv.databaseUrl;
+        await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
+        console.log('✅ Postgres database provisioned and linked.');
       } else {
-        console.warn('Warning: Could not pull environment variables from provisioned Neon database.');
+        console.warn('Warning: Could not read DATABASE_URL from provisioned Neon database.');
       }
     } catch (err: any) {
       const msg = err.stderr || err.message || '';
@@ -299,41 +272,43 @@ export async function deployVercelCommand(options: {
         console.warn('⚠️  Neon marketplace terms not accepted. Accept them at:');
         console.warn('   https://vercel.com/dashboard/integrations/neon');
       } else {
-        const envContent = await pullVercelEnvFile(deployDir);
-        const extracted = envContent ? extractDatabaseUrl(envContent) : null;
-        if (extracted) {
-          databaseUrl = extracted;
-          await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
-          console.log('✅ Postgres database already linked to project.');
-        } else {
-          console.warn('Warning: Could not provision Neon:', msg);
-        }
+        console.warn('Warning: Could not provision Neon:', msg);
+      }
+
+      const storageEnv = await pullVercelStorageEnv(deployDir);
+      if (storageEnv.databaseUrl) {
+        databaseUrl = storageEnv.databaseUrl;
+        await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
+        console.log('✅ Reusing existing Postgres database linked to the project.');
       }
     }
   } else {
     await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
   }
 
-  // Auto-provision Vercel Blob store if not provided
-  let blobToken = options.blobToken || process.env.BLOB_READ_WRITE_TOKEN || '';
+  let blobToken =
+    options.blobToken || process.env.BLOB_READ_WRITE_TOKEN || existingStorageEnv.blobToken || '';
   let blobStoreUrl = '';
-  if (!blobToken) {
-    // Check if project already has a BLOB_READ_WRITE_TOKEN
-    if (await projectHasVercelEnv(deployDir, 'BLOB_READ_WRITE_TOKEN')) {
-      console.log('✅ Blob store already connected to project.');
-      blobToken = 'existing';
-    }
+  if (blobToken && !options.blobToken && !process.env.BLOB_READ_WRITE_TOKEN) {
+    console.log('✅ Reusing existing Blob store from project environment.');
   }
   if (!blobToken) {
     console.log('Provisioning Vercel Blob store...');
     try {
-      const out = await vercelExec(`vercel blob create-store ${projectName}-blob --access private --yes --non-interactive`, deployDir);
-      // Extract store ID from output
+      const out = await vercelExec(
+        `vercel blob create-store ${projectName}-blob --access private --yes --non-interactive`,
+        deployDir
+      );
       const idMatch = out.match(/store_[a-zA-Z0-9]+/);
       const storeId = idMatch ? idMatch[0] : '';
       if (storeId) {
         blobStoreUrl = `https://vercel.com/dashboard/stores/blob/${storeId}`;
         console.log(`✅ Blob store created: ${storeId}`);
+      }
+      const storageEnv = await pullVercelStorageEnv(deployDir);
+      if (storageEnv.blobToken) {
+        blobToken = storageEnv.blobToken;
+        console.log('✅ Blob store linked to project.');
       }
     } catch (err: any) {
       const msg = err.stderr || err.message || '';
@@ -344,19 +319,16 @@ export async function deployVercelCommand(options: {
       } else {
         console.warn('Warning: Could not provision Blob store:', msg);
       }
+      const storageEnv = await pullVercelStorageEnv(deployDir);
+      if (storageEnv.blobToken) {
+        blobToken = storageEnv.blobToken;
+        console.log('✅ Reusing existing Blob store linked to the project.');
+      }
     }
-
-    // Re-check project env after store creation. Vercel often auto-injects
-    // BLOB_READ_WRITE_TOKEN even though we do not know the token value locally.
-    if (await projectHasVercelEnv(deployDir, 'BLOB_READ_WRITE_TOKEN')) {
-      console.log('✅ Blob token detected in project environment.');
-      blobToken = 'existing';
-    }
-  } else if (blobToken !== 'existing') {
+  } else {
     await setVercelEnv(deployDir, 'BLOB_READ_WRITE_TOKEN', blobToken);
   }
 
-  // Deploy
   console.log('Deploying to Vercel...');
   let deployOutput: string;
   try {
@@ -366,7 +338,6 @@ export async function deployVercelCommand(options: {
     process.exit(1);
   }
 
-  // Parse deployment URL from JSON output (last line)
   let projectUrl: string | null = null;
   const lines = deployOutput.trim().split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -389,7 +360,6 @@ export async function deployVercelCommand(options: {
     process.exit(1);
   }
 
-  // Add custom domain
   if (customDomain) {
     console.log(`Adding custom domain ${customDomain}...`);
     try {
@@ -403,7 +373,6 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Check storage status
   const hasDatabase = !!databaseUrl;
   const hasBlob = !!blobToken;
 
@@ -414,24 +383,22 @@ export async function deployVercelCommand(options: {
       console.log('❌ DATABASE_URL not available.');
       console.log('   Run: vercel integration add neon --non-interactive');
       console.log('   Or accept terms at: https://vercel.com/integrations/neon');
-      console.log('   If this project already has Postgres env vars, re-run with: --postgres-url <POSTGRES_URL>');
       console.log('');
     }
     if (!hasBlob) {
       console.log('❌ BLOB_READ_WRITE_TOKEN not available.');
       if (blobStoreUrl) {
-        console.log(`   Copy the token from your Blob store dashboard:`);
+        console.log('   Copy the token from your Blob store dashboard:');
         console.log(`   ${blobStoreUrl}`);
       } else {
-        console.log(`   Create a Blob store at: https://vercel.com/dashboard`);
-        console.log(`   → Storage → Create Store → Blob`);
+        console.log('   Create a Blob store at: https://vercel.com/dashboard');
+        console.log('   → Storage → Create Store → Blob');
       }
       console.log('   Then re-deploy with: --blob-token <token>');
       console.log('');
     }
   }
 
-  // Run migrations if database is available
   if (hasDatabase) {
     console.log('Running database migrations...');
     try {
@@ -446,7 +413,6 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Save config
   const endpoint = customDomain ? `https://${customDomain}` : projectUrl;
   await saveConfig(
     {
@@ -474,9 +440,9 @@ export async function deployVercelCommand(options: {
   }
   console.log(`   Mode:     ${multiTenant ? 'Multi-tenant team' : 'Single-user'}`);
   if (hasDatabase && hasBlob) {
-    console.log(`   Upload:   toss ./file.html`);
+    console.log('   Upload:   toss ./file.html');
   } else {
     console.log('   ⚠️  Configure storage before uploading files.');
   }
-  console.log(`   Manage:   toss list`);
+  console.log('   Manage:   toss list');
 }

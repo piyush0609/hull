@@ -2,6 +2,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { loadConfig, saveConfig } from '../lib/config.js';
 import { promptConfirm } from '../lib/prompt.js';
+import { deriveDeploymentSuffix, getVercelProjectName } from '../lib/deployment-target.js';
 
 const execAsync = promisify(exec);
 
@@ -14,9 +15,7 @@ export async function destroyVercelCommand(options: { profile?: string; yes?: bo
 
   const projectName = config.vercelProjectId
     ? undefined
-    : config.subdomain && config.subdomain !== 'toss'
-      ? `toss-${config.subdomain}`
-      : 'toss';
+    : getVercelProjectName(deriveDeploymentSuffix(options.profile, config.subdomain));
 
   if (!projectName && !config.vercelProjectId) {
     console.error('Could not determine Vercel project name. No subdomain or project ID in config.');

@@ -2,14 +2,9 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { prompt, promptConfirm } from '../lib/prompt.js';
 import { loadConfig, saveConfig, switchProfile } from '../lib/config.js';
+import { deriveDeploymentSuffix } from '../lib/deployment-target.js';
 
 const execAsync = promisify(exec);
-
-function deriveDeploymentSuffix(profileName?: string, savedSubdomain?: string): string {
-  if (savedSubdomain) return savedSubdomain;
-  if (!profileName || profileName === 'default' || profileName === 'owner') return 'toss';
-  return profileName.toLowerCase().replace(/_/g, '-');
-}
 
 export async function setupVercelCommand(options: { profile?: string; subdomain?: string; yes?: boolean } = {}) {
   const profileName = options.profile;
@@ -33,17 +28,16 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
   }
 
   const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
-  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → existing config → derived default.
-  const subdomain = options.subdomain
-    || process.env.TOSS_SUBDOMAIN
-    || deriveDeploymentSuffix(profileName, existingConfig?.subdomain);
+  const subdomain =
+    options.subdomain ||
+    process.env.TOSS_SUBDOMAIN ||
+    deriveDeploymentSuffix(profileName, existingConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Suffix must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
   console.log(`Using project suffix: ${subdomain}`);
 
-  // Check Node.js
   const nodeVersion = process.version;
   const nodeMajor = parseInt(nodeVersion.slice(1).split('.')[0], 10);
   if (nodeMajor < 18) {
@@ -52,7 +46,6 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
   }
   console.log(`✅ Node.js ${nodeVersion}`);
 
-  // Check / install Vercel CLI
   let vercelVersion = '';
   try {
     const { stdout } = await execAsync('vercel --version');
@@ -77,7 +70,6 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
     }
   }
 
-  // Check auth
   let authOk = false;
   try {
     const { stdout } = await execAsync('vercel whoami');
@@ -111,7 +103,6 @@ export async function setupVercelCommand(options: { profile?: string; subdomain?
     }
   }
 
-  // Save profile
   if (profileName) {
     const config = existingConfig || { endpoint: '', token: '', subdomain: '', role: 'owner' as const };
     config.backend = 'vercel';

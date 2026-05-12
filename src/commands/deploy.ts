@@ -7,15 +7,10 @@ import { promisify } from 'util';
 import { homedir } from 'os';
 import { saveConfig, loadConfig, listProfiles, switchProfile } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
+import { deriveDeploymentSuffix, getCloudflareResourceNames } from '../lib/deployment-target.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-function deriveDeploymentSuffix(profileName?: string, savedSubdomain?: string): string {
-  if (savedSubdomain) return savedSubdomain;
-  if (!profileName || profileName === 'default' || profileName === 'owner') return 'toss';
-  return profileName.toLowerCase().replace(/_/g, '-');
-}
 
 function generateToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -41,10 +36,9 @@ async function getWranglerToken(): Promise<string | null> {
 
 async function getWorkersDevSubdomain(accountId: string, token: string): Promise<string | null> {
   try {
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     const data = await res.json();
     if (data.success && data.result?.subdomain) {
       return data.result.subdomain;
@@ -89,12 +83,16 @@ async function createKV(title: string, env?: { env: NodeJS.ProcessEnv }): Promis
 async function createD1(name: string, env?: { env: NodeJS.ProcessEnv }): Promise<string> {
   try {
     const out = await wranglerJSON(`wrangler d1 create ${name}`, env);
-    const m = out.match(/"database_id":\s*"([a-f0-9-]+)"/) || out.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/);
+    const m =
+      out.match(/"database_id":\s*"([a-f0-9-]+)"/) ||
+      out.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/);
     if (m) return m[1];
   } catch (err: any) {
     if (!err.stderr?.includes('already exists')) throw err;
     const out = await wranglerJSON('wrangler d1 list', env);
-    const m = out.match(new RegExp(`([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}).*${name}`));
+    const m = out.match(
+      new RegExp(`([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}).*${name}`)
+    );
     if (m) return m[1];
   }
   throw new Error('Could not create or find D1 database');
@@ -113,10 +111,14 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
   });
 }
 
-export async function deployCommand(options: { domain?: string; multiTenant?: boolean; profile?: string; subdomain?: string }) {
+export async function deployCommand(options: {
+  domain?: string;
+  multiTenant?: boolean;
+  profile?: string;
+  subdomain?: string;
+}) {
   console.log('Setting up your toss on Cloudflare...\n');
 
-  // Quick prereq check — direct to setup if anything is missing
   try {
     await execAsync('wrangler --version');
   } catch {
@@ -124,7 +126,6 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     process.exit(1);
   }
 
-  // Interactive profile selection
   let profileName = options.profile;
   if (!profileName && process.stdin.isTTY) {
     const { profiles, active } = await listProfiles();
@@ -158,7 +159,6 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     }
   }
 
-  // Interactive deployment mode
   let multiTenant = options.multiTenant;
   if (multiTenant === undefined && process.stdin.isTTY) {
     const mode = await promptSelect('Deployment mode:', [
@@ -169,43 +169,38 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     console.log();
   }
 
-  // Load profile if specified
   let profileConfig = null;
   if (profileName) {
     profileConfig = await loadConfig(profileName);
   }
 
-  // Build wrangler environment: support API token per profile
   let apiToken = profileConfig?.apiToken || process.env.CLOUDFLARE_API_TOKEN || '';
   let accountId = profileConfig?.accountId || '';
 
   if (apiToken) {
-    // Verify API token
     try {
       const res = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
         headers: { Authorization: `Bearer ${apiToken}` },
       });
-      const data = await res.json() as { success: boolean };
+      const data = (await res.json()) as { success: boolean };
       if (!data.success) throw new Error('Invalid token');
       console.log('✅ Using profile API token');
     } catch {
       console.error('❌ API token verification failed. Check your token.');
       process.exit(1);
     }
-    // Fetch account ID if not stored
     if (!accountId) {
       try {
         const res = await fetch('https://api.cloudflare.com/client/v4/accounts', {
           headers: { Authorization: `Bearer ${apiToken}` },
         });
-        const data = await res.json() as { success: boolean; result?: Array<{ id: string }> };
+        const data = (await res.json()) as { success: boolean; result?: Array<{ id: string }> };
         if (data.success && data.result && data.result.length > 0) {
           accountId = data.result[0].id;
         }
       } catch {}
     }
   } else {
-    // Fall back to wrangler OAuth
     try {
       const { stdout } = await execAsync('wrangler whoami');
       if (stdout.includes('not authenticated')) {
@@ -220,36 +215,31 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     }
   }
 
-  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → saved profile → derived default.
-  const subdomain = options.subdomain
-    || process.env.TOSS_SUBDOMAIN
-    || deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
+  const subdomain =
+    options.subdomain ||
+    process.env.TOSS_SUBDOMAIN ||
+    deriveDeploymentSuffix(profileName, profileConfig?.subdomain);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
   console.log(`Using deployment suffix: ${subdomain}`);
 
-  // Save subdomain early so destroy can find resources if deploy fails later
-  const earlyConfig = await loadConfig(profileName) || { endpoint: '', token: '', subdomain, role: 'owner' as const };
+  const earlyConfig =
+    (await loadConfig(profileName)) || { endpoint: '', token: '', subdomain, role: 'owner' as const };
   earlyConfig.subdomain = subdomain;
   earlyConfig.role = 'owner';
   if (accountId) earlyConfig.accountId = accountId;
   if (apiToken) earlyConfig.apiToken = apiToken;
   await saveConfig(earlyConfig, profileName);
 
-  // Validate custom domain if provided
   const customDomain = options.domain || process.env.TOSS_DOMAIN || undefined;
-  if (customDomain) {
-    if (!/^[a-z0-9][a-z0-9-]*\.[a-z]{2,}(\.[a-z]{2,})?$/i.test(customDomain)) {
-      console.error('Error: Invalid domain format.');
-      process.exit(1);
-    }
+  if (customDomain && !/^[a-z0-9][a-z0-9-]*\.[a-z]{2,}(\.[a-z]{2,})?$/i.test(customDomain)) {
+    console.error('Error: Invalid domain format.');
+    process.exit(1);
   }
 
-  const workerName = subdomain && subdomain !== 'toss' ? `toss-${subdomain}` : 'toss';
-  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
-  const kvTitle = subdomain && subdomain !== 'toss' ? `toss-kv-${subdomain}` : 'toss-kv';
+  const { workerName, dbName, kvTitle } = getCloudflareResourceNames(subdomain);
   const workerDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'worker');
   const ownerToken = generateToken();
   const jwtSecret = generateToken();
@@ -276,13 +266,8 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
   await mkdir(workerDir, { recursive: true });
   await copyDir(join(__dirname, '..', 'templates', 'worker'), workerDir);
 
-  const routeConfig = customDomain
-    ? `\n[[routes]]\npattern = "${customDomain}"\ncustom_domain = true\n`
-    : '';
-
-  const multiTenantConfig = multiTenant
-    ? `\n[vars]\nMULTI_TENANT = "true"\n`
-    : '';
+  const routeConfig = customDomain ? `\n[[routes]]\npattern = "${customDomain}"\ncustom_domain = true\n` : '';
+  const multiTenantConfig = multiTenant ? `\n[vars]\nMULTI_TENANT = "true"\n` : '';
 
   await writeFile(
     join(workerDir, 'wrangler.toml'),
@@ -361,26 +346,26 @@ database_id = "${databaseId}"
       endpoint: workerUrl,
       token: ownerToken,
       subdomain,
-      role: 'owner',
-      backend: 'cloudflare',
       kvId,
+      role: 'owner',
       accountId,
       apiToken,
     },
     profileName
   );
 
-  // Auto-switch to the deployed profile
   if (profileName) {
     await switchProfile(profileName);
   }
 
-  console.log('\n✅ Your toss is ready.');
+  console.log('\n✅ Your toss is deployed.');
   console.log(`   Endpoint: ${workerUrl}`);
+  console.log(`   Mode:     ${multiTenant ? 'Multi-tenant team' : 'Single-user'}`);
   if (multiTenant) {
-    console.log(`   Mode:     Multi-tenant team service`);
-    console.log(`   Admin:    toss admin token create --label "teammate"`);
+    console.log('   Admin:    toss admin token create --label "teammate"');
+    console.log('   Teammate: toss login <endpoint> --token <token>');
+  } else {
+    console.log('   Upload:   toss ./file.html');
   }
-  console.log(`   Upload:   toss ./file.html`);
-  console.log(`   Manage:   toss list`);
+  console.log('   Manage:   toss list');
 }

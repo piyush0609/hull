@@ -3,6 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { rm } from 'fs/promises';
 import { join } from 'path';
+import { deriveDeploymentSuffix, getCloudflareResourceNames } from '../lib/deployment-target.js';
 
 const execAsync = promisify(exec);
 
@@ -13,7 +14,7 @@ export async function destroyCommand(options: { profile?: string } = {}) {
     process.exit(1);
   }
 
-  const subdomain = config.subdomain;
+  const subdomain = deriveDeploymentSuffix(options.profile, config.subdomain);
   if (!subdomain) {
     console.warn('⚠️  Warning: No subdomain found in profile config.');
     console.warn('   The deploy may have failed before saving the config.');
@@ -23,7 +24,7 @@ export async function destroyCommand(options: { profile?: string } = {}) {
   console.log(`Destroying toss (${subdomain || 'unknown'})...\n`);
 
   const workerDir = join(process.env.HOME || '.', '.toss', 'worker');
-  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
+  const { dbName } = getCloudflareResourceNames(subdomain);
 
   // Build env with profile API token if available
   const env: NodeJS.ProcessEnv = { ...process.env };

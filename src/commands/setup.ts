@@ -5,39 +5,37 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { prompt, promptConfirm } from '../lib/prompt.js';
 import { loadConfig, saveConfig, switchProfile } from '../lib/config.js';
+import { deriveDeploymentSuffix, getCloudflareResourceNames } from '../lib/deployment-target.js';
 
 const execAsync = promisify(exec);
 
-async function checkSubdomainAvailability(subdomain: string, accountId: string, token: string): Promise<{ available: boolean; conflicts: string[] }> {
+async function checkSubdomainAvailability(
+  subdomain: string,
+  accountId: string,
+  token: string
+): Promise<{ available: boolean; conflicts: string[] }> {
   const conflicts: string[] = [];
-  const workerName = subdomain && subdomain !== 'toss' ? `toss-${subdomain}` : 'toss';
-  const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
-  const kvTitle = subdomain && subdomain !== 'toss' ? `toss-kv-${subdomain}` : 'toss-kv';
+  const { dbName, kvTitle } = getCloudflareResourceNames(subdomain);
 
-  // Check existing workers
   try {
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    const data = await res.json() as { success: boolean; result?: Array<{ id: string }> };
-    if (data.success && data.result) {
-      // Workers list doesn't include names in the basic response, so we skip detailed check
-      // and rely on D1 + KV checks which are more reliable
-    }
+    await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
   } catch {}
 
-  // Check existing D1 databases
   try {
-    const { stdout } = await execAsync(`CLOUDFLARE_ACCOUNT_ID=${accountId} CLOUDFLARE_API_TOKEN=${token} wrangler d1 list`);
+    const { stdout } = await execAsync(
+      `CLOUDFLARE_ACCOUNT_ID=${accountId} CLOUDFLARE_API_TOKEN=${token} wrangler d1 list`
+    );
     if (stdout.includes(dbName)) {
       conflicts.push(`D1 database "${dbName}"`);
     }
   } catch {}
 
-  // Check existing KV namespaces
   try {
-    const { stdout } = await execAsync(`CLOUDFLARE_ACCOUNT_ID=${accountId} CLOUDFLARE_API_TOKEN=${token} wrangler kv namespace list`);
+    const { stdout } = await execAsync(
+      `CLOUDFLARE_ACCOUNT_ID=${accountId} CLOUDFLARE_API_TOKEN=${token} wrangler kv namespace list`
+    );
     if (stdout.includes(kvTitle)) {
       conflicts.push(`KV namespace "${kvTitle}"`);
     }
@@ -63,10 +61,9 @@ async function getWranglerToken(): Promise<string | null> {
 
 async function getWorkersDevSubdomain(accountId: string, token: string): Promise<string | null> {
   try {
-    const res = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     const data = await res.json();
     if (data.success && data.result?.subdomain) {
       return data.result.subdomain;
@@ -80,7 +77,7 @@ async function getAccountIdFromToken(token: string): Promise<string | null> {
     const res = await fetch('https://api.cloudflare.com/client/v4/accounts', {
       headers: { Authorization: `Bearer ${token}` },
     });
-    const data = await res.json() as { success: boolean; result?: Array<{ id: string }> };
+    const data = (await res.json()) as { success: boolean; result?: Array<{ id: string }> };
     if (data.success && data.result && data.result.length > 0) {
       return data.result[0].id;
     }
@@ -120,20 +117,17 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
   }
 
   const existingConfig = profileName ? await loadConfig(profileName) : await loadConfig();
-  // Priority: explicit --subdomain → TOSS_SUBDOMAIN env → existing config → derived default.
-  const subdomain = options.subdomain
-    || process.env.TOSS_SUBDOMAIN
-    || existingConfig?.subdomain
-    || (!profileName || profileName === 'default' || profileName === 'owner'
-      ? 'toss'
-      : profileName.toLowerCase().replace(/_/g, '-'));
+  const subdomain =
+    options.subdomain ||
+    process.env.TOSS_SUBDOMAIN ||
+    existingConfig?.subdomain ||
+    deriveDeploymentSuffix(profileName);
   if (subdomain && !/^[a-z0-9-]+$/.test(subdomain)) {
     console.error('Error: Subdomain must be lowercase alphanumeric with hyphens only.');
     process.exit(1);
   }
   console.log(`Using deployment suffix: ${subdomain}`);
 
-  // Check Node.js
   const nodeVersion = process.version;
   const nodeMajor = parseInt(nodeVersion.slice(1).split('.')[0], 10);
   if (nodeMajor < 18) {
@@ -143,7 +137,6 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
   }
   console.log(`✅ Node.js ${nodeVersion}`);
 
-  // Check / install wrangler
   let wranglerVersion = '';
   try {
     const { stdout } = await execAsync('wrangler --version');
@@ -168,7 +161,6 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     }
   }
 
-  // Check auth state
   let whoamiStdout = '';
   let authOk = false;
   try {
@@ -198,18 +190,16 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
           authOk = false;
         }
       }
+    } else if (autoYes) {
+      console.log('Auto-accepting current account.');
     } else {
-      if (autoYes) {
-        console.log('Auto-accepting current account.');
-      } else {
-        const answer = await prompt('Use this account? (y/n): ');
-        if (answer.toLowerCase() !== 'y') {
-          console.log('Signing out...');
-          try {
-            await execAsync('wrangler logout');
-          } catch {}
-          authOk = false;
-        }
+      const answer = await prompt('Use this account? (y/n): ');
+      if (answer.toLowerCase() !== 'y') {
+        console.log('Signing out...');
+        try {
+          await execAsync('wrangler logout');
+        } catch {}
+        authOk = false;
       }
     }
   }
@@ -228,7 +218,6 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
         console.error('No token provided.');
         process.exit(1);
       }
-      // Verify token works
       try {
         const res = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
           headers: { Authorization: `Bearer ${token}` },
@@ -276,7 +265,6 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     }
   }
 
-  // If OAuth was used (no API token), extract account ID from whoami
   if (!apiToken && !accountId) {
     try {
       const { stdout } = await execAsync('wrangler whoami');
@@ -284,7 +272,6 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     } catch {}
   }
 
-  // Verify auth again with a real API call
   console.log('\nVerifying token works with Cloudflare API...');
   try {
     const { stdout } = await execAsync('wrangler whoami');
@@ -321,9 +308,8 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     }
   }
 
-  // Check subdomain availability if one was provided
   if (subdomain && accountId) {
-    const verifyToken = apiToken || await getWranglerToken() || '';
+    const verifyToken = apiToken || (await getWranglerToken()) || '';
     if (verifyToken) {
       console.log(`\nChecking availability of "${subdomain}"...`);
       const { available, conflicts } = await checkSubdomainAvailability(subdomain, accountId, verifyToken);
@@ -337,13 +323,12 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     }
   }
 
-  // Check workers.dev subdomain
   console.log('\nVerifying workers.dev subdomain...');
   let workersDevSubdomain = '';
   try {
     const { stdout } = await execAsync('wrangler whoami');
     const whoamiAccountId = getAccountIdFromWhoami(stdout);
-    const token = apiToken || await getWranglerToken();
+    const token = apiToken || (await getWranglerToken());
     if (whoamiAccountId && token) {
       workersDevSubdomain = (await getWorkersDevSubdomain(whoamiAccountId, token)) || '';
     }
@@ -358,33 +343,23 @@ export async function setupCommand(options: { profile?: string; subdomain?: stri
     process.exit(1);
   }
 
-  // If profile mode: save auth to profile
   if (profileName) {
     const config = existingConfig || { endpoint: '', token: '', subdomain: '', role: 'owner' as const };
-
-    // Update auth fields
     if (apiToken) config.apiToken = apiToken;
     if (accountId) config.accountId = accountId;
     config.subdomain = subdomain;
     config.role = 'owner';
-    // Persist the backend so a subsequent `admin deploy/destroy` (without
-    // --backend) routes to Cloudflare even if the profile was previously
-    // marked Vercel.
-    config.backend = 'cloudflare';
-
     await saveConfig(config, profileName);
     await switchProfile(profileName);
 
     console.log(`\n✅ Profile "${profileName}" configured.`);
     if (apiToken) {
-      console.log(`   Auth: API token (multi-account ready)`);
+      console.log('   Auth: API token (multi-account ready)');
     } else {
-      console.log(`   Auth: OAuth (global — use API token for multi-account)`);
+      console.log('   Auth: OAuth (global — use API token for multi-account)');
     }
     console.log(`   Account: ${accountId}`);
-    if (subdomain) {
-      console.log(`   Subdomain: ${subdomain}`);
-    }
+    console.log(`   Subdomain: ${subdomain}`);
     console.log(`\n   Next: toss admin deploy --profile ${profileName}`);
   } else {
     console.log('\n✅ Setup complete. You can now run:');
