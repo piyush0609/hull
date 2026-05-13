@@ -222,6 +222,21 @@ class StatefulMockD1 {
       return { success: true };
     }
 
+    if (query.includes('UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE thread_id = ? AND deleted_at IS NULL')) {
+      const deletedAt = Number(values[0]);
+      const deletedByTokenHash = String(values[1]);
+      const updatedAt = Number(values[2]);
+      const threadId = String(values[3]);
+      this.commentMessages.forEach((message) => {
+        if (message.thread_id === threadId && message.deleted_at == null) {
+          message.deleted_at = deletedAt;
+          message.deleted_by_token_hash = deletedByTokenHash;
+          message.updated_at = updatedAt;
+        }
+      });
+      return { success: true };
+    }
+
     if (query.includes('DELETE FROM users WHERE token_hash = ?')) {
       const tokenHash = String(values[0]);
       this.users = this.users.filter((u) => !(u.token_hash === tokenHash && u.is_admin === 0));
@@ -363,7 +378,7 @@ class StatefulMockD1 {
       ) as T | null;
     }
 
-    if (query.includes('SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id')) {
+    if (query.includes('SELECT m.thread_id, m.author_token_hash, m.deleted_at') && query.includes('WHERE m.id = ? AND t.deleted_at IS NULL')) {
       const message = this.commentMessages.find((item) => item.id === String(values[0]));
       if (!message) return null;
       const thread = this.commentThreads.find((item) => item.id === message.thread_id && item.deleted_at == null);
@@ -372,9 +387,19 @@ class StatefulMockD1 {
         thread_id: message.thread_id,
         author_token_hash: message.author_token_hash,
         deleted_at: message.deleted_at,
+        created_at: message.created_at,
         artifact_id: thread.artifact_id,
         thread_status: thread.status,
       }) as T;
+    }
+
+    if (query.includes('SELECT id FROM comment_messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT 1')) {
+      const threadId = String(values[0]);
+      const message = this.commentMessages
+        .filter((item) => item.thread_id === threadId)
+        .slice()
+        .sort((a, b) => a.created_at - b.created_at)[0];
+      return (message ? { id: message.id } : null) as T | null;
     }
 
     return null;
@@ -654,7 +679,7 @@ describe('Worker Routes', () => {
       expect(commentsResponse.status).toBe(404);
     });
 
-    it('should support threaded comments with anchors, replies, resolve, edit, and delete permissions', async () => {
+    it('should cascade root-comment deletion, keep reply deletion local, and preserve admin delete markers', async () => {
       const statefulDb = new StatefulMockD1();
       const memberAToken = 'member-a-token';
       const memberBToken = 'member-b-token';
@@ -807,14 +832,50 @@ describe('Worker Routes', () => {
       expect(editOwnReplyBody.body).toBe('Agree, and maybe tighten line height.');
       expect(editOwnReplyBody.threadUpdatedAt).toBeGreaterThan(0);
 
-      const deleteOwnReply = await worker.fetch(new Request(`http://localhost/comment-messages/${replyBody.id}`, {
+      const outsiderDelete = await worker.fetch(new Request(`http://localhost/comment-messages/${createdThread.messageId}`, {
         method: 'DELETE',
         headers: {
-          Authorization: `Bearer ${memberBToken}`,
+          Authorization: `Bearer ${outsiderToken}`,
           'X-Toss-Viewer': viewerToken,
         },
       }), env);
-      expect(deleteOwnReply.status).toBe(204);
+      expect(outsiderDelete.status).toBe(403);
+
+      const adminDeleteReply = await worker.fetch(new Request(`http://localhost/comment-messages/${replyBody.id}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${OWNER}`,
+          'X-Toss-Viewer': viewerToken,
+        },
+      }), env);
+      expect(adminDeleteReply.status).toBe(204);
+
+      const memberViewAfterAdminDelete = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
+        headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${memberAToken}` },
+      }), env);
+      expect(memberViewAfterAdminDelete.status).toBe(200);
+      const memberViewAfterAdminDeleteBody = await memberViewAfterAdminDelete.json() as {
+        threads: Array<{
+          id: string;
+          messages: Array<{
+            id: string;
+            deleted_at: number | null;
+            deleted_notice?: string;
+            can_delete: boolean;
+          }>;
+        }>;
+      };
+      const threadWithAdminDeletedReply = memberViewAfterAdminDeleteBody.threads.find((thread) => thread.id === createdThread.id);
+      expect(threadWithAdminDeletedReply?.messages.some((message) => message.id === replyBody.id && message.deleted_at != null && message.deleted_notice === 'Deleted by admin')).toBe(true);
+
+      const deleteRootComment = await worker.fetch(new Request(`http://localhost/comment-messages/${createdThread.messageId}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${memberAToken}`,
+          'X-Toss-Viewer': viewerToken,
+        },
+      }), env);
+      expect(deleteRootComment.status).toBe(204);
 
       const threadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
         headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${memberAToken}` },
@@ -835,15 +896,12 @@ describe('Worker Routes', () => {
       };
       expect(threadData.pagePath).toBe('index.html');
       expect(threadData.viewer).toEqual({ authenticated: true, label: 'member-a' });
-      expect(threadData.threads).toHaveLength(2);
-      expect(threadData.activityThreads).toHaveLength(2);
+      expect(threadData.threads).toHaveLength(1);
+      expect(threadData.activityThreads).toHaveLength(1);
       expect(threadData.threads.every((thread) => thread.page_path === 'index.html')).toBe(true);
-      expect(threadData.threads.some((thread) => thread.scope_type === 'element' && thread.anchor?.selector === '#hero')).toBe(true);
       expect(threadData.threads.some((thread) => thread.scope_type === 'selection' && thread.anchor?.selectedText === 'Faster builds for every branch')).toBe(true);
-      const reopenedThread = threadData.threads.find((thread) => thread.id === createdThread.id);
-      expect(reopenedThread?.status).toBe('open');
-      expect(reopenedThread?.messages.some((message) => message.deleted_at !== null)).toBe(true);
-      expect(reopenedThread?.messages.some((message) => message.body === 'Agree, and maybe tighten line height.' && message.can_edit)).toBe(false);
+      expect(threadData.threads.some((thread) => thread.id === createdThread.id)).toBe(false);
+      expect(threadData.activityThreads.some((thread) => thread.id === createdThread.id)).toBe(false);
 
       const memberBThreadList = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html&includeActivity=1`, {
         headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${memberBToken}` },
@@ -855,17 +913,13 @@ describe('Worker Routes', () => {
           messages: Array<{ body: string; can_edit: boolean; deleted_at?: number | null }>;
         }>;
       };
-      const memberBViewOfReopenedThread = memberBThreadData.threads.find((thread) => thread.id === createdThread.id);
-      expect(memberBViewOfReopenedThread?.messages.some((message) => message.deleted_at != null)).toBe(true);
-
-      const deleteThread = await worker.fetch(new Request(`http://localhost/comment-threads/${createdThread.id}`, {
-        method: 'DELETE',
-        headers: {
-          Authorization: `Bearer ${memberAToken}`,
-          'X-Toss-Viewer': viewerToken,
-        },
-      }), env);
-      expect(deleteThread.status).toBe(204);
+      expect(memberBThreadData.threads.some((thread) => thread.id === createdThread.id)).toBe(false);
+      expect(statefulDb.commentThreads.find((thread) => thread.id === createdThread.id)?.deleted_at).not.toBeNull();
+      expect(
+        statefulDb.commentMessages
+          .filter((message) => message.thread_id === createdThread.id)
+          .every((message) => message.deleted_at != null)
+      ).toBe(true);
 
       const anonymousCreate = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
         method: 'POST',

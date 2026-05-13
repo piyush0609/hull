@@ -873,7 +873,7 @@ function injectCommentsUI(html: string, config: {
         const replyMeta = messageIndex > 0 ? '<div class="toss-comments-replying-to">Replying to ' + esc(replyTarget) + '</div>' : '';
         box.innerHTML = '<div class="toss-comments-message-meta"><span>' + esc(message.author_label) + '</span><span>' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span></div>' +
           replyMeta +
-          '<div>' + esc(message.deleted_at ? 'Message deleted' : message.body) + '</div>';
+          '<div>' + esc(message.deleted_at ? (message.deleted_notice || 'Message deleted') : message.body) + '</div>';
         if (!message.deleted_at && (message.can_edit || message.can_delete)) {
           const actions = document.createElement('div');
           actions.className = 'toss-comments-actions';
@@ -908,9 +908,6 @@ function injectCommentsUI(html: string, config: {
       }
       if (thread.can_resolve && thread.status === 'resolved') {
         actions.innerHTML += '<button type="button" data-action="reopen-thread" data-thread-id="' + thread.id + '">Reopen</button>';
-      }
-      if (thread.can_delete) {
-        actions.innerHTML += '<button type="button" class="warn" data-action="delete-thread" data-thread-id="' + thread.id + '">Delete Thread</button>';
       }
       article.appendChild(actions);
       if (state.replyThreadId === thread.id) {
@@ -973,6 +970,8 @@ function injectCommentsUI(html: string, config: {
         }
       }
       state.activityThreads = nextActivityThreads;
+      const visibleThreadIds = new Set(nextActivityThreads.map((thread) => thread.id));
+      state.activityFeed = state.activityFeed.filter((item) => visibleThreadIds.has(item.threadId));
       if (!silent && state.token) {
         setStatus(state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.');
       } else if (!silent) {
@@ -1347,15 +1346,6 @@ function injectCommentsUI(html: string, config: {
           resolved_at: null,
           updated_at: data.updatedAt || thread.updated_at,
         }));
-      } else if (action === 'delete-thread') {
-        if (!window.confirm('Delete this thread?')) return;
-        if (state.activeThreadId === target.dataset.threadId) {
-          state.activeThreadId = '';
-          clearFocusHighlight();
-        }
-        removeThread(target.dataset.threadId);
-        render();
-        await api('/comment-threads/' + target.dataset.threadId, { method: 'DELETE' }, true);
       } else if (action === 'edit-message') {
         const nextBody = window.prompt('Edit comment', target.dataset.body || '');
         if (!nextBody) return;
@@ -1385,13 +1375,33 @@ function injectCommentsUI(html: string, config: {
         if (!window.confirm('Delete this comment?')) return;
         const threadNode = target.closest('[data-thread-id]');
         const threadId = threadNode ? threadNode.dataset.threadId : '';
-        updateThread(threadId, (thread) => ({
-          ...thread,
-          messages: (thread.messages || []).map((message) =>
-            message.id === target.dataset.messageId
-              ? { ...message, deleted_at: Math.floor(Date.now() / 1000), body: '' }
-              : message),
-        }));
+        const thread = state.threads.find((item) => item.id === threadId);
+        const rootMessage = thread && Array.isArray(thread.messages) ? thread.messages[0] : null;
+        const isRootMessage = !!rootMessage && rootMessage.id === target.dataset.messageId;
+        if (isRootMessage) {
+          if (state.activeThreadId === threadId) {
+            state.activeThreadId = '';
+            clearFocusHighlight();
+          }
+          removeThread(threadId);
+          state.activityFeed = state.activityFeed.filter((item) => item.threadId !== threadId);
+        } else {
+          const now = Math.floor(Date.now() / 1000);
+          updateThread(threadId, (currentThread) => ({
+            ...currentThread,
+            messages: (currentThread.messages || []).map((message) =>
+              message.id === target.dataset.messageId
+                ? {
+                  ...message,
+                  deleted_at: now,
+                  body: '',
+                  deleted_notice: state.currentLabel === 'admin' && message.author_label !== state.currentLabel
+                    ? 'Deleted by admin'
+                    : 'Message deleted',
+                }
+                : message),
+          }));
+        }
         render();
         await api('/comment-messages/' + target.dataset.messageId, { method: 'DELETE' }, true);
       }
@@ -1760,7 +1770,7 @@ export default {
           'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC'
         ).bind(artifactId, pagePath).all();
         const messageQuery = await env.TOSS_DB.prepare(
-          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, m.deleted_by_token_hash, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
         ).bind(artifactId, pagePath).all();
         let activityThreadQuery: { results?: unknown[] } | null = null;
         let activityMessageQuery: { results?: unknown[] } | null = null;
@@ -1769,9 +1779,11 @@ export default {
             'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
           ).bind(artifactId).all();
           activityMessageQuery = await env.TOSS_DB.prepare(
-            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, m.deleted_by_token_hash, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
           ).bind(artifactId).all();
         }
+
+        const ownerHash = await sha256(env.OWNER_TOKEN);
 
         const hydrateThreads = (
           threadRows: Array<Record<string, unknown>>,
@@ -1788,10 +1800,18 @@ export default {
           const byThread = new Map<string, Array<Record<string, unknown>>>();
           for (const row of messageRows) {
             const items = byThread.get(String(row.thread_id)) || [];
+            const deletedByTokenHash = row.deleted_by_token_hash == null ? '' : String(row.deleted_by_token_hash);
+            const deletedByAdmin =
+              !!row.deleted_at &&
+              !!deletedByTokenHash &&
+              !constantTimeEqual(String(row.author_token_hash), deletedByTokenHash) &&
+              constantTimeEqual(deletedByTokenHash, ownerHash);
             items.push({
               ...row,
               can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
               can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
+              deleted_by_admin: deletedByAdmin,
+              deleted_notice: row.deleted_at ? (deletedByAdmin ? 'Deleted by admin' : 'Message deleted') : null,
             });
             byThread.set(String(row.thread_id), items);
           }
@@ -1801,7 +1821,10 @@ export default {
             delete thread.anchor_json;
             delete thread.created_by_token_hash;
           }
-          return threads;
+          return threads.filter((thread) => {
+            const rootMessage = Array.isArray(thread.messages) ? thread.messages[0] : null;
+            return !!rootMessage && !rootMessage.deleted_at;
+          });
         };
 
         const threads = hydrateThreads(
@@ -1971,27 +1994,7 @@ export default {
 
       const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
       if (threadDeleteMatch && request.method === 'DELETE') {
-        if (env.MULTI_TENANT !== 'true') return new Response('Not found', { status: 404 });
-        const threadId = threadDeleteMatch[1];
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
-
-        const threadRow = await env.TOSS_DB.prepare(
-          'SELECT artifact_id, created_by_token_hash, deleted_at FROM comment_threads WHERE id = ?'
-        ).bind(threadId).first<{ artifact_id: string; created_by_token_hash: string; deleted_at: number | null }>();
-        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
-
-        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
-        if (access instanceof Response) return access;
-        if (!auth.isAdmin && !constantTimeEqual(threadRow.created_by_token_hash, auth.tokenHash)) {
-          return new Response('Forbidden', { status: 403 });
-        }
-
-        const now = Math.floor(Date.now() / 1000);
-        await env.TOSS_DB.prepare(
-          'UPDATE comment_threads SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?'
-        ).bind(now, auth.tokenHash, now, threadId).run();
-        return new Response(null, { status: 204 });
+        return new Response('Not found', { status: 404 });
       }
 
       const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
@@ -2002,8 +2005,8 @@ export default {
         if (auth instanceof Response) return auth;
 
         const row = await env.TOSS_DB.prepare(
-          'SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
-        ).bind(messageId).first<{ thread_id: string; author_token_hash: string; deleted_at: number | null; artifact_id: string; thread_status: string }>();
+          'SELECT m.thread_id, m.author_token_hash, m.deleted_at, m.created_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
+        ).bind(messageId).first<{ thread_id: string; author_token_hash: string; deleted_at: number | null; created_at: number; artifact_id: string; thread_status: string }>();
         if (!row || row.deleted_at) return new Response('Not found', { status: 404 });
 
         const access = await requireCommentAccess(request, env, row.artifact_id);
@@ -2022,6 +2025,20 @@ export default {
             .run();
           await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, row.thread_id).run();
           return jsonResponse({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
+        }
+
+        const rootRow = await env.TOSS_DB.prepare(
+          'SELECT id FROM comment_messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT 1'
+        ).bind(row.thread_id).first<{ id: string }>();
+        const isRootMessage = !!rootRow && rootRow.id === messageId;
+        if (isRootMessage) {
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE thread_id = ? AND deleted_at IS NULL'
+          ).bind(now, auth.tokenHash, now, row.thread_id).run();
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_threads SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?'
+          ).bind(now, auth.tokenHash, now, row.thread_id).run();
+          return new Response(null, { status: 204 });
         }
 
         await env.TOSS_DB.prepare('UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?')
