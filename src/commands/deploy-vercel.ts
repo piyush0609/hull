@@ -63,9 +63,13 @@ async function projectHasVercelEnv(cwd: string, name: string): Promise<boolean> 
   }
 }
 
+// Pull the PRODUCTION env — toss always deploys with `--prod`, so the live
+// secrets and the production Neon branch URL live there. The development env can
+// hold different secrets or a suspended/stale Neon branch (cause of failed
+// migrations and accidental secret rotation).
 async function pullVercelEnvFile(cwd: string): Promise<string | null> {
   try {
-    await vercelExec('vercel env pull --yes --non-interactive', cwd);
+    await vercelExec('vercel env pull .env.local --environment=production --yes --non-interactive', cwd);
     return await readFile(join(cwd, '.env.local'), 'utf-8');
   } catch {
     return null;
@@ -78,6 +82,37 @@ function readEnvVar(envContent: string, name: string): string | null {
   if (quoted) return quoted[1];
   const plain = envContent.match(new RegExp(`^${escaped}=(.+)$`, 'm'));
   return plain ? plain[1].trim() : null;
+}
+
+// Reuse a secret already provisioned on the project so redeploys stay stable;
+// only mint a new one on first deploy when the project env has none.
+export function resolveSecret(
+  existingEnv: string | null,
+  name: string,
+  generate: () => string
+): { value: string; generated: boolean } {
+  const existing = existingEnv ? readEnvVar(existingEnv, name) : null;
+  if (existing) return { value: existing, generated: false };
+  return { value: generate(), generated: true };
+}
+
+// Retry an async operation a few times. Neon serverless compute auto-suspends
+// when idle and the first query after a cold start can fail with "fetch failed";
+// a couple of retries let the first attempt wake the compute for the next.
+export async function retryAsync<T>(
+  fn: () => Promise<T>,
+  opts: { attempts: number; delayMs: number }
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < opts.attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < opts.attempts - 1) await new Promise((r) => setTimeout(r, opts.delayMs));
+    }
+  }
+  throw lastErr;
 }
 
 function extractDatabaseUrl(envContent: string): string | null {
@@ -179,11 +214,11 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Load profile
-  let profileConfig = null;
-  if (profileName) {
-    profileConfig = await loadConfig(profileName);
-  }
+  // Load the resolved config: the named profile, or the active/default profile
+  // when none is named. Loading unconditionally means a previously saved
+  // subdomain is honored even without an explicit --profile — otherwise a
+  // redeploy resolves to a different project name and creates a new app.
+  const profileConfig = await loadConfig(profileName);
 
   // Interactive deployment mode
   let multiTenant = options.multiTenant;
@@ -225,8 +260,6 @@ export async function deployVercelCommand(options: {
 
   const projectName = subdomain === 'toss' ? 'toss' : `toss-${subdomain}`;
   const deployDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'vercel', projectName);
-  const ownerToken = generateToken();
-  const jwtSecret = generateToken();
 
   // Prepare project files
   console.log('Preparing project files...');
@@ -266,10 +299,16 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Set environment variables
+  // Set environment variables. Reuse secrets already on the project so redeploys
+  // keep existing signed links and the multi-tenant admin identity stable;
+  // only mint new ones on first deploy.
   console.log('Setting secrets...');
-  await setVercelEnv(deployDir, 'JWT_SECRET', jwtSecret);
-  await setVercelEnv(deployDir, 'OWNER_TOKEN', ownerToken);
+  const existingEnv = await pullVercelEnvFile(deployDir);
+  const jwt = resolveSecret(existingEnv, 'JWT_SECRET', generateToken);
+  const owner = resolveSecret(existingEnv, 'OWNER_TOKEN', generateToken);
+  const ownerToken = owner.value;
+  if (jwt.generated) await setVercelEnv(deployDir, 'JWT_SECRET', jwt.value);
+  if (owner.generated) await setVercelEnv(deployDir, 'OWNER_TOKEN', owner.value);
   if (multiTenant) {
     await setVercelEnv(deployDir, 'MULTI_TENANT', 'true');
   }
@@ -436,10 +475,15 @@ export async function deployVercelCommand(options: {
     console.log('Running database migrations...');
     try {
       await execAsync('npm install --no-package-lock --silent', { cwd: deployDir });
-      await execAsync('node migrate.js', {
-        cwd: deployDir,
-        env: { ...process.env, DATABASE_URL: databaseUrl },
-      });
+      // Migrations are idempotent, so retrying is safe; the first attempt wakes
+      // a cold (auto-suspended) Neon compute so a later attempt connects.
+      await retryAsync(
+        () => execAsync('node migrate.js', {
+          cwd: deployDir,
+          env: { ...process.env, DATABASE_URL: databaseUrl },
+        }),
+        { attempts: 4, delayMs: 2500 }
+      );
     } catch (err: any) {
       console.error('Migration failed:', err.stderr || err.message);
       console.log('  You may need to apply migrations manually.');
