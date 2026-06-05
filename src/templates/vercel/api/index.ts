@@ -336,10 +336,14 @@ async function requireLiveArtifact(artifactId: string): Promise<true | Response>
   return true;
 }
 
-// Comment-API contract: caller must hold a valid viewer JWT scoped to the
-// artifact AND the artifact must still be live (not revoked, not expired).
-// Returns the first failing Response, or true.
+// Comment-API contract: the artifact must have comments enabled (per-share
+// opt-in) AND still be live (not revoked/expired) AND the caller must hold a
+// valid viewer JWT scoped to it. Returns the first failing Response, or true.
 async function requireCommentAccess(request: Request, artifactId: string): Promise<true | Response> {
+  // Per-share opt-in; a null row also covers a missing/revoked artifact.
+  const sql = getSQL();
+  const rows = await sql`SELECT comments_enabled FROM artifacts WHERE id = ${artifactId}`;
+  if (!rows[0] || !rows[0].comments_enabled) return new Response('Not found', { status: 404 });
   const viewer = await requireViewerForArtifact(request, artifactId);
   if (viewer !== true) return viewer;
   return requireLiveArtifact(artifactId);
@@ -496,7 +500,10 @@ async function serveArtifact(
     if (!response.ok) return new Response('Not found', { status: 404 });
     const html = await response.text();
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
-    if (!MULTI_TENANT) {
+    // Comments are a per-share opt-in (comments_enabled), independent of MULTI_TENANT.
+    const sql = getSQL();
+    const commentsRows = await sql`SELECT comments_enabled FROM artifacts WHERE id = ${meta.id}`;
+    if (!commentsRows[0] || !commentsRows[0].comments_enabled) {
       headers['Cache-Control'] = 'private, no-store, max-age=0';
       return new Response(html, { status: 200, headers });
     }
@@ -627,11 +634,13 @@ export default async function handler(request: Request): Promise<Response> {
 
       const passwordParam = url.searchParams.get('password');
       const passwordHash = passwordParam ? await sha256(passwordParam + id) : null;
+      const commentsParam = url.searchParams.get('comments');
+      const commentsEnabled = commentsParam === '1' || commentsParam === 'true' ? 1 : 0;
 
       await blobPut(`artifacts/${id}/files/index.html`, html, 'text/html');
 
       const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
-      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash})`;
+      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash}, ${commentsEnabled})`;
 
       // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
       // time-bound distinction so the verifier can normalize correctly.
@@ -725,9 +734,37 @@ export default async function handler(request: Request): Promise<Response> {
       return authJson({ revoked: id });
     }
 
+    // ===== TOGGLE comments (per-share opt-in) =====
+    const commentsToggleMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comments$/);
+    if (commentsToggleMatch && request.method === 'PATCH') {
+      const auth = await requireUser(request);
+      if (auth instanceof Response) return auth;
+      const id = commentsToggleMatch[1];
+      const sql = getSQL();
+
+      // Owner/admin only — same ownership rule as DELETE.
+      if (MULTI_TENANT && !auth.isAdmin) {
+        const rows = await sql`SELECT token_hash FROM artifacts WHERE id = ${id}`;
+        if (!rows[0] || !constantTimeEqual(rows[0].token_hash, auth.tokenHash)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+      }
+
+      let enabled: unknown;
+      try {
+        enabled = ((await request.json()) as { enabled?: unknown }).enabled;
+      } catch {
+        return new Response('Invalid payload', { status: 400 });
+      }
+      if (typeof enabled !== 'boolean') {
+        return new Response('enabled (boolean) is required', { status: 400 });
+      }
+      await sql`UPDATE artifacts SET comments_enabled = ${enabled ? 1 : 0} WHERE id = ${id}`;
+      return authJson({ id, comments_enabled: enabled });
+    }
+
     const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
     if (commentListMatch && request.method === 'GET') {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
       const access = await requireCommentAccess(request, artifactId);
       if (access instanceof Response) return access;
@@ -776,7 +813,6 @@ export default async function handler(request: Request): Promise<Response> {
     }
 
     if (commentListMatch && request.method === 'POST') {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const artifactId = commentListMatch[1];
       const access = await requireCommentAccess(request, artifactId);
       if (access instanceof Response) return access;
@@ -827,7 +863,6 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
     if (threadMessageMatch && request.method === 'POST') {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadMessageMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -865,7 +900,6 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadResolveMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/(resolve|reopen)$/);
     if (threadResolveMatch && request.method === 'POST') {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadResolveMatch[1];
       const action = threadResolveMatch[2];
       const auth = await requireUser(request);
@@ -894,7 +928,6 @@ export default async function handler(request: Request): Promise<Response> {
 
     const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
     if (threadDeleteMatch && request.method === 'DELETE') {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const threadId = threadDeleteMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
@@ -915,7 +948,6 @@ export default async function handler(request: Request): Promise<Response> {
 
     const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
     if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
-      if (!MULTI_TENANT) return new Response('Not found', { status: 404 });
       const messageId = messageMatch[1];
       const auth = await requireUser(request);
       if (auth instanceof Response) return auth;
