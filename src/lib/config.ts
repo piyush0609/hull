@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod, access, rename } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod, access, rename, rm } from 'fs/promises';
 import { join } from 'path';
 
 function getTossDir(): string {
@@ -28,7 +28,19 @@ export interface TossConfig {
   vercelTeamId?: string;
 }
 
-interface ProfilesData {
+// Unified on-disk store: a single config.json holds every profile (including
+// `default`) plus the active marker. Legacy installs — a flat config.json for the
+// default profile + a separate profiles.json for named profiles — are read
+// transparently and folded into this shape; the next write persists the unified
+// file and removes the legacy profiles.json. Migration is therefore automatic and
+// non-breaking. (Forward-only: an older toss cannot read the unified format.)
+interface ConfigStore {
+  active?: string;
+  profiles: Record<string, TossConfig>;
+}
+
+// Legacy profiles.json shape (when config.json was a flat TossConfig).
+interface LegacyProfilesData {
   active?: string;
   profiles: Record<string, TossConfig>;
 }
@@ -69,20 +81,6 @@ async function writeJsonAtomically(path: string, data: unknown): Promise<void> {
   await chmod(path, 0o600);
 }
 
-async function readProfiles(): Promise<ProfilesData | null> {
-  try {
-    return await readJsonWithRetry<ProfilesData>(profilesFile());
-  } catch {
-    return null;
-  }
-}
-
-async function writeProfiles(data: ProfilesData): Promise<void> {
-  const dir = getTossDir();
-  await mkdir(dir, { recursive: true });
-  await writeJsonAtomically(profilesFile(), data);
-}
-
 function normalizeConfig(raw: TossConfig | null | undefined): TossConfig | null {
   if (!raw) return null;
   const token = raw.token || raw.ownerToken || '';
@@ -101,126 +99,102 @@ function serializeConfig(config: TossConfig): TossConfig {
   return rest;
 }
 
-export async function loadConfig(profile?: string): Promise<TossConfig | null> {
-  // If a specific profile is requested, load it directly
-  if (profile) {
-    if (profile === 'default') {
-      try {
-        return normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
-      } catch {
-        return null;
-      }
+// A flat TossConfig (the legacy default config.json), as opposed to a unified store.
+function isLegacyFlatConfig(obj: any): boolean {
+  return !!obj && typeof obj === 'object' && !('profiles' in obj)
+    && ('endpoint' in obj || 'subdomain' in obj || 'token' in obj || 'ownerToken' in obj);
+}
+
+// Read the unified store, transparently merging any legacy two-file layout.
+// Pure read — never writes; the migration is persisted on the next write (writeStore).
+async function readStore(): Promise<ConfigStore> {
+  const cfgRaw = await readJsonWithRetry<any>(configFile());
+  const legacy = await readJsonWithRetry<LegacyProfilesData>(profilesFile());
+
+  const profiles: Record<string, TossConfig> = {};
+  let active: string | undefined;
+  const unified = !!cfgRaw && typeof cfgRaw === 'object'
+    && !!cfgRaw.profiles && typeof cfgRaw.profiles === 'object';
+
+  if (unified) {
+    Object.assign(profiles, cfgRaw.profiles);
+    active = cfgRaw.active;
+  } else if (isLegacyFlatConfig(cfgRaw)) {
+    profiles.default = cfgRaw as TossConfig;
+    active = 'default';
+  }
+
+  // Fold in legacy named profiles without overwriting unified entries.
+  if (legacy && legacy.profiles && typeof legacy.profiles === 'object') {
+    for (const [name, config] of Object.entries(legacy.profiles)) {
+      if (!(name in profiles)) profiles[name] = config;
     }
-    const profiles = await readProfiles();
-    return normalizeConfig(profiles?.profiles[profile] ?? null);
+    // The legacy active marker wins only before migration (no unified file yet).
+    if (legacy.active && !unified) active = legacy.active;
   }
 
-  // Otherwise, check if there's an active profile
-  const profiles = await readProfiles();
-  if (profiles?.active && profiles.active !== 'default') {
-    return normalizeConfig(profiles.profiles[profiles.active] ?? null);
-  }
+  if (!active && profiles.default) active = 'default';
+  return { active, profiles };
+}
 
-  // Fall back to default config
-  try {
-    return normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
-  } catch {
-    return null;
+async function writeStore(store: ConfigStore): Promise<void> {
+  await mkdir(getTossDir(), { recursive: true });
+  await writeJsonAtomically(configFile(), store);
+  // Unified config.json is now the single source of truth — drop the legacy file.
+  if (await fileExists(profilesFile())) {
+    try { await rm(profilesFile(), { force: true }); } catch {}
   }
+}
+
+export async function loadConfig(profile?: string): Promise<TossConfig | null> {
+  const store = await readStore();
+  const name = profile || store.active || 'default';
+  return normalizeConfig(store.profiles[name] ?? null);
 }
 
 export async function getActiveProfile(): Promise<string | undefined> {
-  const profiles = await readProfiles();
-  if (profiles?.active) return profiles.active;
-  const defaultExists = await fileExists(configFile());
-  return defaultExists ? 'default' : undefined;
+  const store = await readStore();
+  if (store.active && store.profiles[store.active]) return store.active;
+  if (store.profiles.default) return 'default';
+  return undefined;
 }
 
 export async function saveConfig(config: TossConfig, profile?: string): Promise<void> {
-  const serializable = serializeConfig(config);
-
-  // If explicit profile given, save directly
-  if (profile && profile !== 'default') {
-    const profiles = (await readProfiles()) || { profiles: {} };
-    profiles.profiles[profile] = serializable;
-    await writeProfiles(profiles);
-    return;
-  }
-
-  // If no profile specified, follow same logic as loadConfig:
-  // save to active profile, or fall back to config.json
-  if (!profile) {
-    const profiles = await readProfiles();
-    if (profiles?.active && profiles.active !== 'default') {
-      profiles.profiles[profiles.active] = serializable;
-      await writeProfiles(profiles);
-      return;
-    }
-  }
-
-  // Save to default config.json
-  const dir = getTossDir();
-  await mkdir(dir, { recursive: true });
-  await writeJsonAtomically(configFile(), serializable);
+  const store = await readStore();
+  const name = profile || store.active || 'default';
+  store.profiles[name] = serializeConfig(config);
+  if (!store.active) store.active = name;
+  await writeStore(store);
 }
 
 export async function listProfiles(): Promise<{ active?: string; profiles: Record<string, TossConfig> }> {
-  const defaultExists = await fileExists(configFile());
-  const profilesData = await readProfiles();
-
-  const allProfiles: Record<string, TossConfig> = {};
-  if (defaultExists) {
-    try {
-      allProfiles.default = normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()))!;
-    } catch {}
+  const store = await readStore();
+  const profiles: Record<string, TossConfig> = {};
+  for (const [name, config] of Object.entries(store.profiles)) {
+    const normalized = normalizeConfig(config);
+    if (normalized) profiles[name] = normalized;
   }
-  if (profilesData) {
-    for (const [name, config] of Object.entries(profilesData.profiles)) {
-      const normalized = normalizeConfig(config);
-      if (normalized) allProfiles[name] = normalized;
-    }
-  }
-
   return {
-    active: profilesData?.active || (defaultExists ? 'default' : undefined),
-    profiles: allProfiles,
+    active: store.active || (profiles.default ? 'default' : undefined),
+    profiles,
   };
 }
 
 export async function switchProfile(name: string): Promise<boolean> {
-  if (name === 'default') {
-    const exists = await fileExists(configFile());
-    if (!exists) return false;
-    const profiles = await readProfiles();
-    if (profiles) {
-      profiles.active = 'default';
-      await writeProfiles(profiles);
-    } else {
-      // No profiles file yet — create one just to track active = default
-      await writeProfiles({ active: 'default', profiles: {} });
-    }
-    return true;
-  }
-
-  const profiles = await readProfiles();
-  if (!profiles || !profiles.profiles[name]) return false;
-  profiles.active = name;
-  await writeProfiles(profiles);
+  const store = await readStore();
+  if (!store.profiles[name]) return false;
+  store.active = name;
+  await writeStore(store);
   return true;
 }
 
 export async function deleteProfile(name: string): Promise<boolean> {
-  if (name === 'default') {
-    // Can't delete default via this API
-    return false;
-  }
-  const profiles = await readProfiles();
-  if (!profiles || !profiles.profiles[name]) return false;
-  delete profiles.profiles[name];
-  if (profiles.active === name) {
-    profiles.active = 'default';
-  }
-  await writeProfiles(profiles);
+  if (name === 'default') return false; // default profile is not deletable
+  const store = await readStore();
+  if (!store.profiles[name]) return false;
+  delete store.profiles[name];
+  if (store.active === name) store.active = 'default';
+  await writeStore(store);
   return true;
 }
 
@@ -228,48 +202,27 @@ export async function renameProfile(oldName: string, newName: string): Promise<b
   if (oldName === 'default' || newName === 'default') return false;
   if (oldName === newName) return true;
 
-  const profiles = await readProfiles();
-  if (!profiles || !profiles.profiles[oldName]) return false;
-  if (profiles.profiles[newName]) return false; // target exists
+  const store = await readStore();
+  if (!store.profiles[oldName]) return false;
+  if (store.profiles[newName]) return false; // target exists
 
-  profiles.profiles[newName] = profiles.profiles[oldName];
-  delete profiles.profiles[oldName];
-
-  if (profiles.active === oldName) {
-    profiles.active = newName;
-  }
-  await writeProfiles(profiles);
+  store.profiles[newName] = store.profiles[oldName];
+  delete store.profiles[oldName];
+  if (store.active === oldName) store.active = newName;
+  await writeStore(store);
   return true;
 }
 
 export async function copyProfile(from: string, to: string): Promise<boolean> {
   if (from === to) return true;
 
-  const profiles = await readProfiles();
-  let sourceConfig: TossConfig | null = null;
+  const store = await readStore();
+  const source = store.profiles[from];
+  if (!source) return false;
+  const normalized = normalizeConfig(source);
+  if (!normalized) return false;
 
-  if (from === 'default') {
-    try {
-      sourceConfig = normalizeConfig(await readJsonWithRetry<TossConfig>(configFile()));
-    } catch {
-      return false;
-    }
-  } else {
-    if (!profiles || !profiles.profiles[from]) return false;
-    sourceConfig = normalizeConfig(profiles.profiles[from]);
-  }
-
-  if (!sourceConfig) return false;
-
-  if (to === 'default') {
-    const dir = getTossDir();
-    await mkdir(dir, { recursive: true });
-    await writeFile(configFile(), JSON.stringify(serializeConfig(sourceConfig), null, 2));
-    await chmod(configFile(), 0o600);
-  } else {
-    const p = profiles || { profiles: {} };
-    p.profiles[to] = serializeConfig(sourceConfig);
-    await writeProfiles(p);
-  }
+  store.profiles[to] = serializeConfig(normalized);
+  await writeStore(store);
   return true;
 }

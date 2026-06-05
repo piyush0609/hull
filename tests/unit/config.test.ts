@@ -8,6 +8,7 @@ import {
   getActiveProfile,
   renameProfile,
   copyProfile,
+  switchProfile,
   type TossConfig,
 } from '../../src/lib/config.js';
 
@@ -337,5 +338,69 @@ describe('copyProfile', () => {
 
   it('should succeed for same name', async () => {
     expect(await copyProfile('same', 'same')).toBe(true);
+  });
+});
+
+describe('unified config store + migration', () => {
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'toss-test-'));
+    process.env.HOME = tempDir;
+  });
+
+  afterEach(async () => {
+    process.env.HOME = originalHomedir;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('stores all profiles (including default) in a single config.json, no profiles.json', async () => {
+    await saveConfig({ endpoint: 'https://d', token: 'td', subdomain: 'd' }, 'default');
+    await saveConfig({ endpoint: 'https://w', token: 'tw', subdomain: 'w' }, 'work');
+
+    const entries = await readdir(join(tempDir, '.toss'));
+    expect(entries).toContain('config.json');
+    expect(entries).not.toContain('profiles.json');
+
+    const raw = JSON.parse(await readFile(configFile(), 'utf-8'));
+    expect(Object.keys(raw.profiles).sort()).toEqual(['default', 'work']);
+  });
+
+  it('reads a legacy two-file layout (pure read does not migrate or delete files)', async () => {
+    await writeDefaultConfig({ endpoint: 'https://prod', token: 'tok-default', subdomain: 'team' });
+    await writeProfiles('work', { work: { endpoint: 'https://work', token: 'tok-work', subdomain: 'work' } });
+
+    expect((await loadConfig('default'))?.token).toBe('tok-default');
+    expect((await loadConfig('work'))?.token).toBe('tok-work');
+    expect(await getActiveProfile()).toBe('work');
+
+    const entries = await readdir(join(tempDir, '.toss'));
+    expect(entries).toContain('profiles.json');
+  });
+
+  it('migrates a legacy config.json + profiles.json into one unified config.json on first write', async () => {
+    await writeDefaultConfig({ endpoint: 'https://prod', token: 'tok-default', subdomain: 'team' });
+    await writeProfiles('work', { work: { endpoint: 'https://work', token: 'tok-work', subdomain: 'work' } });
+
+    await switchProfile('default'); // any write triggers migration
+
+    const entries = await readdir(join(tempDir, '.toss'));
+    expect(entries).not.toContain('profiles.json');
+
+    const raw = JSON.parse(await readFile(configFile(), 'utf-8'));
+    expect(Object.keys(raw.profiles).sort()).toEqual(['default', 'work']);
+    expect(raw.active).toBe('default');
+
+    expect((await loadConfig('default'))?.token).toBe('tok-default');
+    expect((await loadConfig('work'))?.token).toBe('tok-work');
+  });
+
+  it('switchProfile works uniformly for default and named profiles', async () => {
+    await saveConfig({ endpoint: 'https://d', token: 'td', subdomain: 'd' }, 'default');
+    await saveConfig({ endpoint: 'https://w', token: 'tw', subdomain: 'w' }, 'work');
+
+    expect(await switchProfile('work')).toBe(true);
+    expect(await getActiveProfile()).toBe('work');
+    expect(await switchProfile('default')).toBe(true);
+    expect(await getActiveProfile()).toBe('default');
+    expect(await switchProfile('missing')).toBe(false);
   });
 });
