@@ -347,6 +347,16 @@ class StatefulMockD1 {
       return (artifact ? { expires_at: artifact.expires_at } : null) as T | null;
     }
 
+    if (query.includes('SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ?')) {
+      const a = this.artifacts.find((x) => x.id === String(values[0]));
+      return (a ? { comments_enabled: a.comments_enabled, expires_at: a.expires_at, password_epoch: 0 } : null) as T | null;
+    }
+
+    if (query.includes('SELECT comments_enabled, password_epoch FROM artifacts WHERE id = ?')) {
+      const a = this.artifacts.find((x) => x.id === String(values[0]));
+      return (a ? { comments_enabled: a.comments_enabled, password_epoch: 0 } : null) as T | null;
+    }
+
     if (query.includes('SELECT comments_enabled FROM artifacts WHERE id = ?')) {
       const id = String(values[0]);
       const artifact = this.artifacts.find((a) => a.id === id);
@@ -661,7 +671,7 @@ describe('Worker Routes', () => {
 
       const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
       const now = Math.floor(Date.now() / 1000);
-      const viewerToken = await signJWT({ sub: artifact.id, iat: now, exp: now + 3600 }, SECRET);
+      const viewerToken = await signJWT({ sub: artifact.id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 }, SECRET);
       const commentsResponse = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
         headers: { 'X-Toss-Viewer': viewerToken, Authorization: `Bearer ${OWNER}` },
       }), env);
@@ -696,7 +706,7 @@ describe('Worker Routes', () => {
       const artifact = await create.json() as { id: string };
       const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
       const now = Math.floor(Date.now() / 1000);
-      const viewerToken = await signJWT({ sub: artifact.id, iat: now, exp: now + 3600 }, SECRET);
+      const viewerToken = await signJWT({ sub: artifact.id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 }, SECRET);
 
       const elementThread = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
         method: 'POST',
@@ -921,7 +931,7 @@ describe('Worker Routes', () => {
       const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
       const now = Math.floor(Date.now() / 1000);
       const viewerToken = await signJWT(
-        { sub: artifact.id, iat: now, exp: now + 3600 },
+        { sub: artifact.id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 },
         SECRET,
       );
 
@@ -988,7 +998,7 @@ describe('Worker Routes', () => {
       const artifact = await create.json() as { id: string };
       const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
       const now = Math.floor(Date.now() / 1000);
-      const viewerToken = await signJWT({ sub: artifact.id, iat: now, exp: now + 3600 }, SECRET);
+      const viewerToken = await signJWT({ sub: artifact.id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 }, SECRET);
 
       const createIndexThread = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads`, {
         method: 'POST',
@@ -1069,7 +1079,7 @@ describe('Worker Routes', () => {
     async function viewerFor(id: string) {
       const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
       const now = Math.floor(Date.now() / 1000);
-      return signJWT({ sub: id, iat: now, exp: now + 3600 }, SECRET);
+      return signJWT({ sub: id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 }, SECRET);
     }
 
     it('comments are OFF by default even in multi-tenant mode (no UI, routes 404)', async () => {
@@ -1132,6 +1142,22 @@ describe('Worker Routes', () => {
         body: JSON.stringify({ enabled: true }),
       }), env);
       expect(noAuth.status).toBe(401);
+    });
+
+    it('rejects a plain viewer token on comment routes (distinct grant required)', async () => {
+      const { env } = await makeAdminEnv();
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=x.html&comments=1', {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: '<html><body>hi</body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string };
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      // A plain viewer token (no aud:"comment") must NOT work on comment routes.
+      const plainViewer = await signJWT({ sub: artifact.id, exp: now + 3600, iat: now }, SECRET);
+      const res = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': plainViewer },
+      }), env);
+      expect(res.status).toBe(403);
     });
   });
 });

@@ -44,6 +44,16 @@ async function issueArtifactJWT(artifactId: string, expiresAt: number, secret: s
   return signJWT(payload, secret);
 }
 
+// A comment grant authorizes commenting on one artifact. Distinct aud:"comment"
+// (so a plain viewer/legacy token can't be replayed on comment routes) and it
+// carries pwd_epoch, so a password change invalidates outstanding grants.
+async function issueCommentGrant(artifactId: string, expiresAt: number, secret: string, epoch: number): Promise<string> {
+  const now = nowSeconds();
+  const cap = now + 24 * 3600; // grants live at most 24h, never past artifact expiry
+  const exp = expiresAt === PERMANENT ? cap : Math.min(cap, expiresAt);
+  return signJWT({ sub: artifactId, aud: 'comment', pwd_epoch: epoch, iat: now, exp }, secret);
+}
+
 // Parse a previously-issued artifact JWT payload. Returns the normalized
 // expires_at (PERMANENT for permanent tokens, the original exp otherwise), or
 // null if the time-bound token has expired. Caller has already verified the
@@ -206,44 +216,37 @@ function htmlEscape(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-async function requireViewerForArtifact(request: Request, artifactId: string, env: Env): Promise<true | Response> {
-  const token = request.headers.get('X-Toss-Viewer');
-  if (!token) return new Response('Missing viewer token', { status: 401 });
+// Comment-API contract: the artifact must have comments enabled (per-share
+// opt-in) AND still be live (not revoked/expired) AND the caller must present
+// either a valid comment grant (a distinct aud:"comment" token issued at serve
+// time — the plain viewer/legacy token has no aud and is rejected here) OR the
+// owner token (Bearer) for programmatic/cloud access. Returns true | Response.
+async function requireCommentAccess(request: Request, env: Env, artifactId: string): Promise<true | Response> {
+  const row = await env.TOSS_DB.prepare('SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ?')
+    .bind(artifactId)
+    .first<{ comments_enabled: number; expires_at: number; password_epoch: number | null }>();
+  // A null row also covers a missing/revoked artifact.
+  if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
+  if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
 
+  // Owner token is a first-class reader/writer (programmatic/cloud access).
+  const user = await resolveUser(request, env);
+  if (user?.isAdmin) return true;
+
+  // Otherwise require the comment grant. The distinct aud breaks the conflation
+  // with the plain viewer token; pwd_epoch ties it to the current password.
+  const token = request.headers.get('X-Toss-Viewer');
+  if (!token) return new Response('Missing comment grant', { status: 401 });
   try {
     const payload = await verifyJWT(token, env.JWT_SECRET);
+    if (payload.aud !== 'comment') return new Response('Forbidden', { status: 403 });
     if (payload.sub !== artifactId) return new Response('Forbidden', { status: 403 });
-    // readArtifactJWT handles both permanent (no exp check) and time-bound tokens uniformly.
-    if (!readArtifactJWT(payload)) return new Response('Link expired', { status: 410 });
+    if (typeof payload.exp !== 'number' || payload.exp < nowSeconds()) return new Response('Grant expired', { status: 401 });
+    if ((Number(payload.pwd_epoch) || 0) !== (Number(row.password_epoch) || 0)) return new Response('Grant expired', { status: 401 });
     return true;
   } catch {
-    return new Response('Invalid viewer token', { status: 401 });
+    return new Response('Invalid comment grant', { status: 401 });
   }
-}
-
-// A viewer JWT can outlive the artifact (revoke leaves a still-valid token).
-// Every comment route runs this after the viewer check so a leaked URL can't
-// keep reading/posting against a deleted or expired artifact.
-async function requireLiveArtifact(env: Env, artifactId: string): Promise<true | Response> {
-  const row = await env.TOSS_DB.prepare('SELECT expires_at FROM artifacts WHERE id = ?')
-    .bind(artifactId)
-    .first<{ expires_at: number }>();
-  if (!row) return new Response('Not found', { status: 404 });
-  if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
-  return true;
-}
-
-// Comment-API contract: the artifact must have comments enabled (per-share
-// opt-in) AND still be live (not revoked/expired) AND the caller must hold a
-// valid viewer JWT scoped to it. Returns the first failing Response, or true.
-async function requireCommentAccess(request: Request, env: Env, artifactId: string): Promise<true | Response> {
-  // Per-share opt-in; a null row also covers a missing/revoked artifact.
-  const row = await env.TOSS_DB.prepare('SELECT comments_enabled FROM artifacts WHERE id = ?')
-    .bind(artifactId).first<{ comments_enabled: number }>();
-  if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
-  const viewer = await requireViewerForArtifact(request, artifactId, env);
-  if (viewer !== true) return viewer;
-  return requireLiveArtifact(env, artifactId);
 }
 
 type CommentScope = 'artifact' | 'element' | 'selection';
@@ -1494,13 +1497,13 @@ async function serveArtifact(
     const html = typeof obj === 'string' ? obj : new TextDecoder().decode(obj);
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
     // Comments are a per-share opt-in (comments_enabled), independent of MULTI_TENANT.
-    const commentsRow = await env.TOSS_DB.prepare('SELECT comments_enabled FROM artifacts WHERE id = ?')
-      .bind(meta.id).first<{ comments_enabled: number }>();
+    const commentsRow = await env.TOSS_DB.prepare('SELECT comments_enabled, password_epoch FROM artifacts WHERE id = ?')
+      .bind(meta.id).first<{ comments_enabled: number; password_epoch: number | null }>();
     if (!commentsRow || !commentsRow.comments_enabled) {
       headers['Cache-Control'] = 'private, no-store, max-age=0';
       return new Response(html, { status: 200, headers });
     }
-    const viewerToken = await issueArtifactJWT(meta.id, meta.expires_at, env.JWT_SECRET);
+    const viewerToken = await issueCommentGrant(meta.id, meta.expires_at, env.JWT_SECRET, Number(commentsRow.password_epoch) || 0);
     const maxAge = artifactCookieMaxAge(meta.expires_at);
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
     headers['Cache-Control'] = 'private, no-store, max-age=0';
