@@ -30,9 +30,22 @@ export async function verifyJWT(token: string, secret: string): Promise<Record<s
 
   let payload: string;
   let sigData: string;
+  let header: string;
   try {
+    header = b64urlDecode(h);
     payload = b64urlDecode(b);
     sigData = b64urlDecode(s);
+  } catch {
+    throw new Error('Invalid token format');
+  }
+
+  // Pin the algorithm: we only ever issue HS256. Asserting it here rejects any
+  // token whose header claims a different alg (e.g. "none"), so the verifier can
+  // never be tricked into skipping the HMAC check.
+  try {
+    if ((JSON.parse(header) as { alg?: string }).alg !== 'HS256') {
+      throw new Error('Unexpected token algorithm');
+    }
   } catch {
     throw new Error('Invalid token format');
   }
