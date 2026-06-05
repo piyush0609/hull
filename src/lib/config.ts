@@ -18,6 +18,7 @@ export interface TossConfig {
   endpoint: string;
   token?: string;
   ownerToken?: string;
+  jwtSecret?: string;
   subdomain: string;
   role?: 'owner' | 'member';
   backend?: 'cloudflare' | 'vercel';
