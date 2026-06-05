@@ -45,6 +45,7 @@ class StatefulMockD1 {
     expires_at: number;
     token_hash: string;
     password_hash: string | null;
+    comments_enabled: number;
   }> = [];
   commentThreads: Array<{
     id: string;
@@ -100,6 +101,7 @@ class StatefulMockD1 {
         expires_at: Number(values[5]),
         token_hash: String(values[6]),
         password_hash: values[7] == null ? null : String(values[7]),
+        comments_enabled: values[8] == null ? 0 : Number(values[8]),
       });
       return { success: true };
     }
@@ -143,6 +145,12 @@ class StatefulMockD1 {
     if (query.includes('DELETE FROM artifacts WHERE id = ?')) {
       const id = String(values[0]);
       this.artifacts = this.artifacts.filter((a) => a.id !== id);
+      return { success: true };
+    }
+
+    if (query.includes('UPDATE artifacts SET comments_enabled = ? WHERE id = ?')) {
+      const artifact = this.artifacts.find((a) => a.id === String(values[1]));
+      if (artifact) artifact.comments_enabled = Number(values[0]);
       return { success: true };
     }
 
@@ -337,6 +345,12 @@ class StatefulMockD1 {
       const id = String(values[0]);
       const artifact = this.artifacts.find((a) => a.id === id);
       return (artifact ? { expires_at: artifact.expires_at } : null) as T | null;
+    }
+
+    if (query.includes('SELECT comments_enabled FROM artifacts WHERE id = ?')) {
+      const id = String(values[0]);
+      const artifact = this.artifacts.find((a) => a.id === id);
+      return (artifact ? { comments_enabled: artifact.comments_enabled } : null) as T | null;
     }
 
     if (query.includes('SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?')) {
@@ -674,7 +688,7 @@ describe('Worker Routes', () => {
         MULTI_TENANT: 'true',
       };
 
-      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=review.html', {
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=review.html&comments=1', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OWNER}` },
         body: '<html><body><main><h1 id="hero">Launch faster</h1><p>Faster builds for every branch with preview URLs.</p></main></body></html>',
@@ -897,7 +911,7 @@ describe('Worker Routes', () => {
       };
 
       // Create an artifact and post a thread on it.
-      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site.html', {
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site.html&comments=1', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OWNER}` },
         body: '<html><body><h1>Live</h1></body></html>',
@@ -966,7 +980,7 @@ describe('Worker Routes', () => {
         MULTI_TENANT: 'true',
       };
 
-      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site/index.html', {
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=site/index.html&comments=1', {
         method: 'POST',
         headers: { Authorization: `Bearer ${OWNER}` },
         body: '<html><body><h1>Overview</h1></body></html>',
@@ -1040,6 +1054,84 @@ describe('Worker Routes', () => {
       expect(featureData.threads).toHaveLength(1);
       expect(featureData.threads[0].page_path).toBe('features.html');
       expect(featureData.threads[0].messages[0].body).toBe('Features page comment');
+    });
+  });
+
+  describe('Comments opt-in (Story 1)', () => {
+    async function makeAdminEnv() {
+      const statefulDb = new StatefulMockD1();
+      statefulDb.users.push({ token_hash: await sha256(OWNER), label: 'admin', created_at: 1, is_admin: 1 });
+      const localKv = new MockKV();
+      const env = { ...createEnv(localKv, statefulDb as unknown as MockD1), MULTI_TENANT: 'true' };
+      return { statefulDb, env };
+    }
+
+    async function viewerFor(id: string) {
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      return signJWT({ sub: id, iat: now, exp: now + 3600 }, SECRET);
+    }
+
+    it('comments are OFF by default even in multi-tenant mode (no UI, routes 404)', async () => {
+      const { env } = await makeAdminEnv();
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=x.html', {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: '<html><body>hi</body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string; slug: string };
+
+      const page = await worker.fetch(new Request(`http://localhost/s/${artifact.slug}/`), env);
+      expect(await page.text()).not.toContain('toss-comments-root');
+
+      const viewer = await viewerFor(artifact.id);
+      const list = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': viewer, Authorization: `Bearer ${OWNER}` },
+      }), env);
+      expect(list.status).toBe(404);
+    });
+
+    it('comments are ON when shared with ?comments=1 (UI injected, routes live)', async () => {
+      const { env } = await makeAdminEnv();
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=x.html&comments=1', {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: '<html><body>hi</body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string; slug: string };
+
+      const page = await worker.fetch(new Request(`http://localhost/s/${artifact.slug}/`), env);
+      expect(await page.text()).toContain('toss-comments-root');
+
+      const viewer = await viewerFor(artifact.id);
+      const list = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': viewer, Authorization: `Bearer ${OWNER}` },
+      }), env);
+      expect(list.status).toBe(200);
+    });
+
+    it('PATCH /artifacts/:id/comments toggles comments on and off; requires owner', async () => {
+      const { env } = await makeAdminEnv();
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=x.html', {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: '<html><body>hi</body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string; slug: string };
+
+      const on = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comments`, {
+        method: 'PATCH', headers: { Authorization: `Bearer ${OWNER}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      }), env);
+      expect(on.status).toBe(200);
+      expect(await (await worker.fetch(new Request(`http://localhost/s/${artifact.slug}/`), env)).text()).toContain('toss-comments-root');
+
+      const off = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comments`, {
+        method: 'PATCH', headers: { Authorization: `Bearer ${OWNER}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      }), env);
+      expect(off.status).toBe(200);
+      expect(await (await worker.fetch(new Request(`http://localhost/s/${artifact.slug}/`), env)).text()).not.toContain('toss-comments-root');
+
+      const noAuth = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comments`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      }), env);
+      expect(noAuth.status).toBe(401);
     });
   });
 });
