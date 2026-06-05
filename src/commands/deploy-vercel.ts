@@ -2,11 +2,12 @@ import { mkdir, writeFile, rm, readdir, copyFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
-import { saveConfig, loadConfig, listProfiles, switchProfile } from '../lib/config.js';
+import { saveConfig, loadConfig, listProfiles } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
+import { resolveSecret } from '../lib/deploy-secrets.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -41,17 +42,43 @@ async function vercelExec(cmd: string, cwd?: string): Promise<string> {
   return stdout + '\n' + (stderr || '');
 }
 
+// Build argv for `vercel env add`. Pure + exported for testing.
+//
+// Vercel CLI 52+ defaults Production/Preview variables to *sensitive*, which
+// makes them unreadable by `vercel env pull` — that broke secret reuse
+// (resolveSecret) and, with the previous stdin approach, silently stored empty
+// values (and dropped MULTI_TENANT). The flags fix each failure mode:
+//   --value         pass the value as a discrete argv element (no shell
+//                   parsing, no injection, no trailing-newline corruption)
+//   --no-sensitive  keep the var readable so a later deploy can reuse it
+//   --force         overwrite an existing var in place (no separate `env rm`)
+//   --yes           skip the add-confirmation prompt
+//   --non-interactive  never prompt (e.g. the --force overwrite confirmation);
+//                   without it `env add` blocks on stdin forever under spawn
+export function buildVercelEnvAddArgs(name: string, env: string, value: string): string[] {
+  return ['env', 'add', name, env, '--value', value, '--no-sensitive', '--force', '--yes', '--non-interactive'];
+}
+
 async function setVercelEnv(cwd: string, name: string, value: string): Promise<void> {
-  const environments = ['production', 'development'];
-  for (const env of environments) {
-    // Remove existing env var first to avoid "already exists" errors
-    try {
-      await execAsync(`vercel env rm ${name} ${env} --yes --non-interactive`, { cwd });
-    } catch {
-      // Ignore if it doesn't exist
-    }
-    await execAsync(`printf "%s\\n" "${value.replace(/"/g, '\\"')}" | vercel env add ${name} ${env} --non-interactive`, { cwd });
-  }
+  // Only Production is consumed by `vercel deploy --prod`; Development is for
+  // `vercel dev` (which toss never runs), so we write Production only. spawn (no
+  // shell) passes the value as a discrete arg — safe for secrets and Postgres
+  // URLs with shell metacharacters — and stdin is closed ('ignore') so vercel can
+  // never block waiting on a prompt.
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn('vercel', buildVercelEnvAddArgs(name, 'production', value), {
+      cwd,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr?.on('data', (d) => { stderr += d; });
+    proc.on('error', reject);
+    proc.on('exit', (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`vercel env add ${name} exited with code ${code}: ${stderr.trim()}`))
+    );
+  });
 }
 
 async function projectHasVercelEnv(cwd: string, name: string): Promise<boolean> {
@@ -82,18 +109,6 @@ function readEnvVar(envContent: string, name: string): string | null {
   if (quoted) return quoted[1];
   const plain = envContent.match(new RegExp(`^${escaped}=(.+)$`, 'm'));
   return plain ? plain[1].trim() : null;
-}
-
-// Reuse a secret already provisioned on the project so redeploys stay stable;
-// only mint a new one on first deploy when the project env has none.
-export function resolveSecret(
-  existingEnv: string | null,
-  name: string,
-  generate: () => string
-): { value: string; generated: boolean } {
-  const existing = existingEnv ? readEnvVar(existingEnv, name) : null;
-  if (existing) return { value: existing, generated: false };
-  return { value: generate(), generated: true };
 }
 
 // Retry an async operation a few times. Neon serverless compute auto-suspends
@@ -299,16 +314,18 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Set environment variables. Reuse secrets already on the project so redeploys
-  // keep existing signed links and the multi-tenant admin identity stable;
-  // only mint new ones on first deploy.
+  // Secrets persist on the Vercel project across deploys, so a redeploy must not
+  // re-mint them (rotating JWT_SECRET invalidates every signed link). Decide by
+  // existence (by name) — never by reading the value back, since sensitive vars
+  // read empty. Local config is the source of truth + migration backup.
   console.log('Setting secrets...');
-  const existingEnv = await pullVercelEnvFile(deployDir);
-  const jwt = resolveSecret(existingEnv, 'JWT_SECRET', generateToken);
-  const owner = resolveSecret(existingEnv, 'OWNER_TOKEN', generateToken);
-  const ownerToken = owner.value;
-  if (jwt.generated) await setVercelEnv(deployDir, 'JWT_SECRET', jwt.value);
-  if (owner.generated) await setVercelEnv(deployDir, 'OWNER_TOKEN', owner.value);
+  const jwtExists = await projectHasVercelEnv(deployDir, 'JWT_SECRET');
+  const ownerExists = await projectHasVercelEnv(deployDir, 'OWNER_TOKEN');
+  const jwt = resolveSecret(profileConfig?.jwtSecret, jwtExists, generateToken);
+  const owner = resolveSecret(profileConfig?.token, ownerExists, generateToken, { mustHaveValue: true });
+  const ownerToken = owner.value as string;
+  if (jwt.write && jwt.value) await setVercelEnv(deployDir, 'JWT_SECRET', jwt.value);
+  if (owner.write && owner.value) await setVercelEnv(deployDir, 'OWNER_TOKEN', owner.value);
   if (multiTenant) {
     await setVercelEnv(deployDir, 'MULTI_TENANT', 'true');
   }
@@ -496,6 +513,7 @@ export async function deployVercelCommand(options: {
     {
       endpoint,
       token: ownerToken,
+      jwtSecret: jwt.known ? jwt.value : profileConfig?.jwtSecret,
       subdomain,
       role: 'owner',
       backend: 'vercel',
@@ -504,10 +522,9 @@ export async function deployVercelCommand(options: {
     profileName
   );
 
-  if (profileName) {
-    await switchProfile(profileName);
-  }
-
+  // Note: we intentionally do NOT switch the active profile here. Deploying a
+  // profile shouldn't hijack what bare `toss …` commands target — switch
+  // explicitly with `toss profile switch` when you mean to.
   console.log('\n✅ Your toss project is deployed.');
   console.log(`   Project:  ${projectName}`);
   console.log(`   URL:      ${projectUrl}`);

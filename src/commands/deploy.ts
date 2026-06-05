@@ -5,8 +5,9 @@ import { dirname } from 'path';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
-import { saveConfig, loadConfig, listProfiles, switchProfile } from '../lib/config.js';
+import { saveConfig, loadConfig, listProfiles } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
+import { resolveSecret } from '../lib/deploy-secrets.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -113,6 +114,17 @@ async function setSecret(cwd: string, name: string, value: string): Promise<void
   });
 }
 
+// Existence-by-name check (worker secrets are write-only — never readable). Used
+// to avoid re-minting a secret that already exists on the worker across deploys.
+async function cloudflareSecretExists(cwd: string, name: string, env?: NodeJS.ProcessEnv): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync('wrangler secret list', { cwd, env });
+    return String(stdout).includes(`"${name}"`);
+  } catch {
+    return false;
+  }
+}
+
 export async function deployCommand(options: { domain?: string; multiTenant?: boolean; profile?: string; subdomain?: string }) {
   console.log('Setting up your toss on Cloudflare...\n');
 
@@ -169,11 +181,9 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
     console.log();
   }
 
-  // Load profile if specified
-  let profileConfig = null;
-  if (profileName) {
-    profileConfig = await loadConfig(profileName);
-  }
+  // Load unconditionally so a saved subdomain/secrets are honored even without an
+  // explicit --profile (otherwise a redeploy can't reuse them and would rotate).
+  const profileConfig = await loadConfig(profileName);
 
   // Build wrangler environment: support API token per profile
   let apiToken = profileConfig?.apiToken || process.env.CLOUDFLARE_API_TOKEN || '';
@@ -251,8 +261,6 @@ export async function deployCommand(options: { domain?: string; multiTenant?: bo
   const dbName = subdomain && subdomain !== 'toss' ? `toss-db-${subdomain}` : 'toss-db';
   const kvTitle = subdomain && subdomain !== 'toss' ? `toss-kv-${subdomain}` : 'toss-kv';
   const workerDir = join(process.env.HOME || process.env.USERPROFILE || '.', '.toss', 'worker');
-  const ownerToken = generateToken();
-  const jwtSecret = generateToken();
 
   const wranglerEnvBase: NodeJS.ProcessEnv = { ...process.env };
   if (accountId) wranglerEnvBase.CLOUDFLARE_ACCOUNT_ID = accountId;
@@ -339,10 +347,21 @@ database_id = "${databaseId}"
     ? `https://${customDomain}`
     : `https://${workerName}.${workersDevSubdomain}.workers.dev`;
 
+  // Worker secrets persist across deploys, so reuse them — re-minting JWT_SECRET
+  // would invalidate every signed link. Decide by existence (secret list shows
+  // names only, never values); local config is the source of truth + backup.
   console.log('Setting secrets...');
+  let ownerToken = '';
+  let jwtForConfig: string | undefined = profileConfig?.jwtSecret || undefined;
   try {
-    await setSecret(workerDir, 'OWNER_TOKEN', ownerToken);
-    await setSecret(workerDir, 'JWT_SECRET', jwtSecret);
+    const ownerExists = await cloudflareSecretExists(workerDir, 'OWNER_TOKEN', wranglerEnvBase);
+    const jwtExists = await cloudflareSecretExists(workerDir, 'JWT_SECRET', wranglerEnvBase);
+    const owner = resolveSecret(profileConfig?.token, ownerExists, generateToken, { mustHaveValue: true });
+    const jwt = resolveSecret(profileConfig?.jwtSecret, jwtExists, generateToken);
+    ownerToken = owner.value as string;
+    if (jwt.known) jwtForConfig = jwt.value;
+    if (owner.write && owner.value) await setSecret(workerDir, 'OWNER_TOKEN', owner.value);
+    if (jwt.write && jwt.value) await setSecret(workerDir, 'JWT_SECRET', jwt.value);
   } catch (err: any) {
     console.error('Failed to set secrets:', err.message);
     process.exit(1);
@@ -360,6 +379,7 @@ database_id = "${databaseId}"
     {
       endpoint: workerUrl,
       token: ownerToken,
+      jwtSecret: jwtForConfig,
       subdomain,
       role: 'owner',
       backend: 'cloudflare',
@@ -370,11 +390,9 @@ database_id = "${databaseId}"
     profileName
   );
 
-  // Auto-switch to the deployed profile
-  if (profileName) {
-    await switchProfile(profileName);
-  }
-
+  // Note: we intentionally do NOT switch the active profile here. Deploying a
+  // profile shouldn't hijack what bare `toss …` commands target — switch
+  // explicitly with `toss profile switch` when you mean to.
   console.log('\n✅ Your toss is ready.');
   console.log(`   Endpoint: ${workerUrl}`);
   if (multiTenant) {
