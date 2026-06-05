@@ -300,6 +300,23 @@ function normalizeMessageInput(body: unknown): string | Response {
   return message;
 }
 
+// The commenter's display name — a self-entered claim (not verified), stored
+// immutably as author_label and HTML-escaped on render. Identity needs no toss
+// token or password; the grant already proved page access.
+function normalizeName(body: unknown): string | Response {
+  const raw = body && typeof body === 'object' && typeof (body as { name?: unknown }).name === 'string'
+    ? (body as { name: string }).name.trim()
+    : '';
+  if (!raw) return new Response('Name is required', { status: 400 });
+  if (raw.length > 80) return new Response('Name is too long', { status: 400 });
+  return raw;
+}
+
+// Legacy token columns are NOT NULL but identity is now author_label; write a
+// sentinel so old (token-based) rows and new (name-based) rows coexist with no
+// schema change.
+const NO_TOKEN = '';
+
 function injectCommentsUI(html: string, config: {
   artifactId: string;
   viewerToken: string;
@@ -1798,7 +1815,6 @@ export default {
         if (pagePath instanceof Response) return pagePath;
         const includeActivity = url.searchParams.get('includeActivity') === '1';
 
-        const auth = await resolveUser(request, env);
         const threadQuery = await env.TOSS_DB.prepare(
           'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC'
         ).bind(artifactId, pagePath).all();
@@ -1820,22 +1836,25 @@ export default {
           threadRows: Array<Record<string, unknown>>,
           messageRows: Array<Record<string, unknown>>
         ) => {
+          // Access is already proven (grant or owner); anyone may edit/delete/resolve.
           const threads = threadRows.map((thread) => ({
             ...thread,
             anchor: thread.anchor_json ? JSON.parse(String(thread.anchor_json)) : null,
-            can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
-            can_resolve: !!auth,
+            can_delete: true,
+            can_resolve: true,
             messages: [],
           })) as Array<Record<string, unknown>>;
 
           const byThread = new Map<string, Array<Record<string, unknown>>>();
           for (const row of messageRows) {
             const items = byThread.get(String(row.thread_id)) || [];
-            items.push({
+            const out: Record<string, unknown> = {
               ...row,
-              can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
-              can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
-            });
+              can_edit: !row.deleted_at && row.thread_status !== 'resolved',
+              can_delete: !row.deleted_at,
+            };
+            delete out.author_token_hash; // never expose the legacy author token hash
+            items.push(out);
             byThread.set(String(row.thread_id), items);
           }
 
@@ -1860,7 +1879,7 @@ export default {
 
         return jsonResponse({
           pagePath,
-          viewer: { authenticated: !!auth, label: auth?.label || null },
+          viewer: { authenticated: true, label: null },
           threads,
           activityThreads,
         });
@@ -1871,10 +1890,10 @@ export default {
         const access = await requireCommentAccess(request, env, artifactId);
         if (access instanceof Response) return access;
 
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
-
-        const normalized = normalizeThreadInput(await request.json().catch(() => null));
+        const body = await request.json().catch(() => null);
+        const name = normalizeName(body);
+        if (name instanceof Response) return name;
+        const normalized = normalizeThreadInput(body);
         if (normalized instanceof Response) return normalized;
 
         const now = Math.floor(Date.now() / 1000);
@@ -1887,8 +1906,8 @@ export default {
           threadId,
           artifactId,
           normalized.pagePath,
-          auth.tokenHash,
-          auth.label,
+          NO_TOKEN,
+          name,
           normalized.scopeType,
           normalized.anchorJson,
           'open',
@@ -1898,7 +1917,7 @@ export default {
 
         await env.TOSS_DB.prepare(
           'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).bind(messageId, threadId, auth.tokenHash, auth.label, normalized.body, now, now).run();
+        ).bind(messageId, threadId, NO_TOKEN, name, normalized.body, now, now).run();
 
         return jsonResponse({
           id: threadId,
@@ -1907,7 +1926,7 @@ export default {
             id: threadId,
             artifact_id: artifactId,
             page_path: normalized.pagePath,
-            created_by_label: auth.label,
+            created_by_label: name,
             scope_type: normalized.scopeType,
             anchor: normalized.anchorJson ? JSON.parse(normalized.anchorJson) : null,
             status: 'open',
@@ -1921,7 +1940,7 @@ export default {
             messages: [{
               id: messageId,
               thread_id: threadId,
-              author_label: auth.label,
+              author_label: name,
               body: normalized.body,
               created_at: now,
               updated_at: now,
@@ -1936,8 +1955,6 @@ export default {
       const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
       if (threadMessageMatch && request.method === 'POST') {
         const threadId = threadMessageMatch[1];
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
 
         const threadRow = await env.TOSS_DB.prepare(
           'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
@@ -1947,14 +1964,17 @@ export default {
         const access = await requireCommentAccess(request, env, threadRow.artifact_id);
         if (access instanceof Response) return access;
 
-        const message = normalizeMessageInput(await request.json().catch(() => null));
+        const body = await request.json().catch(() => null);
+        const name = normalizeName(body);
+        if (name instanceof Response) return name;
+        const message = normalizeMessageInput(body);
         if (message instanceof Response) return message;
 
         const now = Math.floor(Date.now() / 1000);
         const messageId = generateId();
         await env.TOSS_DB.prepare(
           'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).bind(messageId, threadId, auth.tokenHash, auth.label, message, now, now).run();
+        ).bind(messageId, threadId, NO_TOKEN, name, message, now, now).run();
         await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, threadId).run();
 
         return jsonResponse({
@@ -1964,7 +1984,7 @@ export default {
           message: {
             id: messageId,
             thread_id: threadId,
-            author_label: auth.label,
+            author_label: name,
             body: message,
             created_at: now,
             updated_at: now,
@@ -1979,8 +1999,41 @@ export default {
       if (threadResolveMatch && request.method === 'POST') {
         const threadId = threadResolveMatch[1];
         const action = threadResolveMatch[2];
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
+
+        const threadRow = await env.TOSS_DB.prepare(
+          'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
+        ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
+        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
+
+        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
+        if (access instanceof Response) return access;
+
+        const rb = await request.json().catch(() => null);
+        const resolverName = rb && typeof rb === 'object' && typeof (rb as { name?: unknown }).name === 'string'
+          ? (rb as { name: string }).name.trim().slice(0, 80) : '';
+
+        const now = Math.floor(Date.now() / 1000);
+        if (action === 'resolve') {
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = ?, resolved_by_label = ?, resolved_at = ?, updated_at = ? WHERE id = ?'
+          ).bind('resolved', NO_TOKEN, resolverName, now, now, threadId).run();
+        } else {
+          await env.TOSS_DB.prepare(
+            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ? WHERE id = ?'
+          ).bind('open', now, threadId).run();
+        }
+        return jsonResponse({
+          id: threadId,
+          status: action === 'resolve' ? 'resolved' : 'open',
+          resolvedByLabel: action === 'resolve' ? (resolverName || null) : null,
+          resolvedAt: action === 'resolve' ? now : null,
+          updatedAt: now,
+        });
+      }
+
+      const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
+      if (threadDeleteMatch && request.method === 'DELETE') {
+        const threadId = threadDeleteMatch[1];
 
         const threadRow = await env.TOSS_DB.prepare(
           'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
@@ -1991,53 +2044,15 @@ export default {
         if (access instanceof Response) return access;
 
         const now = Math.floor(Date.now() / 1000);
-        if (action === 'resolve') {
-          await env.TOSS_DB.prepare(
-            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = ?, resolved_by_label = ?, resolved_at = ?, updated_at = ? WHERE id = ?'
-          ).bind('resolved', auth.tokenHash, auth.label, now, now, threadId).run();
-        } else {
-          await env.TOSS_DB.prepare(
-            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ? WHERE id = ?'
-          ).bind('open', now, threadId).run();
-        }
-        return jsonResponse({
-          id: threadId,
-          status: action === 'resolve' ? 'resolved' : 'open',
-          resolvedByLabel: action === 'resolve' ? auth.label : null,
-          resolvedAt: action === 'resolve' ? now : null,
-          updatedAt: now,
-        });
-      }
-
-      const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
-      if (threadDeleteMatch && request.method === 'DELETE') {
-        const threadId = threadDeleteMatch[1];
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
-
-        const threadRow = await env.TOSS_DB.prepare(
-          'SELECT artifact_id, created_by_token_hash, deleted_at FROM comment_threads WHERE id = ?'
-        ).bind(threadId).first<{ artifact_id: string; created_by_token_hash: string; deleted_at: number | null }>();
-        if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
-
-        const access = await requireCommentAccess(request, env, threadRow.artifact_id);
-        if (access instanceof Response) return access;
-        if (!auth.isAdmin && !constantTimeEqual(threadRow.created_by_token_hash, auth.tokenHash)) {
-          return new Response('Forbidden', { status: 403 });
-        }
-
-        const now = Math.floor(Date.now() / 1000);
         await env.TOSS_DB.prepare(
           'UPDATE comment_threads SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?'
-        ).bind(now, auth.tokenHash, now, threadId).run();
+        ).bind(now, NO_TOKEN, now, threadId).run();
         return new Response(null, { status: 204 });
       }
 
       const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
       if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
         const messageId = messageMatch[1];
-        const auth = await requireUser(request, env);
-        if (auth instanceof Response) return auth;
 
         const row = await env.TOSS_DB.prepare(
           'SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
@@ -2046,9 +2061,6 @@ export default {
 
         const access = await requireCommentAccess(request, env, row.artifact_id);
         if (access instanceof Response) return access;
-        if (!auth.isAdmin && !constantTimeEqual(row.author_token_hash, auth.tokenHash)) {
-          return new Response('Forbidden', { status: 403 });
-        }
 
         const now = Math.floor(Date.now() / 1000);
         if (request.method === 'PATCH') {
@@ -2063,7 +2075,7 @@ export default {
         }
 
         await env.TOSS_DB.prepare('UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?')
-          .bind(now, auth.tokenHash, now, messageId)
+          .bind(now, NO_TOKEN, now, messageId)
           .run();
         await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, row.thread_id).run();
         return new Response(null, { status: 204 });

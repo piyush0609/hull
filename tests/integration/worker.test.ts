@@ -716,6 +716,7 @@ describe('Worker Routes', () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          name: 'Reviewer A',
           body: 'Hero heading should feel bolder.',
           pagePath: 'index.html',
           scopeType: 'element',
@@ -744,6 +745,7 @@ describe('Worker Routes', () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          name: 'Reviewer B',
           body: 'This sentence is the key message.',
           pagePath: 'index.html',
           scopeType: 'selection',
@@ -766,7 +768,7 @@ describe('Worker Routes', () => {
           'X-Toss-Viewer': viewerToken,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body: 'Agree, and maybe tighten the line height too.' }),
+        body: JSON.stringify({ name: 'Reviewer B', body: 'Agree, and maybe tighten the line height too.' }),
       }), env);
       expect(reply.status).toBe(201);
       const replyBody = await reply.json() as { id: string; message: { body: string }; threadUpdatedAt: number };
@@ -782,19 +784,20 @@ describe('Worker Routes', () => {
         },
         body: JSON.stringify({ body: 'I should not be able to edit this.' }),
       }), env);
-      expect(outsiderEdit.status).toBe(403);
+      expect(outsiderEdit.status).toBe(200); // anyone with the grant can edit (trust-based)
 
       const ownerResolve = await worker.fetch(new Request(`http://localhost/comment-threads/${createdThread.id}/resolve`, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${OWNER}`,
           'X-Toss-Viewer': viewerToken,
+          'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ name: 'Reviewer C' }),
       }), env);
       expect(ownerResolve.status).toBe(200);
       const ownerResolveBody = await ownerResolve.json() as { status: string; resolvedByLabel: string; updatedAt: number };
       expect(ownerResolveBody.status).toBe('resolved');
-      expect(ownerResolveBody.resolvedByLabel).toBe('admin');
+      expect(ownerResolveBody.resolvedByLabel).toBe('Reviewer C');
       expect(ownerResolveBody.updatedAt).toBeGreaterThan(0);
 
       const editOwnReply = await worker.fetch(new Request(`http://localhost/comment-messages/${replyBody.id}`, {
@@ -858,7 +861,7 @@ describe('Worker Routes', () => {
         }>;
       };
       expect(threadData.pagePath).toBe('index.html');
-      expect(threadData.viewer).toEqual({ authenticated: true, label: 'member-a' });
+      expect(threadData.viewer).toEqual({ authenticated: true, label: null });
       expect(threadData.threads).toHaveLength(2);
       expect(threadData.activityThreads).toHaveLength(2);
       expect(threadData.threads.every((thread) => thread.page_path === 'index.html')).toBe(true);
@@ -897,9 +900,9 @@ describe('Worker Routes', () => {
           'X-Toss-Viewer': viewerToken,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body: 'Anonymous should not work', pagePath: 'index.html', scopeType: 'artifact' }),
+        body: JSON.stringify({ body: 'Missing the name field', pagePath: 'index.html', scopeType: 'artifact' }),
       }), env);
-      expect(anonymousCreate.status).toBe(401);
+      expect(anonymousCreate.status).toBe(400); // grant present but no name → rejected
     });
 
     it('revoking an artifact blocks comment API access and cascades to comment rows', async () => {
@@ -942,7 +945,7 @@ describe('Worker Routes', () => {
           'X-Toss-Viewer': viewerToken,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body: 'first thought', pagePath: 'index.html', scopeType: 'artifact' }),
+        body: JSON.stringify({ name: 'Dana', body: 'first thought', pagePath: 'index.html', scopeType: 'artifact' }),
       }), env);
       expect(threadCreate.status).toBe(201);
       expect(statefulDb.commentThreads.filter((t) => t.artifact_id === artifact.id)).toHaveLength(1);
@@ -1008,6 +1011,7 @@ describe('Worker Routes', () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          name: 'Eve',
           body: 'Index page comment',
           pagePath: 'index.html',
           scopeType: 'artifact',
@@ -1023,6 +1027,7 @@ describe('Worker Routes', () => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
+          name: 'Eve',
           body: 'Features page comment',
           pagePath: 'features.html',
           scopeType: 'artifact',
@@ -1064,6 +1069,49 @@ describe('Worker Routes', () => {
       expect(featureData.threads).toHaveLength(1);
       expect(featureData.threads[0].page_path).toBe('features.html');
       expect(featureData.threads[0].messages[0].body).toBe('Features page comment');
+    });
+
+    it('renders legacy token-based comment rows (backward compatible)', async () => {
+      const statefulDb = new StatefulMockD1();
+      statefulDb.users.push({ token_hash: await sha256(OWNER), label: 'admin', created_at: 1, is_admin: 1 });
+      const env = { ...createEnv(kv, statefulDb as unknown as MockD1), MULTI_TENANT: 'true' };
+
+      const create = await worker.fetch(new Request('http://localhost/artifacts?expires=3600&name=legacy.html&comments=1', {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: '<html><body>hi</body></html>',
+      }), env);
+      const artifact = await create.json() as { id: string };
+
+      // A row exactly as the OLD token model wrote it: real token_hash, no sentinel.
+      const now = Math.floor(Date.now() / 1000);
+      statefulDb.commentThreads.push({
+        id: 'legacy-thread', artifact_id: artifact.id, page_path: 'index.html',
+        created_by_token_hash: 'd'.repeat(64), created_by_label: 'Legacy User',
+        scope_type: 'artifact', anchor_json: null, status: 'open',
+        resolved_by_token_hash: null, resolved_by_label: null, resolved_at: null,
+        deleted_at: null, deleted_by_token_hash: null, created_at: now, updated_at: now,
+      });
+      statefulDb.commentMessages.push({
+        id: 'legacy-msg', thread_id: 'legacy-thread',
+        author_token_hash: 'd'.repeat(64), author_label: 'Legacy User',
+        body: 'Comment from the old token model', created_at: now, updated_at: now,
+        deleted_at: null, deleted_by_token_hash: null,
+      });
+
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const grant = await signJWT({ sub: artifact.id, aud: 'comment', pwd_epoch: 0, iat: now, exp: now + 3600 }, SECRET);
+      const list = await worker.fetch(new Request(`http://localhost/artifacts/${artifact.id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': grant },
+      }), env);
+      expect(list.status).toBe(200);
+      const data = await list.json() as {
+        threads: Array<{ created_by_label: string; messages: Array<{ author_label: string; body: string; can_edit: boolean; author_token_hash?: string }> }>;
+      };
+      const legacy = data.threads.find((t) => t.created_by_label === 'Legacy User');
+      expect(legacy).toBeDefined();
+      expect(legacy?.messages[0].body).toBe('Comment from the old token model');
+      expect(legacy?.messages[0].author_label).toBe('Legacy User');
+      expect(legacy?.messages[0].can_edit).toBe(true); // anyone with the grant
+      expect(legacy?.messages[0].author_token_hash).toBeUndefined(); // not leaked
     });
   });
 
