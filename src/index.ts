@@ -10,6 +10,7 @@ import { tokenCreateCommand, tokenListCommand, tokenRevokeCommand, tokenRotateCo
 import { joinCommand } from './commands/join.js';
 import { profileListCommand, profileSwitchCommand, profileShowCommand, profileDeleteCommand, profileDefaultCommand, profileRenameCommand } from './commands/profile.js';
 import { loadConfig } from './lib/config.js';
+import { getCommandOptions } from './lib/cli-options.js';
 import { whoamiCommand } from './commands/whoami.js';
 import { membersListCommand } from './commands/members.js';
 import { cleanupCommand } from './commands/cleanup.js';
@@ -73,49 +74,6 @@ async function routePublish(file = '.', options: PublishOptions = {}) {
     password: options.password,
     profile: options.profile,
   });
-}
-
-function readRawOption(name: string): string | boolean | undefined {
-  const flagName = name.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`);
-  const longFlag = `--${flagName}`;
-  const argv = process.argv.slice(2);
-
-  for (let i = argv.length - 1; i >= 0; i--) {
-    const arg = argv[i];
-    if (arg === longFlag) {
-      const next = argv[i + 1];
-      if (!next || next.startsWith('-')) return true;
-      return next;
-    }
-    if (arg.startsWith(`${longFlag}=`)) {
-      return arg.slice(longFlag.length + 1);
-    }
-  }
-
-  return undefined;
-}
-
-function getCommandOptions(args: any[], fallbackKeys: string[] = []): Record<string, any> {
-  const maybeCommand = args[args.length - 1];
-  let options: Record<string, any> = {};
-  if (maybeCommand && typeof maybeCommand.opts === 'function') {
-    options = maybeCommand.opts();
-  } else {
-    const maybeOptions = args[args.length - 1];
-    if (maybeOptions && typeof maybeOptions === 'object') {
-      options = maybeOptions;
-    }
-  }
-
-  for (const key of fallbackKeys) {
-    if (options[key] !== undefined) continue;
-    const rawValue = readRawOption(key);
-    if (rawValue !== undefined) {
-      options[key] = rawValue;
-    }
-  }
-
-  return options;
 }
 
 const program = new Command();
@@ -354,7 +312,7 @@ program
   .option('--postgres-url <url>')
   .option('--blob-token <token>')
   .option('-y, --yes')
-  .action(routeDeploy);
+  .action((...args) => routeDeploy(getCommandOptions(args, ['domain', 'multiTenant', 'profile', 'subdomain', 'backend', 'postgresUrl', 'blobToken', 'yes'])));
 
 program
   .command('setup', { hidden: true })
@@ -362,14 +320,14 @@ program
   .option('--subdomain <name>')
   .option('-y, --yes')
   .option('--backend <backend>', 'Target backend: cloudflare or vercel')
-  .action(routeSetup);
+  .action((...args) => routeSetup(getCommandOptions(args, ['profile', 'subdomain', 'yes', 'backend'])));
 
 program
   .command('destroy', { hidden: true })
   .option('--profile <name>')
   .option('--backend <backend>', 'Target backend: cloudflare or vercel')
   .option('-y, --yes')
-  .action(routeDestroy);
+  .action((...args) => routeDestroy(getCommandOptions(args, ['profile', 'backend', 'yes'])));
 
 const legacyToken = program
   .command('token', { hidden: true });
