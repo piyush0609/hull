@@ -180,6 +180,47 @@ toss deploy --backend vercel
 
 Auto-provisions a Vercel project, Neon Postgres database, Vercel Blob store, env vars, and runs migrations.
 
+### First-time vs iterative deploy
+
+A deployment is identified by its **profile** (which records backend + subdomain + endpoint + owner token). There are two distinct commands — do not confuse them:
+
+**First time** (the profile does not exist yet) — you must declare backend, project name, and mode:
+```bash
+toss deploy --backend <cloudflare|vercel> --subdomain <name> [--multi-tenant] --profile <name> --yes
+```
+Creates the project, provisions DB + storage, generates secrets, sets the mode, runs migrations, and saves the profile.
+
+**Iterative re-deploy** (the profile already exists) — push new code / apply new migrations to the same instance:
+```bash
+toss deploy --profile <name> --yes
+```
+Infers backend, subdomain, and mode from the saved profile; **reuses** the existing DB, storage, and secrets (no rotation, no re-provisioning); re-runs migrations. This is the normal day-to-day command — `--profile <name>` alone is enough.
+
+### Migrations run as part of deploy — never by hand
+
+`toss deploy` applies migrations automatically (Vercel: `migrate.js` against the production DB, with cold-start retry; Cloudflare: `wrangler d1 migrations apply`). To change the schema, add a numbered file under `src/templates/<backend>/migrations/` and deploy. Do **not** run migrations directly against the database.
+
+### Safety rules (these prevent real, previously-hit footguns)
+
+1. **Repo-linked CLI → `npm run build` first.** If `toss` is symlinked to a repo's `dist/` (check with `readlink -f "$(command -v toss)"`), it runs the built output, not `src/`; unbuilt changes won't ship.
+2. **Always pass `--profile <name>`.** Bare `toss deploy` or `--profile default` targets the **default profile = production**. `--profile` is honored on `deploy`, `setup`, and `destroy`.
+3. **Deploy a new instance in a clean shell.** If `DATABASE_URL`, `POSTGRES_URL`, or `BLOB_READ_WRITE_TOKEN` are exported, the deploy reuses them — which can point a fresh instance at an existing (e.g. production) database/store. Unset them so provisioning auto-detects the project's own resources.
+4. **Back up config before risky ops:** `cp ~/.toss/config.json ~/.toss/config.json.bak`.
+
+### Isolated test instance (a sandbox that cannot touch production)
+
+Each profile/subdomain is a **separate** project with its **own** DB, storage, and secrets. Use a dedicated profile for development/testing:
+```bash
+# first time
+toss deploy --backend vercel --subdomain test --multi-tenant --profile test --yes
+# iterate (after code changes)
+npm run build && toss deploy --profile test --yes
+# use it — every command MUST carry --profile test, or it hits production
+toss share ./file.html --expires 30d --profile test
+toss list --profile test
+```
+Production (the `default` profile) is untouched as long as every command carries `--profile test`.
+
 ## Share
 
 ```bash
