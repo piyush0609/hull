@@ -87,4 +87,31 @@ describe('TossAPI', () => {
       })
     );
   });
+
+  it('should set ?comments=1 on upload when comments enabled', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+    await api.upload(Buffer.from('<html>x</html>'), 'x.html', 3600, undefined, undefined, true);
+    const calledUrl = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as string;
+    expect(calledUrl).toContain('comments=1');
+  });
+
+  it('should NOT set the comments param by default', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+    await api.upload(Buffer.from('<html>x</html>'), 'x.html', 3600);
+    const calledUrl = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('comments');
+  });
+
+  it('setComments PATCHes the per-share toggle route', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true } as Response);
+    await api.setComments('abc123', true);
+    expect(fetch).toHaveBeenCalledWith(
+      'https://toss-test.workers.dev/artifacts/abc123/comments',
+      expect.objectContaining({
+        method: 'PATCH',
+        headers: expect.objectContaining({ Authorization: `Bearer ${TEST_CONFIG.token}` }),
+        body: JSON.stringify({ enabled: true }),
+      })
+    );
+  });
 });

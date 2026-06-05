@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
+import { commentsCommand } from './commands/comments.js';
 import { doctorCommand } from './commands/doctor.js';
 import { infoCommand } from './commands/info.js';
 import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
@@ -61,6 +62,7 @@ type PublishOptions = {
   json?: boolean;
   password?: string | true;
   profile?: string;
+  comments?: boolean;
 };
 
 async function routePublish(file = '.', options: PublishOptions = {}) {
@@ -73,6 +75,7 @@ async function routePublish(file = '.', options: PublishOptions = {}) {
     json: options.json,
     password: options.password,
     profile: options.profile,
+    comments: options.comments,
   });
 }
 
@@ -90,8 +93,9 @@ program
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
+  .option('--comments', 'Enable comments on this share (off by default)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'profile'])));
+  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'profile'])));
 
 program.addHelpText('after', `
 Quick start:
@@ -119,8 +123,9 @@ program
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
+  .option('--comments', 'Enable comments on this share (off by default)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'profile'])));
+  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'profile'])));
 
 program
   .command('login <endpoint>')
@@ -144,6 +149,12 @@ program
   .description('Revoke access to a published artifact')
   .option('--profile <name>', 'Use a specific profile')
   .action((id, ...args) => revokeCommand(id, getCommandOptions(args, ['profile'])));
+
+program
+  .command('comments <id> <state>')
+  .description('Enable or disable comments on a share (state: on|off)')
+  .option('--profile <name>', 'Use a specific profile')
+  .action((id, state, ...args) => commentsCommand(id, state, getCommandOptions(args, ['profile'])));
 
 program
   .command('info')
