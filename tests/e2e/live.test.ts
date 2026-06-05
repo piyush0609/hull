@@ -14,7 +14,7 @@ async function findOwnerConfigForBackend(backend: string): Promise<TossConfig | 
   if (!realHome) return null;
 
   try {
-    const raw = await readFile(join(realHome, '.toss', 'profiles.json'), 'utf-8');
+    const raw = await readFile(join(realHome, '.toss', 'config.json'), 'utf-8');
     const profiles = JSON.parse(raw) as {
       active?: string;
       profiles?: Record<string, TossConfig>;
@@ -97,7 +97,7 @@ describe.skipIf(!RUN_E2E)('Live E2E', () => {
       stdio: 'pipe',
     });
 
-    const raw = await readFile(join(tempHome, '.toss', 'profiles.json'), 'utf-8');
+    const raw = await readFile(join(tempHome, '.toss', 'config.json'), 'utf-8');
     const profiles = JSON.parse(raw);
     config = profiles.profiles[profile];
     console.log(`Deployed to ${config.endpoint}`);

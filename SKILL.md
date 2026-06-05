@@ -225,8 +225,7 @@ toss profile delete work
 ```
 
 **Storage:**
-- `~/.toss/config.json` — default profile
-- `~/.toss/profiles.json` — named profiles + active marker
+- `~/.toss/config.json` — all profiles (including `default`) + active marker (legacy two-file installs migrate automatically)
 
 **Per-command targeting:** Use `--profile <name>` on any command without switching:
 

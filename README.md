@@ -413,17 +413,23 @@ toss skill install
 
 Toss stores connection details in `~/.toss/`.
 
-- `config.json` stores the default profile
-- `profiles.json` stores named profiles and the active profile marker
+- `config.json` stores all profiles (including `default`) plus the active profile marker
+
+Legacy installs that used a separate `profiles.json` for named profiles are migrated into `config.json` automatically on the next write.
 
 Example config:
 
 ```json
 {
-  "endpoint": "https://share.example.com",
-  "token": "your-upload-token",
-  "subdomain": "team",
-  "role": "member"
+  "active": "default",
+  "profiles": {
+    "default": {
+      "endpoint": "https://share.example.com",
+      "token": "your-upload-token",
+      "subdomain": "team",
+      "role": "member"
+    }
+  }
 }
 ```
 
