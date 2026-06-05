@@ -82,6 +82,16 @@ async function issueArtifactJWT(artifactId: string, expiresAt: number, secret: s
   return signJWT(payload, secret);
 }
 
+// A comment grant authorizes commenting on one artifact. Distinct aud:"comment"
+// (so a plain viewer/legacy token can't be replayed on comment routes) and it
+// carries pwd_epoch, so a password change invalidates outstanding grants.
+async function issueCommentGrant(artifactId: string, expiresAt: number, secret: string, epoch: number): Promise<string> {
+  const now = nowSeconds();
+  const cap = now + 24 * 3600;
+  const exp = expiresAt === PERMANENT ? cap : Math.min(cap, expiresAt);
+  return signJWT({ sub: artifactId, aud: 'comment', pwd_epoch: epoch, iat: now, exp }, secret);
+}
+
 // Parse a previously-issued artifact JWT payload. Returns the normalized
 // expires_at (PERMANENT for permanent tokens, the original exp otherwise), or
 // null if the time-bound token has expired. Caller has already verified the
@@ -337,16 +347,36 @@ async function requireLiveArtifact(artifactId: string): Promise<true | Response>
 }
 
 // Comment-API contract: the artifact must have comments enabled (per-share
-// opt-in) AND still be live (not revoked/expired) AND the caller must hold a
-// valid viewer JWT scoped to it. Returns the first failing Response, or true.
+// opt-in) AND still be live (not revoked/expired) AND the caller must present
+// either a valid comment grant (a distinct aud:"comment" token issued at serve
+// time — the plain viewer/legacy token has no aud and is rejected here) OR the
+// owner token (Bearer) for programmatic/cloud access. Returns true | Response.
 async function requireCommentAccess(request: Request, artifactId: string): Promise<true | Response> {
-  // Per-share opt-in; a null row also covers a missing/revoked artifact.
   const sql = getSQL();
-  const rows = await sql`SELECT comments_enabled FROM artifacts WHERE id = ${artifactId}`;
-  if (!rows[0] || !rows[0].comments_enabled) return new Response('Not found', { status: 404 });
-  const viewer = await requireViewerForArtifact(request, artifactId);
-  if (viewer !== true) return viewer;
-  return requireLiveArtifact(artifactId);
+  const rows = await sql`SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ${artifactId}`;
+  const row = rows[0];
+  // A null row also covers a missing/revoked artifact.
+  if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
+  if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
+
+  // Owner token is a first-class reader/writer (programmatic/cloud access).
+  const user = await resolveUser(request);
+  if (user?.isAdmin) return true;
+
+  // Otherwise require the comment grant; the distinct aud breaks the conflation
+  // with the plain viewer token and pwd_epoch ties it to the current password.
+  const token = request.headers.get('X-Toss-Viewer');
+  if (!token) return new Response('Missing comment grant', { status: 401 });
+  try {
+    const payload = await verifyJWT(token, JWT_SECRET);
+    if (payload.aud !== 'comment') return new Response('Forbidden', { status: 403 });
+    if (payload.sub !== artifactId) return new Response('Forbidden', { status: 403 });
+    if (typeof payload.exp !== 'number' || payload.exp < nowSeconds()) return new Response('Grant expired', { status: 401 });
+    if ((Number(payload.pwd_epoch) || 0) !== (Number(row.password_epoch) || 0)) return new Response('Grant expired', { status: 401 });
+    return true;
+  } catch {
+    return new Response('Invalid comment grant', { status: 401 });
+  }
 }
 
 type CommentScope = 'artifact' | 'element' | 'selection';
@@ -364,6 +394,21 @@ function normalizePagePath(value: unknown): string | Response {
   if (pagePath.length > 512) return new Response('Page path is too long', { status: 400 });
   return pagePath;
 }
+
+// The commenter's display name — a self-entered claim (not verified), stored
+// immutably as author_label and HTML-escaped on render. No toss token/password.
+function normalizeName(body: unknown): string | Response {
+  const raw = body && typeof body === 'object' && typeof (body as { name?: unknown }).name === 'string'
+    ? (body as { name: string }).name.trim()
+    : '';
+  if (!raw) return new Response('Name is required', { status: 400 });
+  if (raw.length > 80) return new Response('Name is too long', { status: 400 });
+  return raw;
+}
+
+// Legacy token columns are NOT NULL but identity is now author_label; write a
+// sentinel so old (token-based) and new (name-based) rows coexist, no migration.
+const NO_TOKEN = '';
 
 function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null; pagePath: string } | Response {
   if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
@@ -502,12 +547,12 @@ async function serveArtifact(
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
     // Comments are a per-share opt-in (comments_enabled), independent of MULTI_TENANT.
     const sql = getSQL();
-    const commentsRows = await sql`SELECT comments_enabled FROM artifacts WHERE id = ${meta.id}`;
+    const commentsRows = await sql`SELECT comments_enabled, password_epoch FROM artifacts WHERE id = ${meta.id}`;
     if (!commentsRows[0] || !commentsRows[0].comments_enabled) {
       headers['Cache-Control'] = 'private, no-store, max-age=0';
       return new Response(html, { status: 200, headers });
     }
-    const viewerToken = await issueArtifactJWT(meta.id, meta.expires_at, JWT_SECRET);
+    const viewerToken = await issueCommentGrant(meta.id, meta.expires_at, JWT_SECRET, Number(commentsRows[0].password_epoch) || 0);
     const maxAge = artifactCookieMaxAge(meta.expires_at);
     headers['Set-Cookie'] = `toss_tok=${meta.id}; Path=/a/${meta.id}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
     headers['Cache-Control'] = 'private, no-store, max-age=0';
@@ -772,7 +817,6 @@ export default async function handler(request: Request): Promise<Response> {
       if (pagePath instanceof Response) return pagePath;
       const includeActivity = url.searchParams.get('includeActivity') === '1';
 
-      const auth = await resolveUser(request);
       const sql = getSQL();
       const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND deleted_at IS NULL ORDER BY created_at DESC`;
       const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
@@ -783,30 +827,37 @@ export default async function handler(request: Request): Promise<Response> {
         ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
         : messages;
 
+      // Access is already proven (grant or owner); anyone may edit/delete/resolve.
       const hydrateThreads = (threadRows: any[], messageRows: any[]) => {
         const grouped = new Map();
         for (const row of messageRows) {
           const items = grouped.get(row.thread_id) || [];
-          items.push({
+          const out = {
             ...row,
-            can_edit: !!auth && !row.deleted_at && row.thread_status !== 'resolved' && constantTimeEqual(String(row.author_token_hash), auth.tokenHash),
-            can_delete: !!auth && !row.deleted_at && (auth.isAdmin || constantTimeEqual(String(row.author_token_hash), auth.tokenHash)),
-          });
+            can_edit: !row.deleted_at && row.thread_status !== 'resolved',
+            can_delete: !row.deleted_at,
+          };
+          delete out.author_token_hash; // never expose the legacy author token hash
+          items.push(out);
           grouped.set(row.thread_id, items);
         }
 
-        return threadRows.map((thread) => ({
-          ...thread,
-          anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null,
-          can_delete: !!auth && (auth.isAdmin || constantTimeEqual(String(thread.created_by_token_hash), auth.tokenHash)),
-          can_resolve: !!auth,
-          messages: grouped.get(thread.id) || [],
-        }));
+        return threadRows.map((thread) => {
+          const out = {
+            ...thread,
+            anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null,
+            can_delete: true,
+            can_resolve: true,
+            messages: grouped.get(thread.id) || [],
+          };
+          delete out.created_by_token_hash;
+          return out;
+        });
       };
 
       return authJson({
         pagePath,
-        viewer: { authenticated: !!auth, label: auth?.label || null },
+        viewer: { authenticated: true, label: null },
         threads: hydrateThreads(threads, messages),
         activityThreads: hydrateThreads(activityThreads, activityMessages),
       });
@@ -817,17 +868,18 @@ export default async function handler(request: Request): Promise<Response> {
       const access = await requireCommentAccess(request, artifactId);
       if (access instanceof Response) return access;
 
-      const auth = await requireUser(request);
-      if (auth instanceof Response) return auth;
-      const normalized = normalizeThreadInput(await request.json().catch(() => null));
+      const reqBody = await request.json().catch(() => null);
+      const name = normalizeName(reqBody);
+      if (name instanceof Response) return name;
+      const normalized = normalizeThreadInput(reqBody);
       if (normalized instanceof Response) return normalized;
 
       const sql = getSQL();
       const now = Math.floor(Date.now() / 1000);
       const threadId = generateId();
       const messageId = generateId();
-      await sql`INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${normalized.pagePath}, ${auth.tokenHash}, ${auth.label}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
-      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${auth.tokenHash}, ${auth.label}, ${normalized.body}, ${now}, ${now})`;
+      await sql`INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
+      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${normalized.body}, ${now}, ${now})`;
       return authJson({
         id: threadId,
         messageId,
@@ -835,7 +887,7 @@ export default async function handler(request: Request): Promise<Response> {
           id: threadId,
           artifact_id: artifactId,
           page_path: normalized.pagePath,
-          created_by_label: auth.label,
+          created_by_label: name,
           scope_type: normalized.scopeType,
           anchor: normalized.anchorJson ? JSON.parse(normalized.anchorJson) : null,
           status: 'open',
@@ -849,7 +901,7 @@ export default async function handler(request: Request): Promise<Response> {
           messages: [{
             id: messageId,
             thread_id: threadId,
-            author_label: auth.label,
+            author_label: name,
             body: normalized.body,
             created_at: now,
             updated_at: now,
@@ -864,8 +916,6 @@ export default async function handler(request: Request): Promise<Response> {
     const threadMessageMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)\/messages$/);
     if (threadMessageMatch && request.method === 'POST') {
       const threadId = threadMessageMatch[1];
-      const auth = await requireUser(request);
-      if (auth instanceof Response) return auth;
 
       const sql = getSQL();
       const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
@@ -873,12 +923,15 @@ export default async function handler(request: Request): Promise<Response> {
       const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
       if (access instanceof Response) return access;
 
-      const message = normalizeMessageInput(await request.json().catch(() => null));
+      const reqBody = await request.json().catch(() => null);
+      const name = normalizeName(reqBody);
+      if (name instanceof Response) return name;
+      const message = normalizeMessageInput(reqBody);
       if (message instanceof Response) return message;
 
       const now = Math.floor(Date.now() / 1000);
       const messageId = generateId();
-      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${auth.tokenHash}, ${auth.label}, ${message}, ${now}, ${now})`;
+      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${now}, ${now})`;
       await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId}`;
       return authJson({
         id: messageId,
@@ -887,7 +940,7 @@ export default async function handler(request: Request): Promise<Response> {
         message: {
           id: messageId,
           thread_id: threadId,
-          author_label: auth.label,
+          author_label: name,
           body: message,
           created_at: now,
           updated_at: now,
@@ -902,8 +955,6 @@ export default async function handler(request: Request): Promise<Response> {
     if (threadResolveMatch && request.method === 'POST') {
       const threadId = threadResolveMatch[1];
       const action = threadResolveMatch[2];
-      const auth = await requireUser(request);
-      if (auth instanceof Response) return auth;
 
       const sql = getSQL();
       const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
@@ -911,16 +962,20 @@ export default async function handler(request: Request): Promise<Response> {
       const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
       if (access instanceof Response) return access;
 
+      const rb = await request.json().catch(() => null);
+      const resolverName = rb && typeof rb === 'object' && typeof (rb as { name?: unknown }).name === 'string'
+        ? (rb as { name: string }).name.trim().slice(0, 80) : '';
+
       const now = Math.floor(Date.now() / 1000);
       if (action === 'resolve') {
-        await sql`UPDATE comment_threads SET status = 'resolved', resolved_by_token_hash = ${auth.tokenHash}, resolved_by_label = ${auth.label}, resolved_at = ${now}, updated_at = ${now} WHERE id = ${threadId}`;
+        await sql`UPDATE comment_threads SET status = 'resolved', resolved_by_token_hash = ${NO_TOKEN}, resolved_by_label = ${resolverName}, resolved_at = ${now}, updated_at = ${now} WHERE id = ${threadId}`;
       } else {
         await sql`UPDATE comment_threads SET status = 'open', resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ${now} WHERE id = ${threadId}`;
       }
       return authJson({
         id: threadId,
         status: action === 'resolve' ? 'resolved' : 'open',
-        resolvedByLabel: action === 'resolve' ? auth.label : null,
+        resolvedByLabel: action === 'resolve' ? (resolverName || null) : null,
         resolvedAt: action === 'resolve' ? now : null,
         updatedAt: now,
       });
@@ -929,37 +984,27 @@ export default async function handler(request: Request): Promise<Response> {
     const threadDeleteMatch = url.pathname.match(/^\/comment-threads\/([a-f0-9-]+)$/);
     if (threadDeleteMatch && request.method === 'DELETE') {
       const threadId = threadDeleteMatch[1];
-      const auth = await requireUser(request);
-      if (auth instanceof Response) return auth;
 
       const sql = getSQL();
-      const threadRows = await sql`SELECT artifact_id, created_by_token_hash, deleted_at FROM comment_threads WHERE id = ${threadId}`;
+      const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
       if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
       const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
       if (access instanceof Response) return access;
-      if (!auth.isAdmin && !constantTimeEqual(String(threadRows[0].created_by_token_hash), auth.tokenHash)) {
-        return new Response('Forbidden', { status: 403 });
-      }
 
       const now = Math.floor(Date.now() / 1000);
-      await sql`UPDATE comment_threads SET deleted_at = ${now}, deleted_by_token_hash = ${auth.tokenHash}, updated_at = ${now} WHERE id = ${threadId}`;
+      await sql`UPDATE comment_threads SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} WHERE id = ${threadId}`;
       return new Response(null, { status: 204 });
     }
 
     const messageMatch = url.pathname.match(/^\/comment-messages\/([a-f0-9-]+)$/);
     if (messageMatch && (request.method === 'PATCH' || request.method === 'DELETE')) {
       const messageId = messageMatch[1];
-      const auth = await requireUser(request);
-      if (auth instanceof Response) return auth;
 
       const sql = getSQL();
       const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
       if (!rows[0] || rows[0].deleted_at) return new Response('Not found', { status: 404 });
       const access = await requireCommentAccess(request, String(rows[0].artifact_id));
       if (access instanceof Response) return access;
-      if (!auth.isAdmin && !constantTimeEqual(String(rows[0].author_token_hash), auth.tokenHash)) {
-        return new Response('Forbidden', { status: 403 });
-      }
 
       const now = Math.floor(Date.now() / 1000);
       if (request.method === 'PATCH') {
@@ -971,7 +1016,7 @@ export default async function handler(request: Request): Promise<Response> {
         return authJson({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
       }
 
-      await sql`UPDATE comment_messages SET deleted_at = ${now}, deleted_by_token_hash = ${auth.tokenHash}, updated_at = ${now} WHERE id = ${messageId}`;
+      await sql`UPDATE comment_messages SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} WHERE id = ${messageId}`;
       await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${rows[0].thread_id}`;
       return new Response(null, { status: 204 });
     }
