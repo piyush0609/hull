@@ -458,49 +458,217 @@ function injectCommentsUI(html: string, config: {
 <script>
 (() => {
   const cfg = ${payload};
-  const storageKey = 'toss-comment-name';
-  const state = { token: localStorage.getItem(storageKey) || '', threads: [], activeThreadId: '', pendingScope: 'artifact', pendingAnchor: null, pendingRects: [], currentLabel: '', busy: false, loaded: false, loading: false };
-  const currentPagePath = cfg.currentPagePath || 'index.html';
-  const esc = (text) => String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  const root = document.getElementById('toss-comments-root');
-  root.innerHTML = '<style>#toss-comments-root{position:fixed;top:0;right:0;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;color:#111827}#toss-comments-root *{box-sizing:border-box}.toss-comments-shell{display:flex;align-items:flex-start;gap:0}.toss-comments-toggle{margin:12px 0 0 auto;background:#111827;color:#fff;border:none;border-radius:999px 0 0 999px;padding:10px 14px;cursor:pointer;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}.toss-comments-panel{width:360px;max-width:calc(100vw - 24px);height:100vh;background:#fff;border-left:1px solid #e5e7eb;box-shadow:-12px 0 32px rgba(15,23,42,.12);display:none;flex-direction:column}.toss-comments-panel.open{display:flex}.toss-comments-header{padding:16px;border-bottom:1px solid #e5e7eb;background:#f8fafc;display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.toss-comments-header-copy{min-width:0}.toss-comments-close{border:none;background:#e2e8f0;color:#0f172a;border-radius:999px;padding:8px 10px;font-size:12px;font-weight:700;cursor:pointer}.toss-comments-title{font-weight:700;font-size:16px;margin:0 0 4px}.toss-comments-sub{font-size:12px;color:#64748b}.toss-comments-body{padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px}.toss-comments-card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fff}.toss-comments-card.resolved{background:#f8fafc}.toss-comments-card.focused{border-color:#0f172a;box-shadow:0 0 0 3px rgba(15,23,42,.12)}.toss-comments-meta,.toss-comments-message-meta{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#64748b;margin-bottom:8px}.toss-comments-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.toss-comments-actions button,.toss-comments-auth button,.toss-comments-context button{background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer}.toss-comments-actions button.primary{background:#111827;color:#fff;border-color:#111827}.toss-comments-actions button.warn{color:#b91c1c;border-color:#fecaca;background:#fff5f5}.toss-comments-auth input,.toss-comments-textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:13px;background:#fff}.toss-comments-textarea{min-height:92px;resize:vertical}.toss-comments-auth{display:flex;gap:8px;flex-wrap:wrap}.toss-comments-auth input{flex:1 1 180px}.toss-comments-status{font-size:12px;color:#475569;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:10px;padding:10px}.toss-comments-context{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border:1px solid #dbe4f0;border-radius:10px;background:#fff;font-size:12px;color:#334155}.toss-comments-context strong{display:block;color:#0f172a;font-size:12px}.toss-comments-context span{display:block;color:#64748b;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}.toss-comments-thread-list{display:flex;flex-direction:column;gap:12px}.toss-comment-draft-highlight{position:absolute;z-index:2147483645;background:rgba(250,204,21,.35);outline:1px solid rgba(202,138,4,.8);border-radius:4px;pointer-events:none}.toss-comment-focus-highlight{position:absolute;z-index:2147483644;background:rgba(59,130,246,.16);outline:2px solid rgba(37,99,235,.8);border-radius:6px;pointer-events:none}.toss-comment-pin{position:absolute;z-index:2147483646;width:18px;height:18px;border-radius:999px;background:#111827;color:#fff;border:2px solid #fff;box-shadow:0 8px 24px rgba(15,23,42,.25);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer}.toss-comment-pin.active{background:#2563eb}.toss-comment-chip{position:absolute;z-index:2147483647;border:none;border-radius:999px;background:#111827;color:#fff;padding:8px 12px;font-size:12px;font-weight:600;box-shadow:0 10px 30px rgba(15,23,42,.28);cursor:pointer}.toss-comments-thread-anchor{font-size:12px;color:#475569;background:#f8fafc;border-radius:8px;padding:8px;margin-bottom:8px}.toss-comments-message{padding:8px 0;border-top:1px solid #f1f5f9}.toss-comments-message:first-child{border-top:none;padding-top:0}.toss-comments-empty{font-size:13px;color:#64748b}</style><div class="toss-comments-shell"><button class="toss-comments-toggle" type="button">Comments</button><aside class="toss-comments-panel" aria-label="Comments sidebar"><div class="toss-comments-header"><div class="toss-comments-header-copy"><div class="toss-comments-title">Comments</div><div class="toss-comments-sub">Discuss this shared page</div></div><button class="toss-comments-close" type="button" aria-label="Close comments">Close</button></div><div class="toss-comments-body"><div class="toss-comments-auth"><input class="toss-comments-token" placeholder="Your name (shown on your comments)" maxlength="80" /><button class="toss-comments-save-token primary" type="button">Save name</button><button class="toss-comments-clear-token" type="button">Clear</button></div><div class="toss-comments-status"></div><div class="toss-comments-context"><div><strong>Comment target</strong><span class="toss-comments-context-label">Whole page</span></div><button class="toss-comments-context-clear" type="button">Use whole page</button></div><textarea class="toss-comments-textarea" placeholder="Write a comment..."></textarea><button class="toss-comments-submit primary" type="button">Post Comment</button><div class="toss-comments-thread-list"></div></div></aside></div>';
-  const panel = root.querySelector('.toss-comments-panel'); const tokenInput = root.querySelector('.toss-comments-token'); const textarea = root.querySelector('.toss-comments-textarea'); const submitButton = root.querySelector('.toss-comments-submit'); const list = root.querySelector('.toss-comments-thread-list'); const status = root.querySelector('.toss-comments-status'); const contextLabel = root.querySelector('.toss-comments-context-label'); tokenInput.value = state.token;
-  const selectorFor = (el) => { if (!(el instanceof Element)) return 'unknown'; const parts = []; let node = el; while (node && node.nodeType === 1 && node !== document.body) { if (node.id) { parts.unshift('#' + node.id); break; } const parent = node.parentElement; let part = node.tagName.toLowerCase(); if (parent) { const sameTagSiblings = Array.from(parent.children).filter((child) => child.tagName === node.tagName); if (sameTagSiblings.length > 1) { const index = sameTagSiblings.indexOf(node) + 1; part += ':nth-of-type(' + index + ')'; } } parts.unshift(part); node = parent; } return parts.join(' > ') || 'unknown'; };
-  const selectionRectFromAnchor = (anchor) => { if (!anchor || !anchor.selector || !anchor.selectedText) return null; const host = document.querySelector(anchor.selector); if (!(host instanceof Element)) return null; const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT); const textNodes = []; let node; let fullText = ''; while ((node = walker.nextNode())) { const text = node.textContent || ''; if (!text) continue; textNodes.push({ node, start: fullText.length, end: fullText.length + text.length }); fullText += text; } if (!fullText) return null; const selectedText = String(anchor.selectedText); let startIndex = fullText.indexOf(selectedText); if (startIndex < 0 && anchor.textSnippet) startIndex = fullText.indexOf(String(anchor.textSnippet)); if (startIndex < 0) return null; const endIndex = startIndex + selectedText.length; const startNodeMeta = textNodes.find((item) => startIndex >= item.start && startIndex <= item.end); const endNodeMeta = textNodes.find((item) => endIndex >= item.start && endIndex <= item.end) || textNodes[textNodes.length - 1]; if (!startNodeMeta || !endNodeMeta) return null; const range = document.createRange(); range.setStart(startNodeMeta.node, Math.max(0, startIndex - startNodeMeta.start)); range.setEnd(endNodeMeta.node, Math.max(0, Math.min((endNodeMeta.node.textContent || '').length, endIndex - endNodeMeta.start))); const rect = range.getBoundingClientRect(); if (!rect || (!rect.width && !rect.height)) return null; return { x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }; };
-  const rectFromAnchor = (anchor) => { if (!anchor) return null; if (anchor.selectedText) { const selectionRect = selectionRectFromAnchor(anchor); if (selectionRect) return selectionRect; } if (anchor.selector) { const node = document.querySelector(anchor.selector); if (node instanceof Element) { const rect = node.getBoundingClientRect(); return { x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }; } } return anchor.rect || null; };
-  const setStatus = (message) => { status.textContent = message; };
-  const clearDraftHighlight = () => { document.querySelectorAll('.toss-comment-draft-highlight').forEach((node) => node.remove()); };
-  const clearFocusHighlight = () => { document.querySelectorAll('.toss-comment-focus-highlight').forEach((node) => node.remove()); };
-  const clearDraftChip = () => { document.querySelectorAll('.toss-comment-chip').forEach((node) => node.remove()); };
-  const renderDraftHighlight = () => { clearDraftHighlight(); state.pendingRects.forEach((rect) => { const marker = document.createElement('div'); marker.className = 'toss-comment-draft-highlight'; marker.style.left = rect.x + 'px'; marker.style.top = rect.y + 'px'; marker.style.width = Math.max(rect.width, 8) + 'px'; marker.style.height = Math.max(rect.height, 16) + 'px'; document.body.appendChild(marker); }); };
-  const renderDraftChip = () => { clearDraftChip(); if (state.pendingScope !== 'selection' || !state.pendingRects.length) return; const firstRect = state.pendingRects[0]; const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'toss-comment-chip'; chip.textContent = 'Comment'; chip.style.left = firstRect.x + 'px'; chip.style.top = Math.max(firstRect.y - 40, 12) + 'px'; chip.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); openPanelForComment(); setStatus('Selection captured. Add your comment.'); setTimeout(() => textarea.focus(), 0); }); document.body.appendChild(chip); };
-  const renderFocusHighlight = () => { clearFocusHighlight(); if (!state.activeThreadId) return; const thread = state.threads.find((item) => item.id === state.activeThreadId); if (!thread || !thread.anchor) return; const rect = rectFromAnchor(thread.anchor); if (!rect) return; const marker = document.createElement('div'); marker.className = 'toss-comment-focus-highlight'; marker.style.left = (rect.x || 0) + 'px'; marker.style.top = (rect.y || 0) + 'px'; marker.style.width = Math.max(rect.width || 0, 8) + 'px'; marker.style.height = Math.max(rect.height || 0, 16) + 'px'; document.body.appendChild(marker); };
-  const activateThread = (threadId) => { state.activeThreadId = threadId; render(); renderFocusHighlight(); const node = root.querySelector('[data-thread-id="' + threadId + '"]'); if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' }); };
-  const updateContext = () => { if (state.pendingScope === 'selection' && state.pendingAnchor) { contextLabel.textContent = 'Selected text: ' + (state.pendingAnchor.selectedText || state.pendingAnchor.textSnippet || 'Selection'); return; } contextLabel.textContent = 'Whole page'; };
-  const resetPendingAnchor = () => { state.pendingScope = 'artifact'; state.pendingAnchor = null; state.pendingRects = []; clearDraftHighlight(); clearDraftChip(); updateContext(); };
-  const setBusy = (busy) => { state.busy = busy; tokenInput.disabled = busy; textarea.disabled = busy; submitButton.disabled = busy; root.querySelectorAll('button').forEach((button) => { if (button.classList.contains('toss-comments-toggle')) return; button.disabled = busy; }); };
-  const tempId = (prefix) => prefix + '-' + Math.random().toString(36).slice(2, 10);
-  const scrollThreadIntoView = (threadId) => { const node = root.querySelector('[data-thread-id="' + threadId + '"]'); if (node) node.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
-  const authHeaders = (needsAuth) => { const headers = { 'X-Toss-Viewer': cfg.viewerToken }; if (state.token) headers.Authorization = 'Bearer ' + state.token; if (needsAuth) headers['Content-Type'] = 'application/json'; return headers; };
-  const api = async (path, init = {}, needsAuth = false) => { const res = await fetch(cfg.origin + path, { ...init, headers: { ...(init.headers || {}), ...authHeaders(needsAuth) } }); if (res.status === 204) return null; const text = await res.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text ? { error: text } : null; } if (!res.ok) throw new Error((data && data.error) || text || ('Request failed: ' + res.status)); return data; };
-  const anchorLabel = (thread) => { if (thread.scope_type === 'artifact') return 'General page comment'; const anchor = thread.anchor || {}; if (thread.scope_type === 'selection') return 'Selection: ' + (anchor.selectedText || anchor.textSnippet || 'Selected text'); return 'Element: ' + (anchor.selector || anchor.textSnippet || 'Selected element'); };
-  const normalizeMessage = (message) => ({ ...message, can_edit: !!message.can_edit, can_delete: !!message.can_delete });
-  const normalizeThread = (thread) => ({ ...thread, anchor: thread.anchor || null, can_delete: !!thread.can_delete, can_resolve: !!thread.can_resolve, messages: (thread.messages || []).map(normalizeMessage) });
-  const upsertThread = (thread, options = {}) => { const normalized = normalizeThread(thread); const existingIndex = state.threads.findIndex((item) => item.id === normalized.id); if (existingIndex >= 0) { state.threads.splice(existingIndex, 1, normalized); return; } if (options.prepend) { state.threads.unshift(normalized); return; } state.threads.push(normalized); };
-  const removeThread = (threadId) => { state.threads = state.threads.filter((thread) => thread.id !== threadId); };
-  const updateThread = (threadId, updater) => { state.threads = state.threads.map((thread) => thread.id === threadId ? updater(thread) : thread); };
-  const renderPins = () => { document.querySelectorAll('.toss-comment-pin').forEach((node) => node.remove()); state.threads.forEach((thread, index) => { if (thread.deleted_at || thread.scope_type === 'artifact' || !thread.anchor) return; const rect = rectFromAnchor(thread.anchor); if (!rect) return; const pin = document.createElement('button'); pin.type = 'button'; pin.className = 'toss-comment-pin' + (thread.id === state.activeThreadId ? ' active' : ''); pin.textContent = String(index + 1); pin.style.left = (rect.x || 0) + 'px'; pin.style.top = (rect.y || 0) + 'px'; pin.title = anchorLabel(thread); pin.addEventListener('click', () => { panel.classList.add('open'); ensureThreadsLoaded(); activateThread(thread.id); }); document.body.appendChild(pin); }); };
-  const render = () => { list.innerHTML = ''; if (!state.threads.length) { list.innerHTML = '<div class=\"toss-comments-empty\">No comments yet.</div>'; renderPins(); clearFocusHighlight(); return; } state.threads.forEach((thread) => { const article = document.createElement('article'); article.className = 'toss-comments-card' + (thread.status === 'resolved' ? ' resolved' : ''); if (thread.id === state.activeThreadId) article.className += ' focused'; article.dataset.threadId = thread.id; const meta = document.createElement('div'); meta.className = 'toss-comments-meta'; meta.innerHTML = '<span>' + esc(thread.created_by_label) + '</span><span>' + esc(thread.status) + '</span>'; article.appendChild(meta); const anchor = document.createElement('div'); anchor.className = 'toss-comments-thread-anchor'; anchor.textContent = anchorLabel(thread); article.appendChild(anchor); (thread.messages || []).forEach((message) => { const box = document.createElement('div'); box.className = 'toss-comments-message'; box.innerHTML = '<div class=\"toss-comments-message-meta\"><span>' + esc(message.author_label) + '</span><span>' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span></div><div>' + esc(message.deleted_at ? 'Message deleted' : message.body) + '</div>'; if (!message.deleted_at && (message.can_edit || message.can_delete)) { const actions = document.createElement('div'); actions.className = 'toss-comments-actions'; if (message.can_edit) { const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = 'Edit'; edit.dataset.action = 'edit-message'; edit.dataset.messageId = message.id; edit.dataset.body = message.body; actions.appendChild(edit); } if (message.can_delete) { const del = document.createElement('button'); del.type = 'button'; del.textContent = 'Delete'; del.className = 'warn'; del.dataset.action = 'delete-message'; del.dataset.messageId = message.id; actions.appendChild(del); } box.appendChild(actions); } article.appendChild(box); }); const actions = document.createElement('div'); actions.className = 'toss-comments-actions'; actions.innerHTML = '<button type=\"button\" data-action=\"reply-thread\" data-thread-id=\"' + thread.id + '\">Reply</button>'; if (thread.can_resolve && thread.status !== 'resolved') actions.innerHTML += '<button type=\"button\" class=\"primary\" data-action=\"resolve-thread\" data-thread-id=\"' + thread.id + '\">Resolve</button>'; if (thread.can_resolve && thread.status === 'resolved') actions.innerHTML += '<button type=\"button\" data-action=\"reopen-thread\" data-thread-id=\"' + thread.id + '\">Reopen</button>'; if (thread.can_delete) actions.innerHTML += '<button type=\"button\" class=\"warn\" data-action=\"delete-thread\" data-thread-id=\"' + thread.id + '\">Delete Thread</button>'; article.appendChild(actions); article.addEventListener('click', () => { state.activeThreadId = thread.id; render(); renderFocusHighlight(); }); list.appendChild(article); }); renderPins(); renderFocusHighlight(); };
-  const loadThreads = async () => { state.loading = true; try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(currentPagePath) + '&includeActivity=1'); state.threads = (data.threads || []).map(normalizeThread); state.currentLabel = ''; state.loaded = true; setStatus(state.token ? ('Commenting as ' + state.token) : 'Enter your name above, then comment.'); render(); } catch (error) { setStatus(error.message || 'Failed to load comments.'); } finally { state.loading = false; } };
-  const ensureThreadsLoaded = async (force = false) => { if (state.loading) return; if (!force && state.loaded) return; await loadThreads(); };
-  const openPanelForComment = () => { panel.classList.add('open'); ensureThreadsLoaded(); };
-  const captureSelectionAnchor = (options = {}) => { const openPanel = !!options.openPanel; const silent = !!options.silent; const selection = window.getSelection(); if (!selection || selection.isCollapsed || !selection.toString().trim()) { if (!silent) setStatus('Select some text on the page first.'); return false; } const range = selection.getRangeAt(0); const rect = range.getBoundingClientRect(); const rects = Array.from(range.getClientRects()).map((clientRect) => ({ x: Math.round(clientRect.left + window.scrollX), y: Math.round(clientRect.top + window.scrollY), width: Math.round(clientRect.width), height: Math.round(clientRect.height) })).filter((clientRect) => clientRect.width > 0 && clientRect.height > 0); const selectedText = selection.toString().trim(); state.pendingScope = 'selection'; state.pendingAnchor = { selector: selectorFor(range.startContainer && range.startContainer.parentElement), selectedText, textSnippet: selectedText.slice(0, 240), rect: { x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }, startOffset: range.startOffset, endOffset: range.endOffset }; state.pendingRects = rects.length ? rects : [{ x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) }]; renderDraftHighlight(); renderDraftChip(); updateContext(); setStatus('Selection captured. Add your comment.'); if (openPanel) openPanelForComment(); return true; };
-  document.addEventListener('mouseup', (event) => { const target = event.target; if (target instanceof Node && root.contains(target)) return; captureSelectionAnchor({ openPanel: false, silent: true }); });
-  document.addEventListener('keydown', (event) => { if (event.key !== 'Escape') return; const selection = window.getSelection(); if (selection) selection.removeAllRanges(); if (state.pendingScope === 'selection' || state.pendingRects.length) { resetPendingAnchor(); setStatus('Selection cleared.'); } });
-  root.addEventListener('click', async (event) => { const target = event.target; if (!(target instanceof HTMLElement)) return; const action = target.dataset.action; if (state.busy && !target.classList.contains('toss-comments-toggle')) return; if (target.classList.contains('toss-comments-toggle') || target.classList.contains('toss-comments-close')) { panel.classList.toggle('open'); if (panel.classList.contains('open')) ensureThreadsLoaded(); else { resetPendingAnchor(); state.activeThreadId = ''; clearFocusHighlight(); setStatus('Comments closed.'); } return; } if (target.classList.contains('toss-comments-save-token')) { state.token = tokenInput.value.trim(); if (state.token) localStorage.setItem(storageKey, state.token); setStatus('Name saved.'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-clear-token')) { state.token = ''; tokenInput.value = ''; localStorage.removeItem(storageKey); setStatus('Name cleared.'); setBusy(true); try { await ensureThreadsLoaded(true); } finally { setBusy(false); } return; } if (target.classList.contains('toss-comments-context-clear')) { resetPendingAnchor(); setStatus('Comment will be posted on the whole page.'); return; } if (target.classList.contains('toss-comments-submit')) { if (!state.token) { setStatus('Enter your name first (top of the panel).'); return; } const body = textarea.value.trim(); if (!body) { setStatus('Write a comment first.'); return; } const draft = textarea.value; textarea.value = ''; captureSelectionAnchor({ silent: true }); const optimisticThreadId = tempId('thread'); const optimisticMessageId = tempId('message'); const now = Math.floor(Date.now() / 1000); upsertThread({ id: optimisticThreadId, artifact_id: cfg.artifactId, created_by_label: state.token || 'You', scope_type: state.pendingScope, anchor: state.pendingScope === 'artifact' ? null : state.pendingAnchor, status: 'open', resolved_by_label: null, resolved_at: null, deleted_at: null, created_at: now, updated_at: now, can_delete: true, can_resolve: true, messages: [{ id: optimisticMessageId, thread_id: optimisticThreadId, author_label: state.token || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true }] }, { prepend: true }); render(); scrollThreadIntoView(optimisticThreadId); try { const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ name: state.token, body, pagePath: currentPagePath, scopeType: state.pendingScope, anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor }) }, true); if (data && data.thread) { removeThread(optimisticThreadId); upsertThread(data.thread, { prepend: true }); render(); } resetPendingAnchor(); setStatus('Comment posted.'); } catch (error) { removeThread(optimisticThreadId); render(); textarea.value = draft; setStatus(error.message || 'Failed to post comment.'); } return; } if (!action) return; if (!state.token) { setStatus('Enter your name first (top of the panel).'); return; } try { if (action === 'reply-thread') { const body = window.prompt('Reply'); if (!body) return; const threadId = target.dataset.threadId; const optimisticMessageId = tempId('reply'); const now = Math.floor(Date.now() / 1000); updateThread(threadId, (thread) => ({ ...thread, updated_at: now, messages: [...(thread.messages || []), normalizeMessage({ id: optimisticMessageId, thread_id: threadId, author_label: state.token || 'You', body, created_at: now, updated_at: now, deleted_at: null, can_edit: true, can_delete: true })] })); render(); scrollThreadIntoView(threadId); const data = await api('/comment-threads/' + target.dataset.threadId + '/messages', { method: 'POST', body: JSON.stringify({ name: state.token, body }) }, true); if (data && data.message) { updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === optimisticMessageId ? normalizeMessage(data.message) : message) })); } } else if (action === 'resolve-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'resolved', resolved_by_label: state.token || 'You', resolved_at: Math.floor(Date.now() / 1000), messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/resolve', { method: 'POST', body: JSON.stringify({ name: state.token }) }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: data.resolvedByLabel, resolved_at: data.resolvedAt, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })) })); } else if (action === 'reopen-thread') { updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: 'open', resolved_by_label: null, resolved_at: null, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.token || 'You') })) })); render(); const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST' }, true); updateThread(target.dataset.threadId, (thread) => ({ ...thread, status: data.status, resolved_by_label: null, resolved_at: null, updated_at: data.updatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.token || 'You') })) })); } else if (action === 'delete-thread') { if (!window.confirm('Delete this thread?')) return; if (state.activeThreadId === target.dataset.threadId) { state.activeThreadId = ''; clearFocusHighlight(); } removeThread(target.dataset.threadId); render(); await api('/comment-threads/' + target.dataset.threadId, { method: 'DELETE' }, true); } else if (action === 'edit-message') { const nextBody = window.prompt('Edit comment', target.dataset.body || ''); if (!nextBody) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: nextBody, updated_at: Math.floor(Date.now() / 1000) } : message) })); render(); const data = await api('/comment-messages/' + target.dataset.messageId, { method: 'PATCH', body: JSON.stringify({ body: nextBody }) }, true); updateThread(threadId, (thread) => ({ ...thread, updated_at: data.threadUpdatedAt || thread.updated_at, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, body: data.body, updated_at: data.updatedAt || message.updated_at } : message) })); } else if (action === 'delete-message') { if (!window.confirm('Delete this comment?')) return; const threadNode = target.closest('[data-thread-id]'); const threadId = threadNode ? threadNode.dataset.threadId : ''; updateThread(threadId, (thread) => ({ ...thread, messages: (thread.messages || []).map((message) => message.id === target.dataset.messageId ? { ...message, deleted_at: Math.floor(Date.now() / 1000), body: '' } : message) })); render(); await api('/comment-messages/' + target.dataset.messageId, { method: 'DELETE' }, true); } render(); } catch (error) { setStatus(error.message || 'Action failed.'); } });
-  updateContext(); setStatus('Select text on the page to anchor a comment, or write to comment on the whole page.');
+  const NAME_KEY = 'toss-comment-name';
+  const PAGE = cfg.currentPagePath || 'index.html';
+  const state = { mode: 'browse', threads: [], name: localStorage.getItem(NAME_KEY) || '', pending: null, hoverEl: null, loaded: false };
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+  const txt = (el) => (el && (el.innerText || el.textContent) || '').trim();
+  const ago = (ts) => { const s = Math.floor(Date.now() / 1000 - ts); if (s < 60) return 'just now'; const m = Math.floor(s / 60); if (m < 60) return m + 'm ago'; const h = Math.floor(m / 60); if (h < 24) return h + 'h ago'; return Math.floor(h / 24) + 'd ago'; };
+
+  const host = document.getElementById('toss-comments-root');
+  const sr = host.attachShadow({ mode: 'open' });
+  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,system-ui,sans-serif}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;border:0;cursor:pointer;border-radius:999px;font-size:14px;font-weight:600;color:#fff;background:#d9654a;box-shadow:0 6px 20px rgba(0,0,0,.18);padding:11px 18px}.launcher{right:20px;bottom:20px}.launcher.active{background:#111827}.panelBtn{right:20px;bottom:72px;background:#fff;color:#374151;padding:9px 14px;font-size:13px;box-shadow:0 4px 14px rgba(0,0,0,.14)}#count{display:inline-block;min-width:18px;padding:0 6px;margin-left:4px;background:#d9654a;color:#fff;border-radius:999px;font-size:11px;line-height:18px;text-align:center}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:92vw;height:100vh;background:#fff;box-shadow:-8px 0 30px rgba(0,0,0,.16);display:flex;flex-direction:column}.panel header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;color:#111827}.panel header button{border:0;background:none;font-size:16px;cursor:pointer;color:#9ca3af}#status{padding:0 18px;font-size:12px;color:#9a3412}#list{overflow:auto;padding:10px;display:flex;flex-direction:column;gap:10px}.empty{color:#9ca3af;text-align:center;padding:40px 16px;font-size:13px;line-height:1.7}.item{border:1px solid #eef0f2;border-radius:12px;padding:12px;cursor:pointer}.item:hover{box-shadow:0 4px 14px rgba(0,0,0,.1)}.ctxline{font-size:12px;color:#6b7280;margin-bottom:6px}.ctxline .sel{color:#d9654a}.meta{font-size:13px;color:#111827}.meta .agox{color:#9ca3af;font-weight:400;font-size:12px;margin-left:6px}.body{font-size:13px;color:#374151;line-height:1.5;margin-top:2px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.55);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.3);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 12px;font-size:15px;color:#111827}#ctx{background:#f8fafc;border:1px solid #eef0f2;border-radius:10px;padding:10px 12px;margin-bottom:12px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.7;color:#111827}#ctx .cr span{color:#9ca3af;min-width:80px}#ctx code{font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d7dadf;border-radius:10px;padding:10px 12px;font-size:14px;color:#111827}textarea{min-height:84px;resize:vertical}.actions{display:flex;justify-content:flex-end;gap:8px}.btn{border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer}.btn.ghost{background:#f1f2f4;color:#374151}.btn.primary{background:#d9654a;color:#fff}</style>';
+  const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose">&times;</button></header><div id="status"></div><div id="list"></div></aside><div id="composer" class="composer" hidden><div class="card"><div class="pad"><h3>Add a comment</h3><div id="ctx"></div><div class="row"><input id="cName" type="text" placeholder="Your name" maxlength="80"></div><div class="row"><textarea id="cText" placeholder="Describe the issue or suggestion"></textarea></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div>';
+  sr.innerHTML = STYLE + MARKUP;
+  const $ = (s) => sr.querySelector(s);
+  const launcher = $('#launcher'), panelBtn = $('#panelBtn'), countEl = $('#count'), hint = $('#hint'), hl = $('#hl');
+  const panel = $('#panel'), list = $('#list'), composer = $('#composer'), ctx = $('#ctx'), cName = $('#cName'), cText = $('#cText'), statusEl = $('#status');
+
+  launcher.addEventListener('click', () => setMode(state.mode === 'comment' ? 'browse' : 'comment'));
+  panelBtn.addEventListener('click', () => { if (panel.hidden) openPanel(); else panel.hidden = true; });
+  $('#panelClose').addEventListener('click', () => { panel.hidden = true; });
+  $('#cCancel').addEventListener('click', closeComposer);
+  $('#cAdd').addEventListener('click', addComment);
+
+  function setStatus(t) { statusEl.textContent = t || ''; }
+
+  // ---- comment-mode capture (document-level, capture phase) ----
+  function onOver(e) { if (e.target === host) { clearHover(); return; } setHover(e.target); }
+  function onClick(e) {
+    if (e.target === host) return;
+    e.preventDefault(); e.stopPropagation();
+    const selA = window.getSelection();
+    if (selA && !selA.isCollapsed && selA.toString().trim()) capture(captureSelection(selA));
+    else capture(captureElement(e.target));
+  }
+  function onUp(e) {
+    if (e.target === host) return;
+    const selA = window.getSelection();
+    if (selA && !selA.isCollapsed && selA.toString().trim()) {
+      e.preventDefault(); e.stopPropagation();
+      document.addEventListener('click', function sw(ev) { ev.preventDefault(); ev.stopPropagation(); document.removeEventListener('click', sw, true); }, true);
+      capture(captureSelection(selA));
+    }
+  }
+  function onKey(e) { if (e.key === 'Escape') { if (state.mode === 'comment') setMode('browse'); closeComposer(); } }
+
+  function setMode(m) {
+    state.mode = m;
+    const on = m === 'comment';
+    launcher.textContent = on ? 'Exit comment mode' : 'Comment';
+    launcher.classList.toggle('active', on);
+    hint.hidden = !on;
+    document.documentElement.style.cursor = on ? 'crosshair' : '';
+    if (on) {
+      document.addEventListener('mouseover', onOver, true);
+      document.addEventListener('mouseup', onUp, true);
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('keydown', onKey, true);
+    } else {
+      document.removeEventListener('mouseover', onOver, true);
+      document.removeEventListener('mouseup', onUp, true);
+      document.removeEventListener('click', onClick, true);
+      document.removeEventListener('keydown', onKey, true);
+      clearHover();
+    }
+  }
+  function openPanel() { panel.hidden = false; loadThreads(); }
+
+  // ---- highlight ----
+  function boxAt(r, cls) { hl.className = cls || ''; hl.style.left = r.left + 'px'; hl.style.top = r.top + 'px'; hl.style.width = r.width + 'px'; hl.style.height = r.height + 'px'; hl.hidden = false; }
+  function setHover(el) { state.hoverEl = el; boxAt(el.getBoundingClientRect(), 'hover'); }
+  function clearHover() { state.hoverEl = null; hl.hidden = true; }
+  let flashT = null;
+  function flash(el) { boxAt(el.getBoundingClientRect(), 'flash'); clearTimeout(flashT); flashT = setTimeout(() => { hl.hidden = true; }, 2600); }
+
+  // ---- locator (hashed classes excluded) ----
+  function hashed(c) { return /^(css|sc|jsx)-[a-z0-9]{4,}$/i.test(c) || (/^[a-z0-9_-]*[0-9a-f]{6,}[a-z0-9_-]*$/i.test(c) && !/[aeiou]{2}/i.test(c)); }
+  function classesOf(n) { const v = (n.className && n.className.toString().trim()) || ''; return v ? v.split(/ +/).filter((c) => c && !hashed(c)) : []; }
+  function esc2(s) { try { return CSS.escape(s); } catch (e) { return String(s); } }
+  function seg(n) {
+    if (n.id) return '#' + esc2(n.id);
+    let s = n.tagName.toLowerCase();
+    const cls = classesOf(n);
+    if (cls.length) s += '.' + cls.slice(0, 2).map(esc2).join('.');
+    const p = n.parentElement;
+    if (p) { const same = Array.prototype.filter.call(p.children, (c) => c.tagName === n.tagName); if (same.length > 1) s += ':nth-of-type(' + (same.indexOf(n) + 1) + ')'; }
+    return s;
+  }
+  function buildLocator(el) {
+    const parts = []; let n = el, d = 0;
+    while (n && n.nodeType === 1 && n.tagName !== 'BODY' && d < 5) { parts.unshift(seg(n)); if (n.id) break; n = n.parentElement; d++; }
+    const selector = parts.join(' > '); let ordinal = 0;
+    try { const m = document.querySelectorAll(selector); ordinal = Array.prototype.indexOf.call(m, el); if (ordinal < 0) ordinal = 0; } catch (e) {}
+    return { id: el.id || null, testid: el.getAttribute('data-testid') || null, aria: el.getAttribute('aria-label') || null, role: el.getAttribute('role') || null, tag: el.tagName.toLowerCase(), selector: selector, ordinal: ordinal };
+  }
+  function captureView() {
+    const nav = document.querySelector('[aria-current],[role=tab][aria-selected=true],.tab.active,nav .active,.nav .active,.active[role=button]');
+    const h1 = document.querySelector('h1');
+    return { url: location.pathname + location.hash, navLabel: nav ? txt(nav).slice(0, 60) : null, heading: h1 ? txt(h1).slice(0, 80) : null };
+  }
+  function captureElement(el) {
+    const r = el.getBoundingClientRect();
+    return { kind: 'element', locator: buildLocator(el), state: { text: txt(el).slice(0, 300), outerHTML: (el.outerHTML || '').slice(0, 2000), rect: { x: Math.round(r.left + window.scrollX), y: Math.round(r.top + window.scrollY), w: Math.round(r.width), h: Math.round(r.height) } }, view: captureView() };
+  }
+  function captureSelection(selA) {
+    const range = selA.getRangeAt(0), exact = selA.toString().trim();
+    const c = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+    const full = txt(c), i = full.indexOf(exact);
+    const prefix = i >= 0 ? full.slice(Math.max(0, i - 40), i) : '', suffix = i >= 0 ? full.slice(i + exact.length, i + exact.length + 40) : '';
+    const r = range.getBoundingClientRect();
+    return { kind: 'selection', locator: buildLocator(c), quote: { prefix: prefix, exact: exact.slice(0, 240), suffix: suffix }, state: { text: exact.slice(0, 300), outerHTML: (c.outerHTML || '').slice(0, 2000), rect: { x: Math.round(r.left + window.scrollX), y: Math.round(r.top + window.scrollY), w: Math.round(r.width), h: Math.round(r.height) } }, view: captureView() };
+  }
+
+  // ---- compose + POST ----
+  function capture(target) {
+    state.pending = target; setMode('browse'); clearHover();
+    const label = target.kind === 'selection' ? target.quote.exact : (target.state.text || '(element)');
+    ctx.innerHTML = '<div class="cr"><span>Screen</span><b>' + esc(target.view.navLabel || target.view.heading || 'Page') + '</b></div>' +
+      '<div class="cr"><span>' + (target.kind === 'selection' ? 'Selected' : 'Component') + '</span><b>' + esc(label.slice(0, 70)) + (label.length > 70 ? '…' : '') + '</b></div>' +
+      '<div class="cr"><span>Anchor</span><code>' + esc(target.locator.selector) + '</code></div>';
+    cName.value = state.name || ''; cText.value = ''; composer.hidden = false;
+    setTimeout(() => { (cName.value ? cText : cName).focus(); }, 30);
+  }
+  function closeComposer() { composer.hidden = true; state.pending = null; }
+
+  const api = async (path, init) => {
+    init = init || {};
+    const headers = { 'X-Toss-Viewer': cfg.viewerToken };
+    if (init.body) headers['Content-Type'] = 'application/json';
+    const res = await fetch(cfg.origin + path, { method: init.method || 'GET', headers: headers, body: init.body });
+    const t = await res.text(); let data = null; try { data = t ? JSON.parse(t) : null; } catch (e) { data = null; }
+    if (!res.ok) throw new Error((data && data.error) || ('Request failed: ' + res.status));
+    return data;
+  };
+  function scopeOf(kind) { return kind === 'selection' ? 'selection' : (kind === 'page' ? 'artifact' : 'element'); }
+
+  async function addComment() {
+    if (!state.pending) return;
+    const name = (cName.value || '').trim() || 'Anonymous';
+    const body = (cText.value || '').trim();
+    if (!body) { cText.focus(); return; }
+    state.name = name; localStorage.setItem(NAME_KEY, name);
+    const t = state.pending; const scopeType = scopeOf(t.kind);
+    const anchor = { kind: t.kind, locator: t.locator, state: t.state, view: t.view }; if (t.quote) anchor.quote = t.quote;
+    closeComposer(); setStatus('Posting…');
+    try {
+      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ name: name, body: body, pagePath: PAGE, scopeType: scopeType, anchor: scopeType === 'artifact' ? undefined : anchor }) });
+      if (data && data.thread) { state.threads.unshift(data.thread); }
+      setStatus(''); openPanel();
+    } catch (e) { setStatus(e.message || 'Failed to post.'); panel.hidden = false; }
+  }
+
+  function applyThreads(threads) {
+    const sig = threads.length + ':' + threads.map((t) => t.id + ':' + ((t.messages && t.messages.length) || 0) + ':' + (t.status || '')).join(',');
+    if (sig === state.sig) return;
+    state.sig = sig; state.threads = threads; render();
+  }
+  async function loadThreads() {
+    try {
+      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(PAGE) + '&includeActivity=1');
+      state.loaded = true; setStatus(''); applyThreads((data && data.threads) || []);
+    } catch (e) { if (!state.loaded) setStatus(e.message || 'Failed to load.'); }
+  }
+
+  // ---- recovery ladder ----
+  function attrSel(name, val) { return '[' + name + '="' + String(val).split('"').join('') + '"]'; }
+  function findByText(needle) {
+    needle = (needle || '').trim().slice(0, 50); if (!needle) return null;
+    const els = document.querySelectorAll('body *'); let match = null, best = Infinity;
+    for (let i = 0; i < els.length; i++) { const el = els[i]; if (el.closest('#toss-comments-root')) continue; const tt = el.textContent || ''; if (tt.indexOf(needle) >= 0 && tt.length < best) { best = tt.length; match = el; } }
+    return match;
+  }
+  function relocate(a) {
+    if (!a || !a.locator) return null;
+    const L = a.locator;
+    if (L.id) { const e = document.getElementById(L.id); if (e) return e; }
+    if (L.testid) { const e2 = document.querySelector(attrSel('data-testid', L.testid)); if (e2) return e2; }
+    if (L.aria) { const e3 = document.querySelector(attrSel('aria-label', L.aria)); if (e3) return e3; }
+    try { const m = document.querySelectorAll(L.selector); if (m.length) { if (a.state && a.state.text) { const key = a.state.text.slice(0, 30); for (let i = 0; i < m.length; i++) if ((m[i].textContent || '').indexOf(key) >= 0) return m[i]; } return m[Math.min(L.ordinal || 0, m.length - 1)]; } } catch (e) {}
+    return findByText((a.quote && a.quote.exact) || (a.state && a.state.text));
+  }
+
+  // ---- render ----
+  function render() {
+    countEl.textContent = state.threads.length;
+    if (!state.threads.length) { list.innerHTML = '<div class="empty">No comments yet.<br>Click <b>Comment</b>, then click a component (or select text).</div>'; return; }
+    list.innerHTML = state.threads.map((th) => {
+      const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {};
+      const label = a.quote ? ('“' + a.quote.exact + '”') : (st.text || (th.scope_type === 'artifact' ? 'Whole page' : '(element)'));
+      const msg = (th.messages && th.messages[0]) || {};
+      return '<div class="item" data-id="' + esc(th.id) + '">' +
+        '<div class="ctxline">📍 ' + esc(view.navLabel || view.heading || 'Page') + ' · <span class="sel">' + esc(label.slice(0, 46)) + (label.length > 46 ? '…' : '') + '</span></div>' +
+        '<div class="meta"><b>' + esc(th.created_by_label || msg.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span></div>' +
+        '<div class="body">' + esc(msg.body || '') + '</div>' +
+        '<div class="orphan" hidden></div></div>';
+    }).join('');
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', () => onItem(el.getAttribute('data-id'), el)); });
+  }
+  function onItem(id, el) {
+    const th = state.threads.filter((x) => x.id === id)[0]; if (!th) return;
+    const target = relocate(th.anchor || {}), orphan = el.querySelector('.orphan');
+    if (target) { orphan.hidden = true; target.scrollIntoView({ behavior: 'smooth', block: 'center' }); setTimeout(() => flash(target), 300); }
+    else { const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {}; orphan.hidden = false; orphan.innerHTML = '⚠ The page changed since this was written. It referred to <b>“' + esc((st.text || '').slice(0, 80)) + '”</b> on the <b>' + esc(view.navLabel || view.heading || 'page') + '</b> screen.'; }
+  }
+
+  cName.value = state.name;
+  setMode('browse');
+  loadThreads();
+  setInterval(loadThreads, 15000);
 })();
-</script>`;
+</script>
+`;
   return html.includes('</body>') ? html.replace('</body>', shell + '</body>') : html + shell;
 }
 
