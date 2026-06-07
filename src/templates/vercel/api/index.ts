@@ -410,6 +410,22 @@ function normalizeName(body: unknown): string | Response {
 // sentinel so old (token-based) and new (name-based) rows coexist, no migration.
 const NO_TOKEN = '';
 
+// Append-only immutable version record. Mints seq N+1, advances the artifact's
+// current_version_id pointer, and on the first version grandfathers any
+// pre-versioning threads (version_id NULL) to it so the latest-only filter shows them.
+async function mintVersion(artifactId: string, contentHash: string, now: number): Promise<string> {
+  const sql = getSQL();
+  const last = await sql`SELECT seq FROM artifact_versions WHERE artifact_id = ${artifactId} ORDER BY seq DESC LIMIT 1`;
+  const seq = (last[0] && last[0].seq ? Number(last[0].seq) : 0) + 1;
+  const versionId = generateId();
+  await sql`INSERT INTO artifact_versions (id, artifact_id, seq, content_hash, created_at) VALUES (${versionId}, ${artifactId}, ${seq}, ${contentHash}, ${now})`;
+  await sql`UPDATE artifacts SET current_version_id = ${versionId} WHERE id = ${artifactId}`;
+  if (seq === 1) {
+    await sql`UPDATE comment_threads SET version_id = ${versionId} WHERE artifact_id = ${artifactId} AND version_id IS NULL`;
+  }
+  return versionId;
+}
+
 function normalizeThreadInput(body: unknown): { body: string; scopeType: CommentScope; anchorJson: string | null; pagePath: string } | Response {
   if (!body || typeof body !== 'object') return new Response('Invalid payload', { status: 400 });
   const payload = body as { body?: unknown; scopeType?: unknown; anchor?: unknown; pagePath?: unknown };
@@ -816,12 +832,28 @@ export default async function handler(request: Request): Promise<Response> {
             return new Response('Slug already taken by another tenant', { status: 409 });
           }
           const existingId = existing[0].id;
+          // Versioning: mint a new immutable version when content changes (or --force);
+          // fail-closed on a no-op re-share that would hide existing comments.
+          const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
+          const newHash = await sha256(html);
+          const curV = await sql`SELECT av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
+          const curHash = curV[0] ? curV[0].chash : null;
+          const contentChanged = !curHash || curHash !== newHash;
+          if (!contentChanged && !force) {
+            const cc = await sql`SELECT COUNT(*)::int AS n FROM comment_threads WHERE artifact_id = ${existingId} AND deleted_at IS NULL`;
+            if ((cc[0] ? cc[0].n : 0) > 0) {
+              return new Response(JSON.stringify({ error: 'comments_present_no_change', comment_count: cc[0].n, hint: '--force' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+            }
+          }
           // Password salt is the artifact id, which is preserved on update.
           const passwordParam = url.searchParams.get('password');
           const newPasswordHash = passwordParam ? await sha256(passwordParam + existingId) : null;
           const newExpiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
           await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
           await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
+          if (contentChanged || force) {
+            await mintVersion(existingId, newHash, now);
+          }
           const shortUrl = `${url.origin}/s/${requestedId}`;
           return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
             headers: { 'Content-Type': 'application/json' },
@@ -854,6 +886,7 @@ export default async function handler(request: Request): Promise<Response> {
 
       const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
       await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash}, ${commentsEnabled})`;
+      await mintVersion(id, await sha256(html), now);
 
       // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
       // time-bound distinction so the verifier can normalize correctly.
@@ -986,13 +1019,17 @@ export default async function handler(request: Request): Promise<Response> {
       const includeActivity = url.searchParams.get('includeActivity') === '1';
 
       const sql = getSQL();
-      const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND deleted_at IS NULL ORDER BY created_at DESC`;
-      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+      // Latest-only: filter to the artifact's current version. NULL current
+      // (legacy artifact, no version minted yet) => show all (no version filter).
+      const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
+      const curVid = curVerRow[0] ? curVerRow[0].vid : null;
+      const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`;
+      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
       const activityThreads = includeActivity
-        ? await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND deleted_at IS NULL ORDER BY created_at DESC`
+        ? await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`
         : threads;
       const activityMessages = includeActivity
-        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
+        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
         : messages;
 
       // Access is already proven (grant or owner); anyone may edit/delete/resolve.
@@ -1046,7 +1083,9 @@ export default async function handler(request: Request): Promise<Response> {
       const now = Math.floor(Date.now() / 1000);
       const threadId = generateId();
       const messageId = generateId();
-      await sql`INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
+      const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
+      const versionId = curVerRow[0] ? curVerRow[0].vid : null;
+      await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${versionId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
       await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${normalized.body}, ${now}, ${now})`;
       return authJson({
         id: threadId,

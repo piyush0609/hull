@@ -1,5 +1,6 @@
--- Mirror of worker 0009. Postgres + migrate.js re-runs every deploy and splits on
--- ';', so every statement must be idempotent and free of DO $$ blocks.
+-- Mirror of worker 0009. migrate.js re-runs on every deploy and splits SQL on
+-- semicolons, so each statement stays idempotent and this comment avoids inline
+-- semicolons, apostrophes, and dollar-quote blocks that would break the splitter.
 CREATE TABLE IF NOT EXISTS artifact_versions (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL,
