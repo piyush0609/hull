@@ -63,6 +63,7 @@ type PublishOptions = {
   password?: string | true;
   profile?: string;
   comments?: boolean;
+  force?: boolean;
 };
 
 async function routePublish(file = '.', options: PublishOptions = {}) {
@@ -76,6 +77,7 @@ async function routePublish(file = '.', options: PublishOptions = {}) {
     password: options.password,
     profile: options.profile,
     comments: options.comments,
+    force: options.force,
   });
 }
 
@@ -94,8 +96,9 @@ program
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
   .option('--comments', 'Enable comments on this share (off by default)')
+  .option('--force', 'On re-share (same --id): publish a new version even if content is unchanged and comments exist')
   .option('--profile <name>', 'Use a specific profile')
-  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'profile'])));
+  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'force', 'profile'])));
 
 program.addHelpText('after', `
 Quick start:
@@ -124,8 +127,9 @@ program
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
   .option('--comments', 'Enable comments on this share (off by default)')
+  .option('--force', 'On re-share (same --id): publish a new version even if content is unchanged and comments exist')
   .option('--profile <name>', 'Use a specific profile')
-  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'profile'])));
+  .action((path, ...args) => routePublish(path, getCommandOptions(args, ['expires', 'id', 'clipboard', 'json', 'password', 'comments', 'force', 'profile'])));
 
 program
   .command('login <endpoint>')

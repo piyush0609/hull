@@ -69,7 +69,7 @@ async function walkDir(dir: string): Promise<string[]> {
   return files;
 }
 
-export async function shareCommand(file: string, options: { expires?: string; id?: string; clipboard?: boolean; json?: boolean; password?: string | true; profile?: string; comments?: boolean } = {}) {
+export async function shareCommand(file: string, options: { expires?: string; id?: string; clipboard?: boolean; json?: boolean; password?: string | true; profile?: string; comments?: boolean; force?: boolean } = {}) {
   const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
@@ -176,7 +176,7 @@ export async function shareCommand(file: string, options: { expires?: string; id
     // Send only the basename — never the user's full local path.
     const name = basename(file);
     try {
-      result = await api.upload(html, name, expires, password, options.id, options.comments);
+      result = await api.upload(html, name, expires, password, options.id, options.comments, options.force);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
