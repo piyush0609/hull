@@ -41,6 +41,19 @@ export class TossAPI {
     return res.json();
   }
 
+  // Programmatic retrieval (owner token). Returns the latest version's threads.
+  async getComments(id: string): Promise<{ pagePath: string; threads: unknown[]; activityThreads: unknown[] }> {
+    const url = new URL(`/artifacts/${id}/comment-threads`, this.config.endpoint);
+    url.searchParams.set('pagePath', 'index.html');
+    url.searchParams.set('includeActivity', '1');
+    const res = await safeFetch(url.href, { headers: { Authorization: this.authHeader() } });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Failed to fetch comments: ${res.status} ${text}`);
+    }
+    return res.json();
+  }
+
   async uploadFile(artifactId: string, relativePath: string, data: Buffer): Promise<void> {
     const url = new URL(`/artifacts/${artifactId}/files`, this.config.endpoint);
     url.searchParams.set('path', relativePath);

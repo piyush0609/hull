@@ -1,18 +1,14 @@
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
-// toss comments <slug-or-id> on|off — owner-only per-share comment toggle.
+// toss comments <id-or-slug> [on|off]
+//   no state  -> list the share's comments on the latest version (--json for raw output)
+//   on|off    -> owner-only per-share comment toggle
 export async function commentsCommand(
   idOrSlug: string,
-  state: string,
-  options: { profile?: string } = {}
+  state: string | undefined,
+  options: { profile?: string; json?: boolean } = {}
 ) {
-  if (state !== 'on' && state !== 'off') {
-    console.error('Error: usage: toss comments <id-or-slug> on|off');
-    process.exit(1);
-  }
-  const enabled = state === 'on';
-
   const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
@@ -27,18 +23,64 @@ export async function commentsCommand(
     try {
       const artifacts = await api.list();
       const match = artifacts.find((a) => a.slug === idOrSlug);
-      if (match) {
-        id = match.id;
-      } else {
+      if (!match) {
         console.error(`Error: No artifact found with slug "${idOrSlug}"`);
         process.exit(1);
       }
+      id = match.id;
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
   }
 
+  // No state -> retrieve comments (programmatic read, owner token).
+  if (state === undefined) {
+    let data: any;
+    try {
+      data = await api.getComments(id);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+    const threads: any[] = (data && (data.activityThreads || data.threads)) || [];
+    if (options.json) {
+      console.log(JSON.stringify({ artifactId: id, threads }, null, 2));
+      return;
+    }
+    if (!threads.length) {
+      console.log(`No comments on ${idOrSlug}.`);
+      return;
+    }
+    console.log(`${threads.length} comment thread(s) on ${idOrSlug} (latest version):\n`);
+    for (const t of threads) {
+      const scope = t.scope_type === 'artifact' ? 'page' : t.scope_type;
+      const anchorText =
+        (t.anchor && t.anchor.state && t.anchor.state.text) ||
+        (t.anchor && t.anchor.quote && t.anchor.quote.exact) ||
+        (t.anchor && t.anchor.selector) ||
+        '';
+      console.log(
+        `• [${scope}] ${t.page_path || ''}` +
+        (anchorText ? ` — ${String(anchorText).slice(0, 60)}` : '') +
+        (t.status === 'resolved' ? '  (resolved)' : '')
+      );
+      for (const m of (t.messages || [])) {
+        const when = new Date((m.created_at || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
+        console.log(`    ${m.author_label || 'anon'} · ${when}${m.deleted_at ? ' (deleted)' : ''}`);
+        if (!m.deleted_at) console.log(`      ${String(m.body || '').replace(/\s+/g, ' ').trim()}`);
+      }
+      console.log('');
+    }
+    return;
+  }
+
+  // state given -> owner-only toggle.
+  if (state !== 'on' && state !== 'off') {
+    console.error('Error: usage: toss comments <id-or-slug> [on|off]');
+    process.exit(1);
+  }
+  const enabled = state === 'on';
   try {
     await api.setComments(id, enabled);
   } catch (err) {

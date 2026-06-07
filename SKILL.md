@@ -1,6 +1,6 @@
 ---
 name: toss
-description: Use when sharing HTML files, folders, reports, demos, or static sites with expiring links — or when the user mentions toss, self-hosted artifact sharing, or commands like `toss share`, `toss deploy`, `toss setup`, `toss list`, `toss revoke`, `toss profile`, `toss token`, `toss join`. Covers Cloudflare Workers and Vercel Edge backends, multi-tenant teams, password-protected shares, profile switching across deployments, and custom domains. Trigger when user asks how to share an HTML file/folder with an expiry, set up a self-hosted share service, or onboard teammates to a shared toss instance.
+description: Use when sharing HTML files, folders, reports, demos, or static sites with expiring links — or when the user mentions toss, self-hosted artifact sharing, or commands like `toss share`, `toss deploy`, `toss setup`, `toss list`, `toss revoke`, `toss comments`, `toss profile`, `toss token`, `toss join`. Covers Cloudflare Workers and Vercel Edge backends, multi-tenant teams, password-protected shares, document comments (name + optional password, versioned, retrievable via the CLI), profile switching across deployments, and custom domains. Trigger when user asks how to share an HTML file/folder with an expiry, set up a self-hosted share service, or onboard teammates to a shared toss instance.
 license: MIT
 ---
 
@@ -250,6 +250,46 @@ toss list
 toss revoke <slug>
 toss info
 toss destroy
+```
+
+## Comments
+
+Shared docs can collect comments. Commenters need **no toss token** — they enter a
+display **name**, plus the document's view **password** only if the share has one
+(open shares need just a name). Comments are stored server-side, tied to the artifact
+and its content **version**.
+
+```bash
+# Enable comments when sharing (works with or without --password)
+toss share ./report.html --comments
+toss share ./report.html --comments --password
+
+# Toggle on an existing share (owner only)
+toss comments <id-or-slug> on
+toss comments <id-or-slug> off
+
+# Read comments programmatically (owner token)
+toss comments <id-or-slug>            # human-readable list (latest version)
+toss comments <id-or-slug> --json     # structured JSON: { artifactId, threads[] }
+```
+
+### Versioning (latest-only)
+
+Each comment is tied to the document version it was made on. Re-sharing the same
+slug with **changed** content mints a new version, and only the **latest** version's
+comments are shown (older ones are retained, not shown by default).
+
+Re-sharing **unchanged** content when comments exist is **blocked** to avoid silently
+hiding them:
+
+```
+Upload failed: 409 {"error":"comments_present_no_change","comment_count":N,"hint":"--force"}
+```
+
+Pass `--force` to publish a new version anyway (this hides the prior version's comments):
+
+```bash
+toss share ./report.html --id <slug> --comments --force
 ```
 
 ## Profiles

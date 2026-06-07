@@ -155,10 +155,11 @@ program
   .action((id, ...args) => revokeCommand(id, getCommandOptions(args, ['profile'])));
 
 program
-  .command('comments <id> <state>')
-  .description('Enable or disable comments on a share (state: on|off)')
+  .command('comments <id> [state]')
+  .description('List a share\'s comments (no state), or enable/disable them (state: on|off)')
+  .option('-j, --json', 'Output comments as JSON (list mode)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((id, state, ...args) => commentsCommand(id, state, getCommandOptions(args, ['profile'])));
+  .action((id, state, ...args) => commentsCommand(id, state, getCommandOptions(args, ['json', 'profile'])));
 
 program
   .command('info')
