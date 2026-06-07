@@ -1,5 +1,5 @@
 ---
-title: Universal commenting for shared HTML documents (name + password identity, versioned)
+title: Universal commenting for shared HTML documents (name + optional-password identity, component-anchored, versioned)
 type: feat
 status: active
 date: 2026-06-05
@@ -9,9 +9,44 @@ date: 2026-06-05
 
 ## Overview
 
-Let anyone who can view a shared HTML document leave comments — on the whole page, on a specific element, or on a text selection — without needing a toss account/token. Commenters authenticate with the document's **view password** and a self-entered **display name**. Comments are stored server-side, tied to the published artifact **and its content version**, and retrievable via API. When a new version of the document is deployed, only the latest version's comments are shown by default; older versions (content + comments) are retained and reachable via a URL parameter.
+Let anyone who can view a shared HTML document leave comments — on a **component** (element) or a **text selection**, through one universal in-page tool — without needing a toss account/token. Commenters identify with a self-entered **display name**; if the share is **password-protected** they pass its view password to get in (name-only on open shares). Comments are stored server-side, tied to the published artifact **and its content version**, and retrievable via the toss CLI/API. When a new version is deployed, only the latest version's comments are shown by default; older versions' comments are retained and listable via a version parameter.
 
 This is a **redesign** of the existing (rolled-back) share-page comment feature, not an extension — see "The redesign reframe" below.
+
+## 🔄 Revision — 2026-06-06 (model finalized; supersedes conflicting text below)
+
+Three things changed after a working spike on the real `avpn-onboarding-prototype.html` (see `examples/snapshot-comments/`). **Where earlier sections conflict, this block wins.**
+
+**1. Password is OPTIONAL, not required.** Identity = the entered **name** (always). The **document password is only a view gate when the share has one**; comments are enabled per-share by **`comments_enabled` alone**, independent of whether a password is set. Open (no-password) shares can have comments (name-only) — as reachable as the document itself. → Supersedes the "password **required**" stance in the reframe table, decision #4 (gate on `comments_enabled` only), decision #5 (`--comments` does **not** require `--password`), and decision #11 (removing a password no longer blocks comments).
+
+**2. Anchoring = COMPONENT-ANCHORED on the live DOM (snapshot rejected).** We built and rejected a snapshot-on-comment approach: a frozen image kills **text selection** and points at a *picture*, not the component. The chosen model anchors to the **live element** and stores its **state**, so text stays selectable and the comment is semantic + agent-actionable. `anchor_json` holds:
+```
+{ kind: "element" | "selection" | "page",
+  locator: { id, testid, aria, role, tag, selector, ordinal },   // stable signals first; HASHED CLASSES EXCLUDED (React)
+  state:   { text, outerHTML(<=4 KB), rect },                     // "the state of the component"
+  view:    { url, navLabel, heading },                           // which screen/state it was on
+  quote:   { prefix, exact, suffix } }                           // selections only (W3C TextQuoteSelector)
+```
+Re-display runs a **recovery ladder**: `id`/`testid`/`aria` → `selector` (confirm by text) → `quote`/text search → **orphan-but-keep**, showing the stored `state` + `view` ("page changed — it referred to …"). The `state` block is both the orphan safety-net and the structured payload for the API / Send-to-Claude. → Supersedes decision #9 and Phase 3's "prefix/suffix only."
+
+**3. UI = explicit comment mode + on-demand re-locate (dissolves the pre-layout-pin CRITICAL).** Comments live in a **side panel**; the page is browse-by-default; an explicit "Comment" mode does hover-highlight + click-to-pick (or text-select). Clicking a comment **re-locates and flashes the live element on demand** — no always-on pins painted pre-layout, so the frontend-races CRITICAL (#5) is **largely dissolved**. The reposition/`ResizeObserver` machinery is only needed if we later add persistent on-page pins. The widget is a **Shadow-DOM overlay** → no CSS/JS collision with the content (incl. a prototype's *own* comment tool, verified on avpn).
+
+**Already built (earlier session) vs remaining — this is the real delta:**
+
+| Requirement | State | Remaining |
+|---|---|---|
+| #1 DB-tied (threads/messages, both backends) | ✅ built | store the richer component `anchor_json` from the new widget |
+| #2 name + optional password, no token (grant JWT, `author_label`, anyone-edits, opt-in toggle, backward-compatible) | ✅ built | none server-side; new widget reuses the name/grant flow |
+| #4 programmatic retrieval via a toss skill | 🔶 partial | `api.getComments(id)` + `toss comments <id> [--json]` (extend `comments.ts`) + **SKILL.md** (zero comment coverage today) |
+| #5 versioned, latest-only | 🆕 new | `artifact_versions` + `version_id` on threads + re-share `--force` guard + latest-only serve/query |
+| Universal component tool (widget) | 🆕 new | port the spike's component-anchor capture into the real widget on **both** backends, POSTing to the existing routes |
+
+**Build order (slices — `toss-test`, TDD, committed one by one, backward-compatible):**
+1. **Versioning foundation** — `artifact_versions`, `version_id` on threads, re-share guard, latest-only serve/query. *Foundation: everything ties to a version.*
+2. **Comment retrieval API + skill** — `toss comments <id> --json` + `SKILL.md` (#4). Small, self-contained.
+3. **Widget component-anchor upgrade** — both backends: capture `{locator,state,view,quote}`, recovery ladder, orphan, explicit comment mode.
+
+Built migrations already present: worker `0007_comments_enabled`, `0008_password_epoch`; vercel `0005_comments_enabled`, `0006_password_epoch`.
 
 ## ⚡ Enhancement Summary (deepened 2026-06-05)
 
@@ -61,7 +96,8 @@ A comment subsystem already exists on both backends and makes the **opposite** d
 | Commenter identity | toss **token** (Bearer) → `author_token_hash` | view **password** + display **name** → `author_label` |
 | Edit/delete rights | author or admin only | **anyone with the password** (trust-based, small group) |
 | Gating | `MULTI_TENANT === 'true'` (404 otherwise) | per-share **`comments_enabled` + password set** |
-| Password requirement | none (works on any viewer-JWT artifact) | **required** (comments live only on password-protected shares) |
+| Password requirement | none (works on any viewer-JWT artifact) | **optional** — name always; password only when the share has one; comments gated by `comments_enabled` (revised 2026-06-06) |
+| Anchoring | token-era page/element/selection | **component-anchored** (locator + state + view), text-selection second gesture, snapshot rejected (revised 2026-06-06) |
 | Versioning | none — re-share overwrites content in place | content-hash **versions**, `?__toss_v=`, latest-only by default |
 
 Origin references: shipped routes at `src/templates/worker/src/index.ts:1747-2032` and `src/templates/vercel/api/index.ts:728-946`; RFC `docs/rfcs/share-page-comments.md` (describes the token model — supersede it).
@@ -73,8 +109,8 @@ These resolve every fork raised in brainstorming and the spec-flow gap analysis.
 1. **Identity:** display **name** (free-text, captured immutably per comment as `author_label`) + the share's **view password**. The name is a *claim, not an identity* — never render it as "verified." Capture client IP + timestamp **server-side only** (`CF-Connecting-IP` / Vercel `request.ip`) for soft-moderation.
 2. **Comment grant (auth path):** reuse the existing **artifact-scoped JWT** pattern (`X-Toss-Viewer`). Issue it in `serveArtifact` **only after the password gate passes and `comments_enabled`** (today it's issued under `MULTI_TENANT`). The client sends it as a header on comment API calls. This solves the cookie-path problem (`toss_pwd_<slug>` is `Path=/s/:slug`, comment routes are `/artifacts/:id/...`) and gives CSRF protection (custom header forces preflight).
 3. **Edit/delete:** anyone holding the comment grant (i.e. the password) can edit/delete **any** comment. Made safe via **soft-delete + tombstone**, immutable `author_label` across edits, an "edited" badge, and recording the editor/deleter label. (Full edit-history revisions table = follow-up, not v1.)
-4. **Gating:** add `comments_enabled` to `artifacts`; inject UI + allow comment routes **iff `comments_enabled AND password_hash IS NOT NULL`**. Fully decoupled from `MULTI_TENANT`.
-5. **Enable paths:** `toss share <file> --comments` (requires `--password`; error if absent) and toggle later via `toss comments <slug> on|off` → `PATCH /artifacts/:id/comments` (owner/admin auth, reusing the `token_hash` owner check).
+4. **Gating:** add `comments_enabled` to `artifacts`; inject UI + allow comment routes **iff `comments_enabled`** — independent of whether a password is set, so open shares can have comments. Fully decoupled from `MULTI_TENANT`. *(Revised 2026-06-06: dropped the `password_hash IS NOT NULL` requirement.)*
+5. **Enable paths:** `toss share <file> --comments` (works **with or without** `--password`) and toggle later via `toss comments <slug> on|off` → `PATCH /artifacts/:id/comments` (owner/admin auth, reusing the `token_hash` owner check). *(Revised 2026-06-06: `--comments` no longer requires `--password`.)*
 6. **Versioning (Option A — append-only immutable version records):** versioning is an **append-only `artifact_versions` table** — one **immutable** row per share/re-share (`id, artifact_id, seq, content_hash, created_at`), never updated after insert; `artifacts.current_version_id` points at the latest. **Content is overwritten in place** (no content-addressed storage, no per-version bodies retained); `content_hash` (normalized, single-pass) is stored on the version row as **metadata only**, used to detect "did the content change?". `content_hash` is **not** unique per artifact (a `--force` re-share can repeat identical content as a new row) — `UNIQUE(artifact_id, seq)` is the ordinal; there is no `UNIQUE(artifact_id, content_hash)`. Each comment thread carries the **`version_id`** it was authored against; the default view filters to `version_id = current_version_id`, so a new version **hides** prior comments (retained as a *list*, not a re-rendered old body). **Settings carry over:** `password_hash`, `expires_at`, and `comments_enabled` live on the mutable `artifacts` row and are **preserved on re-share** (never reset implicitly) — not snapshotted per version.
 6a. **Re-share trigger + fail-closed guard.** A new version is minted when content changes; the guard protects comments on no-op re-shares. Detect change by comparing the upload's `content_hash` to the current version's.
    - **Content changed →** new immutable version; prior comments move to history. (Normal path.)
@@ -86,7 +122,7 @@ These resolve every fork raised in brainstorming and the spec-flow gap analysis.
 8. **Version-pinned writes:** the served page embeds its `version_id`; comment POSTs carry it; the server attaches the comment to that version and **rejects (409) any write whose `version_id` ≠ `current_version_id`** (prevents commenting into a superseded version mid-redeploy).
 9. **Anchor robustness:** extend `anchor_json` with **32-char `prefix`/`suffix`** (W3C TextQuoteSelector). On the latest version, run a Hypothesis-style recovery ladder; on failure **orphan the comment (keep it, detach the pin, badge it) — never silently drop it.**
 10. **Read access:** readers = anyone with the view password (page) ; **programmatic/cloud API auth = owner toss token** (Bearer), version-scoped (default latest). Never public; `Vary: Cookie, Authorization`; comments fetched client-side after the gate, never inlined into gated HTML.
-11. **Password lifecycle:** changing the password **bumps a session epoch** (`toss_pwd_<slug>=<epoch>`) to invalidate stale sessions; **removing the password while comments exist is blocked / auto-disables comments** (otherwise comments leak publicly — violates the password requirement).
+11. **Password lifecycle:** changing the password **bumps a session epoch** (`toss_pwd_<slug>=<epoch>`) to invalidate stale sessions. *(Revised 2026-06-06: since open shares may have comments, removing a password no longer blocks/auto-disables comments — they remain, gated by `comments_enabled`, as reachable as the now-open document.)*
 12. **Disable/enable:** disable = **hide + retain** (`comments_enabled=0`); re-enable restores existing threads.
 13. **Folder shares:** **folder versioning is out of scope for v1** (`--id` is blocked for directories; `src/commands/share.ts:107-110`). Folder shares may still have comments scoped per file via the existing `page_path`, but without versioning. Single-file shares get the full versioning behavior.
 
@@ -161,8 +197,8 @@ erDiagram
 ```
 
 Token columns from the old model (`created_by_token_hash`, `author_token_hash`, `*_token_hash`) become **nullable / repurposed** (the new model has no per-commenter token). New migrations:
-- Worker (D1, tracked, **no `IF NOT EXISTS`**, no `NOT NULL` without default): `0007_comments_enabled.sql`, `0008_artifact_versions.sql`, `0009_comment_version_and_labels.sql`, `0010_password_epoch.sql`.
-- Vercel (Postgres, **idempotent** — `migrate.js` re-runs all; use `ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`): `0005_*` … `0008_*` mirrors.
+- Worker (D1, tracked, **no `IF NOT EXISTS`**, no `NOT NULL` without default): ✅ built `0007_comments_enabled.sql`, `0008_password_epoch.sql`; 🆕 next `0009_artifact_versions.sql`, `0010_comment_version_and_labels.sql`.
+- Vercel (Postgres, **idempotent** — `migrate.js` re-runs all; use `ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`): ✅ built `0005_comments_enabled.sql`, `0006_password_epoch.sql`; 🆕 next `0007_artifact_versions.sql`, `0008_comment_version_and_labels.sql`.
 
 ### API surface
 
@@ -186,7 +222,7 @@ Old-version (`?__toss_v=`) views: write routes reject with `409 read-only (histo
 
 **Phase 0 — Isolated test instance (no production risk).** Deploy a separate `toss-test` Vercel project (own Neon DB + Blob) via `node dist/index.js deploy --backend vercel --subdomain test`. Production `toss-team`/`share.realfast.ai` is never touched. Worker logic is TDD'd locally via `tests/integration/worker.test.ts`.
 
-**Phase 1 — Per-share opt-in + password-based comment grant (no versioning yet).**
+**Phase 1 — Per-share opt-in + name/grant comment auth (no versioning yet). ✅ BUILT (earlier session; password now optional per the 2026-06-06 revision).**
 - Migrations: `comments_enabled`, `password_epoch`; nullable token columns; `author_label` as identity.
 - Decouple comment gating from `MULTI_TENANT` → gate on `comments_enabled && password_hash`.
 - Issue comment-grant JWT post-password-gate; replace token-bearer write-auth with grant + name.
@@ -204,9 +240,10 @@ Old-version (`?__toss_v=`) views: write routes reject with `409 read-only (histo
 - `?__toss_v=<seq>` + `toss comments list --version` view an old version's **comments** (a list, not the old body).
 - **Cut (Option A):** per-version content storage, content-addressed bodies, pruning, `410`-content, retention bound, backfill blob-moves. Re-share still overwrites the single content blob in place as today; only metadata is versioned.
 
-**Phase 3 — Anchor robustness + universal comment tool polish.**
-- Extend `anchor_json` with prefix/suffix; Hypothesis 4-step recovery ladder; orphan-don't-drop UX.
-- One universal entry point for page/element/selection comments (consolidate existing UI).
+**Phase 3 — Universal COMPONENT-ANCHORED comment tool (see "Revision — 2026-06-06"). 🆕**
+- Replace the widget capture with the component-anchor model: explicit comment mode → hover-highlight + click a component **or** select text; store `{locator, state, view, quote}` in `anchor_json` (hashed classes excluded from the locator).
+- Re-display via the recovery ladder (id/testid/aria → selector+text → quote/text → **orphan-but-keep with stored state**); comments in a side panel; click → re-locate + flash the live element on demand (no pre-layout pins).
+- Shadow-DOM overlay; both backends in lockstep. Snapshot approach evaluated and **rejected** (kills text selection, points at a picture). Spike: `examples/snapshot-comments/`.
 
 **Phase 4 — Programmatic API + CLI retrieval; docs.**
 - `toss comments list` + owner-token API; update RFC/README.
@@ -230,19 +267,19 @@ Old-version (`?__toss_v=`) views: write routes reject with `409 read-only (histo
 
 ### Functional
 - [ ] A share with no `--comments` shows **zero** comment UI and all comment routes 404 (fixes the rollback cause).
-- [ ] `toss share f.html --password --comments` enables comments; `--comments` without a password errors.
+- [ ] `toss share f.html --comments` enables comments **with or without** `--password` (open shares can have comments).
 - [ ] `toss comments <slug> on|off` toggles; disable hides+retains, re-enable restores.
-- [ ] A reviewer with the view password can comment with just a **name** (no token), at page/element/selection scope; name stored immutably.
+- [ ] A reviewer can comment with just a **name** (no token) — passing the view password first only if the share has one — at component/selection scope; name stored immutably.
 - [ ] Anyone with the password can edit/delete any comment; deletes are soft (tombstone), `author_label` preserved, "edited" badge shown.
 - [ ] Re-sharing changed content creates a new immutable version; the page shows **only the new version's comments**; `?__toss_v=<old-seq>` lists the old version's comments (read-only; old body not re-rendered).
 - [ ] Identical re-share with **no comments** is a no-op (no new version); identical re-share **with comments fails** (exit non-zero, `--json` error) unless `--force`; `--force` mints a new version and moves prior comments to history.
 - [ ] Re-share **preserves** password, expiry, and comments-enabled (no implicit reset).
 - [ ] An anchor that no longer matches the latest version is **orphaned and still visible**, never silently dropped.
 - [ ] `toss comments list <slug>` returns comments as JSON via owner token (version-scoped).
-- [ ] Removing a share's password while comments exist is blocked or auto-disables comments; changing the password invalidates old sessions.
+- [ ] Changing the password invalidates old sessions (epoch bump). *(Revised 2026-06-06: password removal no longer blocks comments — open shares may have them.)*
 
 ### Non-Functional / Security
-- [ ] Comment reads require the password grant (page) or owner token (API); never public; `Vary: Cookie, Authorization` set; comments not inlined into gated HTML.
+- [ ] Comment reads require a comment grant (page; issued after the view gate — password only if the share has one) or owner token (API); reads are never *more* public than the document itself; `Vary: Cookie, Authorization` set; comments not inlined into gated HTML.
 - [ ] Writes require a custom header (`X-Toss-Comment`) + pass an `Origin` check (CSRF).
 - [ ] Password checks remain constant-time (equal-length hashes); per-artifact salt retained.
 - [ ] Names HTML-escaped on render; empty names rejected; body ≤ 4000 chars.
