@@ -180,6 +180,7 @@ export async function deployVercelCommand(options: {
   yes?: boolean;
   postgresUrl?: string;
   blobToken?: string;
+  skipMigrate?: boolean;
 }) {
   console.log('Setting up your toss on Vercel...\n');
 
@@ -412,6 +413,37 @@ export async function deployVercelCommand(options: {
     await setVercelEnv(deployDir, 'BLOB_READ_WRITE_TOKEN', blobToken);
   }
 
+  // Migrate BEFORE promoting code. The new code can require new columns, so a failed
+  // (or skipped) migration must block the deploy — otherwise we promote code that 500s
+  // against an un-migrated schema. Migrations are additive + idempotent, so applying
+  // them while the previous deploy is still live is safe.
+  const skipMigrate = options.skipMigrate || process.env.TOSS_SKIP_MIGRATE === '1';
+  if (databaseUrl && !skipMigrate) {
+    console.log('Running database migrations (before deploy)...');
+    try {
+      await execAsync('npm install --no-package-lock --silent', { cwd: deployDir });
+      // Idempotent + retried: the first attempt wakes a cold (auto-suspended) Neon
+      // compute so a later attempt connects.
+      await retryAsync(
+        () => execAsync('node migrate.js', {
+          cwd: deployDir,
+          env: { ...process.env, DATABASE_URL: databaseUrl },
+        }),
+        { attempts: 4, delayMs: 2500 }
+      );
+      console.log('✅ Migrations applied.');
+    } catch (err: any) {
+      console.error('❌ Migration failed:', err.stderr || err.message);
+      console.error('   Deploy aborted — new code was NOT promoted, so production is unchanged.');
+      console.error('   Fix the migration (or apply it manually), then re-deploy.');
+      console.error('   If the schema is already applied (or this machine cannot reach the DB),');
+      console.error('   re-run with --skip-migrate (or TOSS_SKIP_MIGRATE=1).');
+      process.exit(1);
+    }
+  } else if (databaseUrl && skipMigrate) {
+    console.warn('⚠️  Skipping migrations (--skip-migrate / TOSS_SKIP_MIGRATE). Ensure the schema is already applied, or the new code may fail.');
+  }
+
   // Deploy
   console.log('Deploying to Vercel...');
   let deployOutput: string;
@@ -487,25 +519,8 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Run migrations if database is available
-  if (hasDatabase) {
-    console.log('Running database migrations...');
-    try {
-      await execAsync('npm install --no-package-lock --silent', { cwd: deployDir });
-      // Migrations are idempotent, so retrying is safe; the first attempt wakes
-      // a cold (auto-suspended) Neon compute so a later attempt connects.
-      await retryAsync(
-        () => execAsync('node migrate.js', {
-          cwd: deployDir,
-          env: { ...process.env, DATABASE_URL: databaseUrl },
-        }),
-        { attempts: 4, delayMs: 2500 }
-      );
-    } catch (err: any) {
-      console.error('Migration failed:', err.stderr || err.message);
-      console.log('  You may need to apply migrations manually.');
-    }
-  }
+  // (Migrations already ran before the deploy above — fail-loud, so reaching this
+  // point means the schema is applied.)
 
   // Save config
   const endpoint = customDomain ? `https://${customDomain}` : projectUrl;

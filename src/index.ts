@@ -222,7 +222,8 @@ admin
   .option('--postgres-url <url>', 'Postgres connection string (Vercel only)')
   .option('--blob-token <token>', 'Vercel Blob read-write token (Vercel only)')
   .option('-y, --yes', 'Skip interactive prompts')
-  .action((...args) => routeDeploy(getCommandOptions(args, ['domain', 'multiTenant', 'profile', 'subdomain', 'backend', 'postgresUrl', 'blobToken', 'yes'])));
+  .option('--skip-migrate', 'Skip DB migrations — only when the schema is already applied or the DB is unreachable')
+  .action((...args) => routeDeploy(getCommandOptions(args, ['domain', 'multiTenant', 'profile', 'subdomain', 'backend', 'postgresUrl', 'blobToken', 'yes', 'skipMigrate'])));
 
 admin
   .command('setup')
