@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import { VERSION } from './version.js';
 import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
@@ -86,7 +87,7 @@ const program = new Command();
 program
   .name('toss')
   .description('Publish HTML files and folders with a simple share link')
-  .version('0.1.0')
+  .version(VERSION)
   .argument('[path]', 'File or folder to publish', '.')
   // No default for --expires: omitted means permanent (matches `toss publish` /
   // `toss share` semantics). The CLI must NOT silently shorten links to 24h.

@@ -3,8 +3,8 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { createInterface } from 'readline';
+import { VERSION } from '../version.js';
 
-const VERSION = '0.1.0';
 const GITHUB_SKILL_URL = 'https://raw.githubusercontent.com/piyush0609/toss/main/SKILL.md';
 
 interface ToolConfig {
