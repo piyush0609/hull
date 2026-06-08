@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.1](https://github.com/piyush0609/toss/compare/v0.2.0...v0.2.1) (2026-06-08)
+
+
+### Bug Fixes
+
+* **deploy:** auto-promote to current production + preserve custom-domain endpoint ([7b5e097](https://github.com/piyush0609/toss/commit/7b5e0973b03a4a6022ce87c32c8ffb1619e9d087))
+
+
+### Documentation
+
+* add AGENTS.md routing agents to the release runbook ([7591dd6](https://github.com/piyush0609/toss/commit/7591dd6d656e717c12bb5d4780044b5ee88f9ff7))
+* **readme:** add Releasing section linking the runbook ([ced899e](https://github.com/piyush0609/toss/commit/ced899e91bc302d854fd1418a41f8e443f4548e9))
+
 ## [0.2.0](https://github.com/piyush0609/toss/compare/v0.1.0...v0.2.0) (2026-06-08)
 
 
