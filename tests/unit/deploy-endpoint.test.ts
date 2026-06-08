@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chooseEndpoint, isVercelAppEndpoint } from '../../src/commands/deploy-vercel.js';
+import { chooseEndpoint, isVercelAppEndpoint, isAlreadyCurrentProduction } from '../../src/commands/deploy-vercel.js';
 
 describe('chooseEndpoint', () => {
   const deployUrl = 'https://toss-team-abc123-scope.vercel.app';
@@ -36,5 +36,19 @@ describe('isVercelAppEndpoint', () => {
     expect(isVercelAppEndpoint(undefined)).toBe(false);
     expect(isVercelAppEndpoint(null)).toBe(false);
     expect(isVercelAppEndpoint('not-a-url')).toBe(false);
+  });
+});
+
+describe('isAlreadyCurrentProduction', () => {
+  it('detects the 409 "already current" promote response (success, not failure)', () => {
+    expect(isAlreadyCurrentProduction('Error: The provided deploymentId (dpl_x) is already the current production deployment. (409)')).toBe(true);
+    expect(isAlreadyCurrentProduction('already the current production deployment')).toBe(true);
+  });
+
+  it('treats real promote failures and empty input as not-already-current', () => {
+    expect(isAlreadyCurrentProduction('Error: deployment not found')).toBe(false);
+    expect(isAlreadyCurrentProduction('')).toBe(false);
+    expect(isAlreadyCurrentProduction(undefined)).toBe(false);
+    expect(isAlreadyCurrentProduction(null)).toBe(false);
   });
 });

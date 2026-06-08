@@ -42,6 +42,14 @@ export function chooseEndpoint(
   return deploymentUrl;
 }
 
+// A 409 from `vercel promote` means the deployment is ALREADY the current production
+// one — i.e. `vercel deploy --prod` already cut over (the normal case, unless the
+// project is in a rolled-back state). That's success, not a failure, so don't alarm.
+export function isAlreadyCurrentProduction(errText: string | undefined | null): boolean {
+  if (!errText) return false;
+  return /already the current production deployment/i.test(errText) || /\(409\)/.test(errText);
+}
+
 async function copyDir(src: string, dest: string): Promise<void> {
   await mkdir(dest, { recursive: true });
   const entries = await readdir(src, { withFileTypes: true });
@@ -519,8 +527,13 @@ export async function deployVercelCommand(options: {
     await vercelExec(`vercel promote ${projectUrl}`, deployDir);
     console.log('✅ Promoted — production domains now serve this deployment.');
   } catch (err: any) {
-    console.warn('⚠️  Could not auto-promote to current production:', err.stderr || err.message);
-    console.warn(`   Run manually (linked to the project): vercel promote ${projectUrl}`);
+    const msg = err.stderr || err.message || '';
+    if (isAlreadyCurrentProduction(msg)) {
+      console.log('✅ Already the current production deployment — production domains already serve this build.');
+    } else {
+      console.warn('⚠️  Could not auto-promote to current production:', msg);
+      console.warn(`   Run manually (linked to the project): vercel promote ${projectUrl}`);
+    }
   }
 
   // Check storage status
