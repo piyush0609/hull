@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.3](https://github.com/piyush0609/toss/compare/v0.2.2...v0.2.3) (2026-06-08)
+
+
+### Features
+
+* **share:** folder shares take --id, render correctly, reconcile on re-share ([ff0f166](https://github.com/piyush0609/toss/commit/ff0f1665aa7eef95f12ad6000f5e3f1513ba59af))
+
 ## [0.2.2](https://github.com/piyush0609/toss/compare/v0.2.1...v0.2.2) (2026-06-08)
 
 
