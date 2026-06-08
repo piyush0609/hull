@@ -104,11 +104,6 @@ export async function shareCommand(file: string, options: { expires?: string; id
     process.exit(1);
   }
 
-  if (fileStat.isDirectory() && options.id) {
-    console.error('Error: --id is not yet supported for folder shares.');
-    process.exit(1);
-  }
-
   if (fileStat.isDirectory()) {
     // Folder share
     const allFiles = await walkDir(file);
@@ -140,9 +135,15 @@ export async function shareCommand(file: string, options: { expires?: string; id
     const entryName = basename(file);
     const entryHtml = await readFile(entryFile);
     try {
-      result = await api.upload(entryHtml, entryName, expires, password, undefined, options.comments);
+      result = await api.upload(entryHtml, entryName, expires, password, options.id, options.comments, options.force);
     } catch (err) {
-      console.error(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('slug_taken')) {
+        console.error(`Error: the id "${options.id}" is already taken by another share.`);
+        console.error('  Re-run with a different --id, or omit --id for an auto-generated slug.');
+      } else {
+        console.error(msg);
+      }
       process.exit(1);
     }
 
@@ -160,6 +161,12 @@ export async function shareCommand(file: string, options: { expires?: string; id
         }
       }
     }
+
+    // Folder content uses relative links (./styles.css, ./page.html) that the browser
+    // resolves against the URL's directory. Hand out the canonical directory URL
+    // (trailing slash) so it renders natively, without depending on the server's
+    // bare-slug redirect. Single-file shares keep the plain /s/<slug> URL.
+    if (!result.url.endsWith('/')) result.url += '/';
   } else {
     // Single file share
     if (fileStat.size > MAX_FILE_SIZE) {

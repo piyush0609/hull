@@ -870,6 +870,15 @@ export default async function handler(request: Request): Promise<Response> {
           const passwordParam = url.searchParams.get('password');
           const newPasswordHash = passwordParam ? await sha256(passwordParam + existingId) : null;
           const newExpiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
+          // Folder re-share reconciliation: drop stale sub-files (anything other than
+          // the entry) so a page removed/renamed in the new version can't orphan and
+          // keep serving the old blob. index.html is overwritten in place just below;
+          // the client re-uploads the current sub-files next via /files. Single-file
+          // re-shares are unaffected (their only blob is index.html, which is skipped).
+          const staleFiles = await blobList(`artifacts/${existingId}/files/`);
+          for (const p of staleFiles) {
+            if (p !== `artifacts/${existingId}/files/index.html`) await blobDelete(p);
+          }
           await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
           await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           if (contentChanged || force) {
@@ -1299,6 +1308,14 @@ export default async function handler(request: Request): Promise<Response> {
 
       if (isArtifactExpired(rows[0].expires_at)) {
         return new Response('Link expired', { status: 410 });
+      }
+
+      // Serve the entry under a trailing slash so the browser resolves relative assets
+      // (./styles.css, ./page.html) against /s/<slug>/ rather than /s/. Bare-slug GETs
+      // redirect to the canonical slash form; sub-paths (slugMatch[2] defined) and the
+      // password POST pass through untouched.
+      if (slugMatch[2] === undefined && (request.method === 'GET' || request.method === 'HEAD')) {
+        return new Response(null, { status: 302, headers: { Location: `${url.origin}/s/${slug}/` } });
       }
 
       if (rows[0].password_hash) {
