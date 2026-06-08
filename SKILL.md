@@ -247,6 +247,11 @@ recipients keep the exact same link. That stable slug is the identity versioning
 track: re-sharing the same id mints a new content **version** (see Comments → Versioning).
 Omit `--expires` for a permanent link.
 
+**If an `--id` is already taken** (slugs are one global namespace), `toss share` fails with
+`409 {"error":"slug_taken","slug":"…","hint":"…"}`. An agent should **retry with a different
+`--id`** (or **ask the user** which slug to use) — not treat it as a fatal error. Re-sharing a
+slug **you already own** is *not* an error — that's the in-place update / new-version path.
+
 **Password security:**
 - Use `--password` (no value) for an interactive prompt — characters hidden with `*`.
 - Passing `--password <value>` works but exposes the password in shell history.

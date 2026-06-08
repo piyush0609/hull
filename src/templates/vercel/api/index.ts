@@ -841,7 +841,13 @@ export default async function handler(request: Request): Promise<Response> {
         const existing = await sql`SELECT id, token_hash FROM artifacts WHERE slug = ${requestedId}`;
         if (existing[0]) {
           if (existing[0].token_hash !== auth.tokenHash) {
-            return new Response('Slug already taken by another tenant', { status: 409 });
+            // Structured + actionable so an agent can recover (pick a different id) rather
+            // than treat it as an opaque failure. Slugs are a single global namespace.
+            return new Response(JSON.stringify({
+              error: 'slug_taken',
+              slug: requestedId,
+              hint: 'This id is already used by another share. Re-run with a different --id, or omit --id for an auto-generated slug.',
+            }), { status: 409, headers: { 'Content-Type': 'application/json' } });
           }
           const existingId = existing[0].id;
           // Versioning: mint a new immutable version when content changes (or --force);

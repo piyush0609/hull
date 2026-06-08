@@ -178,7 +178,13 @@ export async function shareCommand(file: string, options: { expires?: string; id
     try {
       result = await api.upload(html, name, expires, password, options.id, options.comments, options.force);
     } catch (err) {
-      console.error(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('slug_taken')) {
+        console.error(`Error: the id "${options.id}" is already taken by another share.`);
+        console.error('  Re-run with a different --id, or omit --id for an auto-generated slug.');
+      } else {
+        console.error(msg);
+      }
       process.exit(1);
     }
   }
