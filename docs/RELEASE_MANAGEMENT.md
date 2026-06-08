@@ -1,4 +1,4 @@
-# Releasing toss
+# toss Release Management Guide
 
 A self-contained runbook for cutting a toss release. No prior context needed.
 
