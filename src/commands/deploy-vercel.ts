@@ -23,6 +23,25 @@ function generateToken(): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+export function isVercelAppEndpoint(endpoint: string | undefined | null): boolean {
+  if (!endpoint) return false;
+  try { return new URL(endpoint).hostname.endsWith('.vercel.app'); } catch { return false; }
+}
+
+// Endpoint to persist for the profile. An explicit --domain wins; otherwise KEEP an
+// existing custom-domain endpoint so a redeploy never clobbers e.g.
+// https://share.example.com with the throwaway per-deploy *.vercel.app URL; only fall
+// back to the deploy URL when there is no custom domain yet (first deploy).
+export function chooseEndpoint(
+  customDomain: string | undefined,
+  existingEndpoint: string | undefined | null,
+  deploymentUrl: string
+): string {
+  if (customDomain) return `https://${customDomain}`;
+  if (existingEndpoint && !isVercelAppEndpoint(existingEndpoint)) return existingEndpoint;
+  return deploymentUrl;
+}
+
 async function copyDir(src: string, dest: string): Promise<void> {
   await mkdir(dest, { recursive: true });
   const entries = await readdir(src, { withFileTypes: true });
@@ -491,6 +510,19 @@ export async function deployVercelCommand(options: {
     }
   }
 
+  // Promote the just-deployed production deployment to "current" so the project's
+  // production domains — including a pinned custom domain that does NOT auto-follow
+  // `vercel deploy --prod` — actually serve this build. Non-fatal: the deploy already
+  // succeeded, so a promote hiccup must not abort; surface the manual command instead.
+  console.log('Promoting to current production...');
+  try {
+    await vercelExec(`vercel promote ${projectUrl}`, deployDir);
+    console.log('✅ Promoted — production domains now serve this deployment.');
+  } catch (err: any) {
+    console.warn('⚠️  Could not auto-promote to current production:', err.stderr || err.message);
+    console.warn(`   Run manually (linked to the project): vercel promote ${projectUrl}`);
+  }
+
   // Check storage status
   const hasDatabase = !!databaseUrl;
   const hasBlob = !!blobToken;
@@ -522,8 +554,9 @@ export async function deployVercelCommand(options: {
   // (Migrations already ran before the deploy above — fail-loud, so reaching this
   // point means the schema is applied.)
 
-  // Save config
-  const endpoint = customDomain ? `https://${customDomain}` : projectUrl;
+  // Save config. Preserve an existing custom-domain endpoint (e.g. share.example.com)
+  // — a redeploy must not overwrite it with the throwaway per-deploy *.vercel.app URL.
+  const endpoint = chooseEndpoint(customDomain, profileConfig?.endpoint, projectUrl);
   await saveConfig(
     {
       endpoint,
