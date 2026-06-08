@@ -448,3 +448,7 @@ Owner profiles can also include backend-specific metadata like:
 - Regular users should not need to care whether the service is running on Cloudflare or Vercel.
 - Legacy commands like `toss share`, `toss deploy`, and `toss join` still work for compatibility.
 - For local repo testing, prefer `./toss ...` over `node dist/index.js ...`.
+
+## Releasing
+
+Maintainers: the release process — version bump, changelog, tag, publish, and rollback — lives in [docs/RELEASE_MANAGEMENT.md](docs/RELEASE_MANAGEMENT.md). Repo conventions for agents and contributors are in [AGENTS.md](AGENTS.md).
