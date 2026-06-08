@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { createInterface } from 'readline';
 import { VERSION } from '../version.js';
+import { createHash } from 'node:crypto';
 
 const GITHUB_SKILL_URL = 'https://raw.githubusercontent.com/piyush0609/toss/main/SKILL.md';
 
@@ -100,40 +101,79 @@ async function getSkillContent(): Promise<string> {
   );
 }
 
-function injectVersion(content: string): string {
-  if (content.startsWith('---')) {
-    const endIdx = content.indexOf('---', 3);
-    if (endIdx !== -1) {
-      const frontmatter = content.slice(3, endIdx);
-      const cleaned = frontmatter.replace(/\nversion:.*/g, '');
-      const updated = cleaned.trimEnd() + `\nversion: "${VERSION}"\n`;
-      return '---' + updated + '---' + content.slice(endIdx + 3);
-    }
-  }
-  return `---\nversion: "${VERSION}"\n---\n\n${content}`;
+// --- Skill stamping & content hashing -------------------------------------
+// The installed SKILL.md carries two managed frontmatter fields: `version` (a
+// human label) and `toss-hash` (the staleness signal). Updates are gated on the
+// hash, not the version — so a content change with no version bump still syncs,
+// and a version bump with no content change does not rewrite every install.
+
+// Frontmatter fields toss owns: stripped before hashing, re-written on stamp.
+const STAMP_FIELDS = ['version', 'toss-hash'];
+
+// Split "---<fm>---<body>" into its parts, or null when there is no frontmatter.
+function splitFrontmatter(content: string): { fm: string; body: string } | null {
+  if (!content.startsWith('---')) return null;
+  const endIdx = content.indexOf('---', 3);
+  if (endIdx === -1) return null;
+  return { fm: content.slice(3, endIdx), body: content.slice(endIdx + 3) };
 }
 
-function extractVersion(content: string): string | null {
-  const match = content.match(/version:\s*"([^"]+)"/);
+function stripFields(frontmatter: string, fields: string[]): string {
+  return fields.reduce((fm, f) => fm.replace(new RegExp(`\\n${f}:.*`, 'g'), ''), frontmatter);
+}
+
+// Canonical content with toss-managed fields removed — the thing we hash.
+// Stripping our own stamp is what keeps the hash stable across the install
+// round-trip (source hash === re-read installed hash).
+export function normalizeSkill(content: string): string {
+  const parts = splitFrontmatter(content);
+  if (!parts) return content;
+  return `---${stripFields(parts.fm, STAMP_FIELDS).trimEnd()}\n---${parts.body}`;
+}
+
+export function hashSkill(content: string): string {
+  return createHash('sha256').update(normalizeSkill(content), 'utf-8').digest('hex').slice(0, 16);
+}
+
+// Stamp version + content hash into the frontmatter (replacing any prior stamp).
+export function stampSkill(content: string): string {
+  const stamp = `\nversion: "${VERSION}"\ntoss-hash: "${hashSkill(content)}"\n`;
+  const parts = splitFrontmatter(content);
+  if (!parts) return `---${stamp}---\n\n${content}`;
+  return `---${stripFields(parts.fm, STAMP_FIELDS).trimEnd()}${stamp}---${parts.body}`;
+}
+
+function extractField(content: string, field: string): string | null {
+  const match = content.match(new RegExp(`${field}:\\s*"([^"]+)"`));
   return match ? match[1] : null;
 }
 
 async function getInstalledVersion(skillFile: string): Promise<string | null> {
   try {
-    const content = await readFile(skillFile, 'utf-8');
-    return extractVersion(content);
+    return extractField(await readFile(skillFile, 'utf-8'), 'version');
   } catch {
     return null;
   }
 }
 
-async function installToPath(installPath: string): Promise<void> {
-  const content = await getSkillContent();
-  const versioned = injectVersion(content);
+async function getInstalledHash(skillFile: string): Promise<string | null> {
+  try {
+    return extractField(await readFile(skillFile, 'utf-8'), 'toss-hash');
+  } catch {
+    return null;
+  }
+}
 
+async function installToPath(installPath: string, source: string): Promise<void> {
   await mkdir(installPath, { recursive: true });
-  const skillFile = join(installPath, 'SKILL.md');
-  await writeFile(skillFile, versioned, 'utf-8');
+  await writeFile(join(installPath, 'SKILL.md'), stampSkill(source), 'utf-8');
+}
+
+// Fetch the canonical SKILL.md once and hash it, so a command compares and
+// installs against a single fetch instead of re-reading the source per tool.
+async function loadSource(): Promise<{ source: string; hash: string }> {
+  const source = await getSkillContent();
+  return { source, hash: hashSkill(source) };
 }
 
 async function isInstalled(tool: string, level: 'user' | 'project'): Promise<boolean> {
@@ -151,6 +191,7 @@ export async function skillInstallCommand(tool: string | null, options: { all?: 
     const tools = Object.keys(TOOL_CONFIGS);
     let installed = 0;
     let skipped = 0;
+    const { source, hash: sourceHash } = await loadSource();
 
     for (const t of tools) {
       const config = TOOL_CONFIGS[t];
@@ -172,19 +213,19 @@ export async function skillInstallCommand(tool: string | null, options: { all?: 
 
       const alreadyInstalled = await isInstalled(t, level);
       if (alreadyInstalled) {
-        const installedVer = await getInstalledVersion(join(path, 'SKILL.md'));
-        if (installedVer === VERSION) {
-          console.log(`  ${t}: already at v${VERSION}`);
+        const installedHash = await getInstalledHash(join(path, 'SKILL.md'));
+        if (installedHash === sourceHash) {
+          console.log(`  ${t}: already up to date (v${VERSION})`);
           skipped++;
           continue;
         }
-        console.log(`  ${t}: updating v${installedVer} → v${VERSION}`);
+        console.log(`  ${t}: updating skill content...`);
       } else {
         console.log(`  ${t}: installing...`);
       }
 
       try {
-        await installToPath(path);
+        await installToPath(path, source);
         installed++;
       } catch (err) {
         console.error(`  ${t}: failed — ${(err as Error).message}`);
@@ -226,21 +267,22 @@ export async function skillInstallCommand(tool: string | null, options: { all?: 
     }
   }
 
+  const { source, hash: sourceHash } = await loadSource();
   const alreadyInstalled = await isInstalled(tool, level);
   if (alreadyInstalled) {
-    const installedVer = await getInstalledVersion(join(path, 'SKILL.md'));
-    if (installedVer === VERSION) {
-      console.log(`Skill for ${tool} is already at v${VERSION}.`);
+    const installedHash = await getInstalledHash(join(path, 'SKILL.md'));
+    if (installedHash === sourceHash) {
+      console.log(`Skill for ${tool} is already up to date (v${VERSION}).`);
       return;
     }
-    const ans = await prompt(`Update ${tool} skill from v${installedVer} → v${VERSION}? (Y/n) `);
+    const ans = await prompt(`Update ${tool} skill to the latest content (v${VERSION})? (Y/n) `);
     if (ans.toLowerCase() === 'n') {
       console.log('Cancelled.');
       return;
     }
   }
 
-  await installToPath(path);
+  await installToPath(path, source);
   console.log(`✓ Installed toss skill for ${tool} at ${path}`);
 }
 
@@ -308,6 +350,7 @@ export async function skillUpdateCommand(tool?: string) {
   const toolsToCheck = tool ? [tool] : Object.keys(TOOL_CONFIGS);
   let updated = 0;
   let current = 0;
+  const { source, hash: sourceHash } = await loadSource();
 
   for (const t of toolsToCheck) {
     if (!(t in TOOL_CONFIGS)) {
@@ -322,15 +365,15 @@ export async function skillUpdateCommand(tool?: string) {
       const skillFile = join(path, 'SKILL.md');
       if (!(await fileExists(skillFile))) continue;
 
-      const installedVer = await getInstalledVersion(skillFile);
-      if (installedVer === VERSION) {
+      const installedHash = await getInstalledHash(skillFile);
+      if (installedHash === sourceHash) {
         current++;
         continue;
       }
 
-      console.log(`Updating ${t} (${level}): v${installedVer || '?'} → v${VERSION}`);
+      console.log(`Updating ${t} (${level}) to latest skill content (v${VERSION})`);
       try {
-        await installToPath(path);
+        await installToPath(path, source);
         updated++;
       } catch (err) {
         console.error(`  Failed: ${(err as Error).message}`);
