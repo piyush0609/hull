@@ -1,7 +1,9 @@
 {
-  "scripts": {
-    "postbump": "node scripts/genversion.mjs && git add src/version.ts"
-  },
+  "bumpFiles": [
+    { "filename": "package.json" },
+    { "filename": "package-lock.json" },
+    { "filename": "src/version.ts", "updater": "scripts/version-updater.cjs" }
+  ],
   "types": [
     { "type": "feat", "section": "Features" },
     { "type": "fix", "section": "Bug Fixes" },

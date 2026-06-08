@@ -55,10 +55,10 @@ Each `release:*` passes an explicit `--release-as`, so the bump is intentional a
 never a surprise. `commit-and-tag-version` (invoked via `npx --yes`, no permanent
 dependency) then:
 
-1. bumps `"version"` in `package.json` (+ `package-lock.json`),
-2. runs the `postbump` hook from `.versionrc.json`
-   (`node scripts/genversion.mjs && git add src/version.ts`) so the regenerated
-   SSOT is part of the very same commit,
+1. bumps `"version"` in `package.json` and `package-lock.json`,
+2. rewrites the generated SSOT `src/version.ts` (registered as a `bumpFile` via
+   `scripts/version-updater.cjs`) in the same bump step, so it is committed
+   atomically with `package.json` and never left behind,
 3. updates `CHANGELOG.md` from the conventional commits since the last tag,
 4. creates a release commit and a `vX.Y.Z` git tag.
 
