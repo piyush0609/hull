@@ -353,15 +353,27 @@ async function requireLiveArtifact(artifactId: string): Promise<true | Response>
 // owner token (Bearer) for programmatic/cloud access. Returns true | Response.
 async function requireCommentAccess(request: Request, artifactId: string): Promise<true | Response> {
   const sql = getSQL();
-  const rows = await sql`SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ${artifactId}`;
+  const rows = await sql`SELECT comments_enabled, expires_at, password_epoch, token_hash, password_hash FROM artifacts WHERE id = ${artifactId}`;
   const row = rows[0];
   // A null row also covers a missing/revoked artifact.
   if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
   if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
 
-  // Owner token is a first-class reader/writer (programmatic/cloud access).
+  // Admin OR the artifact's own owner is a first-class reader/writer
+  // (programmatic/cloud access). Multi-tenant: a tenant reads/writes comments on
+  // the artifacts they own with just their token — no grant needed.
   const user = await resolveUser(request);
   if (user?.isAdmin) return true;
+  if (user && row.token_hash && user.tokenHash === row.token_hash) return true;
+
+  // Programmatic collaborative access: the document password, sent out-of-band via
+  // X-Toss-Password (e.g. `toss comments --password-env KEY` — the agent passes the
+  // KEY, never the value). Same salt as the page gate; constant-time compare.
+  const pw = request.headers.get('X-Toss-Password');
+  if (pw && row.password_hash) {
+    const h = await sha256(pw + artifactId);
+    if (constantTimeEqual(h, String(row.password_hash))) return true;
+  }
 
   // Otherwise require the comment grant; the distinct aud breaks the conflation
   // with the plain viewer token and pwd_epoch ties it to the current password.
@@ -836,15 +848,14 @@ export default async function handler(request: Request): Promise<Response> {
           // fail-closed on a no-op re-share that would hide existing comments.
           const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
           const newHash = await sha256(html);
-          const curV = await sql`SELECT a.current_version_id AS vid, av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
-          const curVid = curV[0] ? curV[0].vid : null;
+          const curV = await sql`SELECT av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
           const curHash = curV[0] ? curV[0].chash : null;
           const contentChanged = !curHash || curHash !== newHash;
           if (!contentChanged && !force) {
-            // Count only comments on the CURRENT version — those are the ones a new
-            // version would hide. Archived (older-version) comments are already hidden,
-            // so they must not trip the guard.
-            const cc = await sql`SELECT COUNT(*)::int AS n FROM comment_threads WHERE artifact_id = ${existingId} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL`;
+            // ANY comment on the artifact (current OR archived) blocks an identical
+            // re-share. Re-publishing the same content over a doc that has comment
+            // history must be explicit via --force.
+            const cc = await sql`SELECT COUNT(*)::int AS n FROM comment_threads WHERE artifact_id = ${existingId} AND deleted_at IS NULL`;
             if ((cc[0] ? cc[0].n : 0) > 0) {
               return new Response(JSON.stringify({ error: 'comments_present_no_change', comment_count: cc[0].n, hint: '--force' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
             }

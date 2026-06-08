@@ -1,5 +1,23 @@
+import { readFileSync } from 'node:fs';
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
+
+// Resolve a secret from an env var NAME, falling back to ./.env — so the agent
+// passes only the KEY (e.g. --password-env REVIEW_PW), never the value.
+function readEnvKey(key: string): string | undefined {
+  if (process.env[key]) return process.env[key];
+  try {
+    for (const line of readFileSync('.env', 'utf8').split('\n')) {
+      const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=(.*)$/);
+      if (m && m[1] === key) {
+        let v = m[2].trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        return v;
+      }
+    }
+  } catch { /* no .env present */ }
+  return undefined;
+}
 
 // toss comments <id-or-slug> [on|off]
 //   no state  -> list the share's comments on the latest version (--json for raw output)
@@ -7,7 +25,7 @@ import { TossAPI } from '../lib/api.js';
 export async function commentsCommand(
   idOrSlug: string,
   state: string | undefined,
-  options: { profile?: string; json?: boolean } = {}
+  options: { profile?: string; json?: boolean; passwordEnv?: string } = {}
 ) {
   const config = await loadConfig(options.profile);
   if (!config) {
@@ -34,11 +52,19 @@ export async function commentsCommand(
     }
   }
 
-  // No state -> retrieve comments (programmatic read, owner token).
+  // No state -> retrieve comments (programmatic read).
   if (state === undefined) {
+    let password: string | undefined;
+    if (options.passwordEnv) {
+      password = readEnvKey(options.passwordEnv);
+      if (!password) {
+        console.error(`Error: env key "${options.passwordEnv}" is not set (checked the environment and ./.env).`);
+        process.exit(1);
+      }
+    }
     let data: any;
     try {
-      data = await api.getComments(id);
+      data = await api.getComments(id, { password });
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);

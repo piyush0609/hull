@@ -268,10 +268,31 @@ toss share ./report.html --comments --password
 toss comments <id-or-slug> on
 toss comments <id-or-slug> off
 
-# Read comments programmatically (owner token)
+# Read comments programmatically
 toss comments <id-or-slug>            # human-readable list (latest version)
 toss comments <id-or-slug> --json     # structured JSON: { artifactId, threads[] }
 ```
+
+### Reading comments as an agent (credentials)
+
+Always try the **owner token first** — it's already in `~/.toss/config.json`, never in the
+prompt. It covers every doc the caller owns (and admins read all):
+
+```bash
+toss comments <id-or-slug>            # owner/admin or artifact-owner via the configured token
+```
+
+Only if that 401/403s (a doc you don't own) use the **document password — passed by KEY, never by value**:
+
+```bash
+# the human puts the password in .env once (gitignored):  REVIEW_PW=...
+# the agent passes only the KEY name (safe in a prompt); the CLI reads the value from .env/env:
+toss comments <id-or-slug> --password-env REVIEW_PW
+```
+
+Rules for agents: **never** put a password value in a prompt, in `--password ...`, or in any
+arg (it leaks into transcripts / shell history / `ps`). Pass only the env-var **key**. The
+value lives in `.env`/the environment and is read by the CLI — the agent never sees it.
 
 ### Versioning (latest-only)
 

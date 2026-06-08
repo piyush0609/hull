@@ -41,12 +41,16 @@ export class TossAPI {
     return res.json();
   }
 
-  // Programmatic retrieval (owner token). Returns the latest version's threads.
-  async getComments(id: string): Promise<{ pagePath: string; threads: unknown[]; activityThreads: unknown[] }> {
+  // Programmatic retrieval. Owner/admin or artifact-owner via the token; for a doc
+  // you don't own, pass the document password (sent as X-Toss-Password, never logged
+  // in args — the CLI sources it from an env key).
+  async getComments(id: string, opts: { password?: string } = {}): Promise<{ pagePath: string; threads: unknown[]; activityThreads: unknown[] }> {
     const url = new URL(`/artifacts/${id}/comment-threads`, this.config.endpoint);
     url.searchParams.set('pagePath', 'index.html');
     url.searchParams.set('includeActivity', '1');
-    const res = await safeFetch(url.href, { headers: { Authorization: this.authHeader() } });
+    const headers: Record<string, string> = { Authorization: this.authHeader() };
+    if (opts.password) headers['X-Toss-Password'] = opts.password;
+    const res = await safeFetch(url.href, { headers });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Failed to fetch comments: ${res.status} ${text}`);
