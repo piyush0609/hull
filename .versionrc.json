@@ -1,0 +1,15 @@
+{
+  "scripts": {
+    "postbump": "node scripts/genversion.mjs && git add src/version.ts"
+  },
+  "types": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "test", "hidden": true },
+    { "type": "chore", "hidden": true },
+    { "type": "ci", "hidden": true }
+  ]
+}

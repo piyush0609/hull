@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import { maybeNotifyUpdate } from './lib/update-check.js';
 import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
@@ -372,4 +373,13 @@ legacyToken
   .option('--profile <name>')
   .action(tokenRotateCommand);
 
-program.parse();
+// Best-effort "update available" banner before any command runs — TTY-only,
+// cached, and fail-open, so it never blocks or breaks the command.
+program.hook('preAction', async () => {
+  await maybeNotifyUpdate(VERSION);
+});
+
+program.parseAsync().catch((err) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

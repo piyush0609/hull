@@ -16,7 +16,11 @@
     "cli": "./toss",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "release": "npx --yes commit-and-tag-version",
+    "release:patch": "npx --yes commit-and-tag-version --release-as patch",
+    "release:minor": "npx --yes commit-and-tag-version --release-as minor",
+    "release:major": "npx --yes commit-and-tag-version --release-as major"
   },
   "dependencies": {
     "commander": "^12.0.0"
