@@ -10,3 +10,7 @@ hello.html
 hull
 toss
 dist/
+
+# local spike / scratch — not part of the package
+demo.html
+examples/snapshot-comments/
