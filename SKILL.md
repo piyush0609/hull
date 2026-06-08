@@ -224,18 +224,28 @@ Production (the `default` profile) is untouched as long as every command carries
 ## Share
 
 ```bash
-# Basic share
+# Basic share (random slug, expires in 24h)
 toss share ./index.html --expires 24h
+
+# Permanent link (omit --expires)
+toss share ./index.html
+
+# Stable / static link — fixed slug, URL never changes
+toss share ./report.html --id quarterly-report
+#   → https://<host>/s/quarterly-report
 
 # Password-protected (secure interactive prompt)
 toss share ./report.html --expires 7d --password
 
-# Password via CLI (visible in shell history — not recommended)
-toss share ./report.html --expires 7d --password mysecret
-
 # Use a specific profile
 toss share ./file.html --expires 24h --profile work
 ```
+
+**Stable / static links (`--id`):** `--id <slug>` gives a fixed `/s/<slug>` URL (single-file
+shares). **Re-running `toss share` with the same `--id` replaces the content in place** —
+recipients keep the exact same link. That stable slug is the identity versioning + comments
+track: re-sharing the same id mints a new content **version** (see Comments → Versioning).
+Omit `--expires` for a permanent link.
 
 **Password security:**
 - Use `--password` (no value) for an interactive prompt — characters hidden with `*`.
