@@ -836,11 +836,15 @@ export default async function handler(request: Request): Promise<Response> {
           // fail-closed on a no-op re-share that would hide existing comments.
           const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
           const newHash = await sha256(html);
-          const curV = await sql`SELECT av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
+          const curV = await sql`SELECT a.current_version_id AS vid, av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
+          const curVid = curV[0] ? curV[0].vid : null;
           const curHash = curV[0] ? curV[0].chash : null;
           const contentChanged = !curHash || curHash !== newHash;
           if (!contentChanged && !force) {
-            const cc = await sql`SELECT COUNT(*)::int AS n FROM comment_threads WHERE artifact_id = ${existingId} AND deleted_at IS NULL`;
+            // Count only comments on the CURRENT version — those are the ones a new
+            // version would hide. Archived (older-version) comments are already hidden,
+            // so they must not trip the guard.
+            const cc = await sql`SELECT COUNT(*)::int AS n FROM comment_threads WHERE artifact_id = ${existingId} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL`;
             if ((cc[0] ? cc[0].n : 0) > 0) {
               return new Response(JSON.stringify({ error: 'comments_present_no_change', comment_count: cc[0].n, hint: '--force' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
             }
