@@ -397,7 +397,7 @@ Example:
 toss login https://share.example.com --token <your-token>
 toss ./slides.html
 toss list
-toss revoke <id>
+toss revoke <slug>
 ```
 
 ## Other Commands
