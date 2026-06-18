@@ -151,18 +151,18 @@ program
   .action((...args) => listCommand(getCommandOptions(args, ['profile'])));
 
 program
-  .command('revoke <id>')
+  .command('revoke <slug>')
   .description('Revoke access to a published artifact')
   .option('--profile <name>', 'Use a specific profile')
-  .action((id, ...args) => revokeCommand(id, getCommandOptions(args, ['profile'])));
+  .action((slug, ...args) => revokeCommand(slug, getCommandOptions(args, ['profile'])));
 
 program
-  .command('comments <id> [state]')
+  .command('comments <slug> [state]')
   .description('List a share\'s comments (no state), or enable/disable them (state: on|off)')
   .option('-j, --json', 'Output comments as JSON (list mode)')
   .option('--password-env <key>', 'For a doc you don\'t own: read its password from this env var / .env key (value never in args)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((id, state, ...args) => commentsCommand(id, state, getCommandOptions(args, ['json', 'passwordEnv', 'profile'])));
+  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'passwordEnv', 'profile'])));
 
 program
   .command('info')

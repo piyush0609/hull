@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { getCommandOptions, readRawOption } from '../../src/lib/cli-options.js';
 
 describe('readRawOption', () => {
@@ -32,4 +35,42 @@ describe('getCommandOptions', () => {
     expect(opts.profile).toBe('test');
     expect(opts.backend).toBe('vercel');
   });
+});
+
+// Drives the real CLI through commander to assert user-facing argument names.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+function runCli(args: string[]): { stderr: string; status: number } {
+  try {
+    execFileSync(resolve(REPO_ROOT, 'node_modules/.bin/tsx'), [resolve(REPO_ROOT, 'src/index.ts'), ...args], {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    return { stderr: '', status: 0 };
+  } catch (err) {
+    const e = err as { stderr?: Buffer | string; status?: number };
+    return { stderr: e.stderr?.toString() ?? '', status: e.status ?? 1 };
+  }
+}
+
+describe('revoke argument name (CLI)', () => {
+  // The artifact revoke operates on a slug (see `toss list` / share output), so a
+  // missing positional must read 'slug', not the internal 'id'. Regression for a
+  // user-reported confusing error: `toss revoke` -> "missing required argument 'id'".
+  it('reports the missing positional as "slug", not "id"', () => {
+    const { stderr, status } = runCli(['revoke']);
+    expect(status).toBe(1);
+    expect(stderr).toContain("missing required argument 'slug'");
+    expect(stderr).not.toContain("missing required argument 'id'");
+  }, 20000);
+});
+
+describe('comments argument name (CLI)', () => {
+  // `comments` likewise takes a slug-or-id; the missing positional must read 'slug'.
+  it('reports the missing positional as "slug", not "id"', () => {
+    const { stderr, status } = runCli(['comments']);
+    expect(status).toBe(1);
+    expect(stderr).toContain("missing required argument 'slug'");
+    expect(stderr).not.toContain("missing required argument 'id'");
+  }, 20000);
 });
