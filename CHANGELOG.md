@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.4](https://github.com/piyush0609/toss/compare/v0.2.3...v0.2.4) (2026-06-18)
+
+
+### Bug Fixes
+
+* **list:** show permanent shares as "never" instead of "EXPIRED" ([e10133a](https://github.com/piyush0609/toss/commit/e10133a1fd36666c5a7170bc2237e97ea7ae2c22))
+
+
+### Refactoring
+
+* **share:** drop legacy /a/ link from share output ([528a797](https://github.com/piyush0609/toss/commit/528a797436c34a0a2245b79c9c9b16f421c14573))
+
 ## [0.2.3](https://github.com/piyush0609/toss/compare/v0.2.2...v0.2.3) (2026-06-08)
 
 
