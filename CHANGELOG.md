@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.5](https://github.com/piyush0609/toss/compare/v0.2.4...v0.2.5) (2026-06-18)
+
+
+### Bug Fixes
+
+* **cli:** report missing revoke/comments argument as 'slug' not 'id' ([62140ea](https://github.com/piyush0609/toss/commit/62140ea1b55537810ab746748171d548d1e8b2f2))
+
+
+### Documentation
+
+* **readme:** use <slug> for the revoke example ([1d1d556](https://github.com/piyush0609/toss/commit/1d1d556a0e180d83522da725e35812b08dc80eb8))
+
 ## [0.2.4](https://github.com/piyush0609/toss/compare/v0.2.3...v0.2.4) (2026-06-18)
 
 
