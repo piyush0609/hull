@@ -7,7 +7,10 @@ function fmtSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-function fmtExpiry(msLeft: number): string {
+// expiresAt is unix seconds; 0 (or falsy) means permanent — no expiry.
+function fmtExpiry(expiresAt: number): string {
+  if (!expiresAt) return 'never';
+  const msLeft = expiresAt * 1000 - Date.now();
   if (msLeft <= 0) return 'EXPIRED';
   if (msLeft < 60000) return '<1m left';
   if (msLeft < 3600000) return `${Math.floor(msLeft / 60000)}m left`;
@@ -42,7 +45,7 @@ export async function listCommand(options: { profile?: string } = {}) {
     const slug = (a.slug || '-').slice(0, 20).padEnd(20);
     const name = a.name.slice(0, 17).padEnd(17);
     const size = fmtSize(Number(a.size_bytes)).padStart(7).padEnd(8);
-    const expiry = fmtExpiry(Number(a.expires_at) * 1000 - Date.now());
+    const expiry = fmtExpiry(Number(a.expires_at));
     console.log(`${id} ${slug} ${name} ${size} ${expiry}`);
   }
 }

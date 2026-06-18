@@ -38,6 +38,28 @@ describe('CLI Commands', () => {
     expect(consoleErrorSpy).toHaveBeenCalledWith('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
   });
 
+  it('list shows permanent shares (expires_at 0) as "never", not EXPIRED', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue({
+      endpoint: 'https://example.com',
+      token: 'owner-token',
+      subdomain: 'team',
+      role: 'owner',
+    });
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        { id: 'perm-1', slug: 'forever', name: 'doc.html', size_bytes: 100, created_at: 1, expires_at: 0 },
+      ],
+    } as Response);
+
+    await listCommand();
+
+    const row = consoleLogSpy.mock.calls.map((c) => String(c[0])).find((r) => r.includes('forever'));
+    expect(row).toBeDefined();
+    expect(row).toContain('never');
+    expect(row).not.toContain('EXPIRED');
+  });
+
   it('revoke should exit when no toss is deployed', async () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
     await expect(revokeCommand('abc123')).rejects.toThrow('process.exit(1)');
