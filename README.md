@@ -22,7 +22,7 @@ npm run build
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
+curl -fsSL https://tossme.xyz/install.sh | sh
 ```
 
 If you are testing locally from source instead of installing globally, use `./toss ...` after `npm run build`.

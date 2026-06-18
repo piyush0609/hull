@@ -1,7 +1,7 @@
 #!/bin/sh
 # toss installer — prefers source install (88KB) when Node.js is available.
 # Falls back to 57MB standalone binary only if Node.js is missing.
-# Usage: curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
+# Usage: curl -fsSL https://tossme.xyz/install.sh | sh
 
 set -e
 

@@ -60,7 +60,7 @@ command -v toss && toss --version
 
 - **Not installed** → install it, then continue:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/piyush0609/toss/main/install.sh | sh
+  curl -fsSL https://tossme.xyz/install.sh | sh
   ```
   Verifies Node.js 18+ and falls back to standalone binary if Node is missing.
 - **Installed** → continue.
