@@ -204,7 +204,6 @@ export async function shareCommand(file: string, options: { expires?: string; id
     console.log(JSON.stringify(result));
   } else {
     console.log(`\nLink:     ${result.url}${result.updated ? '  (updated in place)' : ''}`);
-    if (result.legacyUrl) console.log(`Legacy:   ${result.legacyUrl}`);
     if (password) console.log(`Password: ${password}`);
     console.log(`Expires:  ${expires === 0 ? 'never (permanent)' : options.expires}`);
     if (options.clipboard) console.log('Copied to clipboard.');
