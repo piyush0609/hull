@@ -1,6 +1,6 @@
 {
   "name": "toss-cli",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Share HTML artifacts with access-controlled links",
   "type": "module",
   "bin": {

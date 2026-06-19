@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.6](https://github.com/piyush0609/toss/compare/v0.2.5...v0.2.6) (2026-06-19)
+
+
+### Bug Fixes
+
+* clean --json output for folder shares + correct --id docs ([74e2d24](https://github.com/piyush0609/toss/commit/74e2d2491d3edbda6589e3e6bf74b34c452def95))
+* **serve:** revalidate slug assets instead of caching them immutable ([1dbf1fa](https://github.com/piyush0609/toss/commit/1dbf1fa5d54684c8b553354b5bf38c6489c87ae2))
+
+
+### Documentation
+
+* point the install command at tossme.xyz ([c2fd542](https://github.com/piyush0609/toss/commit/c2fd5424d09ddcb1113b0f51ca2aba44041d545b))
+
 ## [0.2.5](https://github.com/piyush0609/toss/compare/v0.2.4...v0.2.5) (2026-06-18)
 
 
