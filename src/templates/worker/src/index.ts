@@ -1535,7 +1535,11 @@ async function serveArtifact(
       { status: 200, headers }
     );
   } else {
-    headers['Cache-Control'] = 'public, max-age=86400, immutable';
+    // A slug share is mutable: `toss share --id <slug>` re-publishes new bytes
+    // under the SAME filenames. `immutable` (max-age=86400) told browsers/CDNs to
+    // never revalidate, so a re-share stayed invisible for up to 24h. Revalidate
+    // instead — same freshness contract the HTML entry above already uses.
+    headers['Cache-Control'] = 'public, max-age=0, must-revalidate';
     return new Response(obj, { status: 200, headers });
   }
 }

@@ -155,6 +155,22 @@ describe('Worker Edge Cases', () => {
       expect(res.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'");
       expect(res.headers.get('Cache-Control')).toBe('private, no-store, max-age=0');
     });
+
+    it('should serve non-HTML assets as revalidatable, not immutable', async () => {
+      // A slug share is mutable (`toss share --id` re-publishes the same filenames),
+      // so assets must revalidate — `immutable` froze stale bytes for up to 24h.
+      await kv.put('artifacts/abc123/files/app.js', 'console.log(1)');
+
+      const now = Math.floor(Date.now() / 1000);
+      const token = await signJWT({ sub: 'abc123', iat: now, exp: now + 3600 }, SECRET);
+
+      const req = new Request(`http://localhost/a/abc123/app.js?t=${token}`);
+      const res = await worker.fetch(req, createEnv(kv, db));
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('Cache-Control')).toBe('public, max-age=0, must-revalidate');
+      expect(res.headers.get('Cache-Control')).not.toContain('immutable');
+    });
   });
 
   describe('Delete', () => {
