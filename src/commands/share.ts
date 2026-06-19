@@ -150,7 +150,10 @@ export async function shareCommand(file: string, options: { expires?: string; id
     // Upload remaining files
     const otherFiles = allFiles.filter(f => f !== entryFile);
     if (otherFiles.length > 0) {
-      console.log(`Uploading ${otherFiles.length} additional files...`);
+      // Progress → stderr, so `--json` keeps stdout as a single clean JSON object
+      // (piping `toss share <folder> --json` into a parser would otherwise choke
+      // on this line).
+      console.error(`Uploading ${otherFiles.length} additional files...`);
       for (const f of otherFiles) {
         const relPath = relative(file, f).replace(/\\/g, '/');
         const data = await readFile(f);
