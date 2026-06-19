@@ -1572,6 +1572,11 @@ export default {
         const name = url.searchParams.get('name') || 'untitled.html';
         const expiresParam = url.searchParams.get('expires');
         const requestedId = url.searchParams.get('id');
+        // For a folder share the request body is only the entry index.html, but the
+        // artifact represents the whole folder. The client sends the summed folder size
+        // as total_bytes so `toss list` reports the real footprint, not the index size.
+        // Absent/invalid (single-file shares) → fall back to the uploaded body length.
+        const totalBytesParam = url.searchParams.get('total_bytes');
 
         // expires=0 or missing → permanent. Otherwise capped at 90 days.
         let expiresSeconds = 0;
@@ -1595,6 +1600,8 @@ export default {
         }
 
         const html = await request.text();
+        const sizeBytes = totalBytesParam && /^\d+$/.test(totalBytesParam)
+          ? Number(totalBytesParam) : html.length;
         const now = Math.floor(Date.now() / 1000);
 
         // Replace-in-place when a stable slug already exists and is owned by the caller.
@@ -1618,7 +1625,7 @@ export default {
             await env.TOSS_KV.put(`artifacts/${existingId}/files/index.html`, html);
             await env.TOSS_DB.prepare(
               'UPDATE artifacts SET name = ?, size_bytes = ?, expires_at = ?, password_hash = ? WHERE id = ?'
-            ).bind(name, html.length, newExpiresAt, newPasswordHash, existingId).run();
+            ).bind(name, sizeBytes, newExpiresAt, newPasswordHash, existingId).run();
             const shortUrl = `${url.origin}/s/${requestedId}`;
             return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
               headers: { 'Content-Type': 'application/json' },
@@ -1655,7 +1662,7 @@ export default {
         await env.TOSS_DB.prepare(
           'INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
         )
-          .bind(id, slug, name, html.length, now, expiresAt, auth.tokenHash, passwordHash, commentsEnabled)
+          .bind(id, slug, name, sizeBytes, now, expiresAt, auth.tokenHash, passwordHash, commentsEnabled)
           .run();
 
         // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs

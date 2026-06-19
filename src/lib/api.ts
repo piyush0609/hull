@@ -15,7 +15,7 @@ export class TossAPI {
     return `Bearer ${this.config.token || this.config.ownerToken || ''}`;
   }
 
-  async upload(html: Buffer, name: string, expiresSeconds: number, password?: string, id?: string, comments?: boolean, force?: boolean): Promise<{ id: string; slug: string; url: string; legacyUrl: string; updated?: boolean }> {
+  async upload(html: Buffer, name: string, expiresSeconds: number, password?: string, id?: string, comments?: boolean, force?: boolean, totalBytes?: number): Promise<{ id: string; slug: string; url: string; legacyUrl: string; updated?: boolean }> {
     const url = new URL('/artifacts', this.config.endpoint);
     // expiresSeconds === 0 signals "never expires"
     url.searchParams.set('expires', String(expiresSeconds));
@@ -24,6 +24,9 @@ export class TossAPI {
     if (id) url.searchParams.set('id', id);
     if (comments) url.searchParams.set('comments', '1');
     if (force) url.searchParams.set('force', '1');
+    // Folder shares: the body is only the entry HTML, so tell the server the whole
+    // folder's byte total — otherwise `toss list` would report just the index size.
+    if (totalBytes != null) url.searchParams.set('total_bytes', String(totalBytes));
 
     const res = await safeFetch(url.href, {
       method: 'POST',

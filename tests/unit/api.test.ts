@@ -102,6 +102,20 @@ describe('TossAPI', () => {
     expect(calledUrl).not.toContain('comments');
   });
 
+  it('should set ?total_bytes when a folder total is passed (so list shows the whole folder)', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+    await api.upload(Buffer.from('<html>x</html>'), 'folder', 3600, undefined, undefined, undefined, undefined, 182400);
+    const calledUrl = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as string;
+    expect(calledUrl).toContain('total_bytes=182400');
+  });
+
+  it('should NOT set total_bytes for a single-file share (server falls back to body length)', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+    await api.upload(Buffer.from('<html>x</html>'), 'x.html', 3600);
+    const calledUrl = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('total_bytes');
+  });
+
   it('setComments PATCHes the per-share toggle route', async () => {
     global.fetch = vi.fn().mockResolvedValue({ ok: true } as Response);
     await api.setComments('abc123', true);

@@ -806,6 +806,11 @@ export default async function handler(request: Request): Promise<Response> {
       const name = url.searchParams.get('name') || 'untitled.html';
       const expiresParam = url.searchParams.get('expires');
       const requestedId = url.searchParams.get('id');
+      // For a folder share the request body is only the entry index.html, but the
+      // artifact represents the whole folder. The client sends the summed folder size
+      // as total_bytes so `toss list` reports the real footprint, not the index size.
+      // Absent/invalid (single-file shares) → fall back to the uploaded body length.
+      const totalBytesParam = url.searchParams.get('total_bytes');
 
       // expires=0 or missing → permanent. Otherwise capped at 90 days.
       let expiresSeconds = 0;
@@ -829,6 +834,8 @@ export default async function handler(request: Request): Promise<Response> {
       }
 
       const html = await request.text();
+      const sizeBytes = totalBytesParam && /^\d+$/.test(totalBytesParam)
+        ? Number(totalBytesParam) : html.length;
       const sql = getSQL();
       const now = Math.floor(Date.now() / 1000);
 
@@ -880,7 +887,7 @@ export default async function handler(request: Request): Promise<Response> {
             if (p !== `artifacts/${existingId}/files/index.html`) await blobDelete(p);
           }
           await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
-          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${html.length}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
+          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${sizeBytes}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           if (contentChanged || force) {
             await mintVersion(existingId, newHash, now);
           }
@@ -915,7 +922,7 @@ export default async function handler(request: Request): Promise<Response> {
       await blobPut(`artifacts/${id}/files/index.html`, html, 'text/html');
 
       const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
-      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (${id}, ${slug}, ${name}, ${html.length}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash}, ${commentsEnabled})`;
+      await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (${id}, ${slug}, ${name}, ${sizeBytes}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash}, ${commentsEnabled})`;
       await mintVersion(id, await sha256(html), now);
 
       // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs

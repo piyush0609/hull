@@ -135,7 +135,7 @@ export async function shareCommand(file: string, options: { expires?: string; id
     const entryName = basename(file);
     const entryHtml = await readFile(entryFile);
     try {
-      result = await api.upload(entryHtml, entryName, expires, password, options.id, options.comments, options.force);
+      result = await api.upload(entryHtml, entryName, expires, password, options.id, options.comments, options.force, totalSize);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('slug_taken')) {
