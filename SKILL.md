@@ -241,8 +241,8 @@ toss share ./report.html --expires 7d --password
 toss share ./file.html --expires 24h --profile work
 ```
 
-**Stable / static links (`--id`):** `--id <slug>` gives a fixed `/s/<slug>` URL (single-file
-shares). **Re-running `toss share` with the same `--id` replaces the content in place** —
+**Stable / static links (`--id`):** `--id <slug>` gives a fixed `/s/<slug>` URL (works for
+single files and folders). **Re-running `toss share` with the same `--id` replaces the content in place** —
 recipients keep the exact same link. That stable slug is the identity versioning + comments
 track: re-sharing the same id mints a new content **version** (see Comments → Versioning).
 Omit `--expires` for a permanent link.

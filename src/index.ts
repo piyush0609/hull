@@ -93,7 +93,7 @@ program
   // No default for --expires: omitted means permanent (matches `toss publish` /
   // `toss share` semantics). The CLI must NOT silently shorten links to 24h.
   .option('-e, --expires <duration>', 'Link lifetime: 1h, 24h, 7d, 30d (omit for permanent)')
-  .option('--id <slug>', 'Stable URL slug — re-running with same id replaces the content (single file only)')
+  .option('--id <slug>', 'Stable URL slug — re-running with same id replaces the content (files or folders)')
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
@@ -124,7 +124,7 @@ program
   .alias('share')
   .description('Publish an HTML file or folder')
   .option('-e, --expires <duration>', 'Link lifetime: 1h, 24h, 7d, 30d (omit for permanent)')
-  .option('--id <slug>', 'Stable URL slug — re-running with same id replaces the content (single file only)')
+  .option('--id <slug>', 'Stable URL slug — re-running with same id replaces the content (files or folders)')
   .option('-c, --clipboard', 'Copy link to clipboard')
   .option('-j, --json', 'Output JSON')
   .option('-p, --password [password]', 'Password-protect this publish (omit value for secure prompt)')
