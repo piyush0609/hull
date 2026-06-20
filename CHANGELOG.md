@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.2.7](https://github.com/piyush0609/toss/compare/v0.2.6...v0.2.7) (2026-06-20)
+
+
+### Bug Fixes
+
+* **list:** report whole-folder size, not just the entry HTML ([4e948cb](https://github.com/piyush0609/toss/commit/4e948cbefc61089a8616f47dae254be1e538470c))
+
 ## [0.2.6](https://github.com/piyush0609/toss/compare/v0.2.5...v0.2.6) (2026-06-19)
 
 
