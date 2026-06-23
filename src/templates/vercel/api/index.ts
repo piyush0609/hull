@@ -772,6 +772,68 @@ async function serveArtifact(
   }
 }
 
+// --- Default instance landing page (served at /). Static, domain-aware, no instance data. ---
+function instancePage(origin: string, multiTenant: boolean): string {
+  const cta = multiTenant
+    ? `<div class="cmd"><span class="p">$</span> toss login ${origin} --token &lt;token&gt;</div>
+    <p class="sub2">Need a token? Ask whoever runs this instance.</p>`
+    : '';
+  return `<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>toss</title>
+<style>
+  :root{--ink:#0b0e14;--edge:#232a3a;--fg:#f3f5f7;--fg2:#c8cfda;--muted:#8b93a1;--teal:#1d9e75;--tealb:#5dcaa5;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  *{box-sizing:border-box}html,body{margin:0;height:100%}
+  body{background:var(--ink);color:var(--fg);font-family:var(--sans);min-height:100vh;display:grid;place-items:center;overflow:hidden;position:relative}
+  .aurora{position:fixed;inset:-25%;z-index:0;pointer-events:none;filter:blur(46px);opacity:.9;background:radial-gradient(38% 38% at 32% 30%,rgba(29,158,117,.30),transparent 62%),radial-gradient(34% 34% at 70% 62%,rgba(46,120,200,.20),transparent 62%),radial-gradient(30% 30% at 55% 48%,rgba(93,202,165,.14),transparent 60%);animation:drift 17s ease-in-out infinite alternate}
+  @keyframes drift{from{transform:translate(-4%,-3%) scale(1)}to{transform:translate(5%,4%) scale(1.16)}}
+  .grid{position:fixed;inset:-80px;z-index:0;pointer-events:none;background-image:radial-gradient(circle,rgba(93,202,165,.11) 1.4px,transparent 1.8px);background-size:44px 44px;-webkit-mask:radial-gradient(circle at 50% 42%,#000 28%,transparent 72%);mask:radial-gradient(circle at 50% 42%,#000 28%,transparent 72%);animation:pan 44s linear infinite}
+  @keyframes pan{to{background-position:440px 320px}}
+  .card{position:relative;z-index:1;max-width:460px;padding:40px 28px;text-align:center;animation:rise .9s cubic-bezier(.2,.7,.2,1) both}
+  @keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+  .tile{width:88px;height:88px;border-radius:22px;background:#0f131c;display:inline-flex;align-items:center;justify-content:center;margin-bottom:24px;box-shadow:0 0 0 1px var(--edge),0 22px 60px rgba(0,0,0,.5);animation:float 5.5s ease-in-out infinite;position:relative}
+  .tile::after{content:"";position:absolute;inset:-2px;border-radius:24px;box-shadow:0 0 36px 6px rgba(29,158,117,.35);animation:pulse 3.4s ease-in-out infinite;z-index:-1}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  @keyframes pulse{0%,100%{opacity:.45}50%{opacity:.9}}
+  .arc{stroke-dasharray:60;stroke-dashoffset:60;animation:draw 2.6s ease-in-out infinite}
+  @keyframes draw{0%{stroke-dashoffset:60}45%{stroke-dashoffset:0}80%{stroke-dashoffset:0}100%{stroke-dashoffset:-60}}
+  .win{animation:land 2.6s ease-in-out infinite;transform-box:fill-box;transform-origin:center}
+  @keyframes land{0%,70%{transform:scale(1)}84%{transform:scale(1.09)}94%,100%{transform:scale(1)}}
+  .pill{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--fg2);background:rgba(20,25,37,.7);border:1px solid var(--edge);border-radius:999px;padding:6px 14px;margin-bottom:20px}
+  .pill .d{width:7px;height:7px;border-radius:50%;background:var(--tealb);box-shadow:0 0 10px 1px rgba(93,202,165,.8);animation:blink 2.2s ease-in-out infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+  h1{font-size:34px;font-weight:600;letter-spacing:-.6px;line-height:1.12;margin:0;background:linear-gradient(100deg,#fff 10%,var(--tealb) 50%,#fff 90%);background-size:220% auto;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 7s linear infinite}
+  @keyframes shine{to{background-position:220% center}}
+  .lead{font-size:16.5px;color:var(--fg2);margin:14px 0 0;line-height:1.6}
+  .hint{font-family:var(--mono);font-size:13px;color:var(--muted);margin-top:24px}
+  .cmd{display:inline-flex;align-items:center;gap:9px;background:rgba(15,19,28,.85);border:1px solid var(--edge);border-radius:10px;padding:10px 14px;margin-top:14px;font-family:var(--mono);font-size:12.5px;color:#cdd3dd}
+  .cmd .p{color:var(--tealb)}
+  .sub2{font-size:13px;color:var(--muted);margin:10px 0 0}
+  .more{display:inline-block;margin-top:26px;font-size:14.5px;color:var(--tealb);text-decoration:none;position:relative}
+  .more::after{content:"";position:absolute;left:0;bottom:-3px;width:100%;height:1px;background:var(--tealb);transform:scaleX(0);transform-origin:left;transition:transform .35s ease}
+  .more:hover::after{transform:scaleX(1)}
+  footer{position:fixed;bottom:20px;left:0;right:0;text-align:center;z-index:1;color:#5b6470;font-size:12.5px;font-family:var(--mono)}
+</style></head>
+<body>
+  <div class="aurora"></div><div class="grid"></div>
+  <div class="card">
+    <span class="tile"><svg width="52" height="52" viewBox="0 0 48 48" aria-hidden="true">
+      <path class="arc" d="M8.5 38.5 C 14 29, 19 25, 23.5 22.6" fill="none" stroke="#5dcaa5" stroke-width="2.4" stroke-linecap="round"/>
+      <circle cx="8.5" cy="38.5" r="2.3" fill="#5dcaa5" opacity="0.6"/>
+      <g class="win"><g transform="rotate(-14 31 23)"><rect x="20.5" y="10.5" width="22" height="26" rx="4" fill="#fff"/><circle cx="25" cy="15.2" r="1" fill="#aab2bd"/><circle cx="28.2" cy="15.2" r="1" fill="#aab2bd"/><circle cx="31.4" cy="15.2" r="1" fill="#aab2bd"/><rect x="24.5" y="20.8" width="14" height="4" rx="2" fill="#1d9e75"/><rect x="24.5" y="28" width="10" height="2.8" rx="1.4" fill="#cdd3dd"/></g></g>
+      <circle r="2.6" fill="#5dcaa5"><animateMotion dur="2.6s" repeatCount="indefinite" calcMode="spline" keyPoints="0;1" keyTimes="0;1" keySplines="0.4 0 0.2 1" path="M8.5 38.5 C 14 29, 19 25, 23.5 22.6"/><animate attributeName="opacity" dur="2.6s" repeatCount="indefinite" values="0;1;1;0" keyTimes="0;0.15;0.85;1"/></circle>
+    </svg></span>
+    <div><span class="pill"><span class="d"></span>self-hosted instance</span></div>
+    <h1>This is a toss instance</h1>
+    <p class="lead">Publish HTML files and folders as shareable links — self-hosted, on your own domain.</p>
+    <div class="hint">shares live at /s/&lt;slug&gt; · publishing needs a token</div>
+    ${cta}
+    <div><a class="more" href="https://tossme.xyz">What is toss? →</a></div>
+  </div>
+  <footer>powered by toss</footer>
+</body></html>`;
+}
+
 // --- Main handler ---
 
 export default async function handler(request: Request): Promise<Response> {
@@ -1424,34 +1486,11 @@ export default async function handler(request: Request): Promise<Response> {
       return serveArtifact(meta, filePath, request, { artifactBasePath: `/a/${id}/` });
     }
 
-    // ===== Root (/)
+    // ===== Root (/) — branded splash; no instance data leaked. (/health is the machine endpoint.)
     if (url.pathname === '/' || url.pathname === '') {
-      const isMulti = MULTI_TENANT;
-      let artifactCount = 0;
-      try {
-        const sql = getSQL();
-        const countRows = await sql`SELECT COUNT(*)::int as c FROM artifacts`;
-        artifactCount = countRows[0]?.c || 0;
-      } catch {}
-
-      let userCount = 0;
-      if (isMulti) {
-        try {
-          const userRows = await sql`SELECT COUNT(*)::int as c FROM users`;
-          userCount = userRows[0]?.c || 0;
-        } catch {}
-      }
-
-      return new Response(JSON.stringify({
-        ok: true,
-        backend: 'vercel',
-        mode: isMulti ? 'multi-tenant' : 'single-user',
-        artifacts: artifactCount,
-        users: isMulti ? userCount : undefined,
-        version: '0.1.0',
-      }), {
+      return new Response(instancePage(url.origin, MULTI_TENANT), {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' },
       });
     }
 
