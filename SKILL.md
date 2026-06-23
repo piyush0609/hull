@@ -286,6 +286,8 @@ toss comments <id-or-slug> off
 # Read comments programmatically
 toss comments <id-or-slug>            # human-readable list (latest version)
 toss comments <id-or-slug> --json     # structured JSON: { artifactId, threads[] }
+toss versions <id-or-slug>            # list versions: seq, date, comment count, current
+toss comments <id-or-slug> --seq 2    # comments on a previous version (seq from `toss versions`)
 ```
 
 ### Reading comments as an agent (credentials)
@@ -309,11 +311,13 @@ Rules for agents: **never** put a password value in a prompt, in `--password ...
 arg (it leaks into transcripts / shell history / `ps`). Pass only the env-var **key**. The
 value lives in `.env`/the environment and is read by the CLI — the agent never sees it.
 
-### Versioning (latest-only)
+### Versioning (per version)
 
 Each comment is tied to the document version it was made on. Re-sharing the same
 slug with **changed** content mints a new version, and only the **latest** version's
-comments are shown (older ones are retained, not shown by default).
+comments are shown by default (older ones are retained). To explore history, run
+`toss versions <id-or-slug>` to list versions (seq, date, comment count, current),
+then `toss comments <id-or-slug> --seq <n>` to read a previous version's comments.
 
 Re-sharing **unchanged** content when comments exist is **blocked** to avoid silently
 hiding them:
@@ -408,6 +412,8 @@ toss list --profile default        # admin sees all
 | `toss share <file> --password` | Share with secure password prompt |
 | `toss list` | List artifacts with size and expiry |
 | `toss revoke <slug>` | Delete an artifact |
+| `toss versions <slug>` | List an artifact's versions (seq, date, comment count) |
+| `toss comments <slug> --seq <n>` | Read comments on a previous version |
 | `toss info` | Show endpoint, backend, count |
 | `toss destroy` | Delete all infrastructure and local config |
 | `toss doctor` | Check prerequisites (read-only) |

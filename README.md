@@ -98,6 +98,7 @@ Available flags:
 ```bash
 toss list
 toss revoke <id-or-slug>
+toss versions <id-or-slug>            # list versions; then: toss comments <id-or-slug> --seq <n>
 toss info
 toss whoami
 toss profile list
