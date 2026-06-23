@@ -8,6 +8,8 @@ import { membersListCommand } from '../../src/commands/members.js';
 import { cleanupCommand } from '../../src/commands/cleanup.js';
 import { infoCommand } from '../../src/commands/info.js';
 import { whoamiCommand } from '../../src/commands/whoami.js';
+import { commentsCommand } from '../../src/commands/comments.js';
+import { versionsCommand } from '../../src/commands/versions.js';
 import * as config from '../../src/lib/config.js';
 
 describe('CLI Commands', () => {
@@ -221,5 +223,80 @@ describe('CLI Commands', () => {
     await cleanupCommand({ yes: true });
 
     expect(consoleLogSpy).toHaveBeenCalledWith('No expired artifacts found.');
+  });
+});
+
+describe('versions + comments --version', () => {
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+      throw new Error(`process.exit(${code})`);
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Hex, no dash, no g-z letters => the command skips slug→id resolution (no list() call).
+  const HEXID = 'abc12345';
+  const ownerCfg = { endpoint: 'https://example.com', token: 'owner-token', subdomain: 'team', role: 'owner' } as any;
+
+  it('versions exits when no toss is deployed', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(null);
+    await expect(versionsCommand(HEXID)).rejects.toThrow('process.exit(1)');
+  });
+
+  it('versions lists seq, count, and the current marker, hitting /versions', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ artifactId: HEXID, versions: [
+        { seq: 2, content_hash: 'a1b2c3d4ee', created_at: 1700000000, comment_count: 3, is_current: true },
+        { seq: 1, content_hash: '0011223344', created_at: 1699000000, comment_count: 1, is_current: false },
+      ] }),
+    } as Response);
+    await versionsCommand(HEXID, {});
+    const out = consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('SEQ');
+    expect(out).toContain('a1b2c3d4');
+    expect(out).toMatch(/\(current\)/);
+    expect(String((global.fetch as any).mock.calls[0][0])).toContain(`/artifacts/${HEXID}/versions`);
+  });
+
+  it('versions --json emits structured data', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ artifactId: HEXID, versions: [{ seq: 1, content_hash: 'x', created_at: 1, comment_count: 0, is_current: true }] }),
+    } as Response);
+    await versionsCommand(HEXID, { json: true });
+    const parsed = JSON.parse(consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n'));
+    expect(parsed.versions[0].seq).toBe(1);
+    expect(parsed.versions[0].is_current).toBe(true);
+  });
+
+  it('comments --version pins the read to that version seq', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ version: 2, threads: [], activityThreads: [] }),
+    } as Response);
+    await commentsCommand(HEXID, undefined, { seq: '2' });
+    expect(String((global.fetch as any).mock.calls[0][0])).toContain('version=2');
+    const out = consoleLogSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain(`No comments on ${HEXID} version 2.`);
+  });
+
+  it('comments rejects a non-integer --version before calling the API', async () => {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
+    global.fetch = vi.fn();
+    await expect(commentsCommand(HEXID, undefined, { seq: 'abc' })).rejects.toThrow('process.exit(1)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('--seq must be a positive integer'));
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });

@@ -351,12 +351,15 @@ async function requireLiveArtifact(artifactId: string): Promise<true | Response>
 // either a valid comment grant (a distinct aud:"comment" token issued at serve
 // time — the plain viewer/legacy token has no aud and is rejected here) OR the
 // owner token (Bearer) for programmatic/cloud access. Returns true | Response.
-async function requireCommentAccess(request: Request, artifactId: string): Promise<true | Response> {
+async function requireCommentAccess(request: Request, artifactId: string, opts: { requireEnabled?: boolean } = {}): Promise<true | Response> {
   const sql = getSQL();
   const rows = await sql`SELECT comments_enabled, expires_at, password_epoch, token_hash, password_hash FROM artifacts WHERE id = ${artifactId}`;
   const row = rows[0];
   // A null row also covers a missing/revoked artifact.
-  if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
+  if (!row) return new Response('Not found', { status: 404 });
+  // Version listing reads artifact metadata (not comment bodies), so it stays
+  // available when comments are toggled off; callers pass requireEnabled:false.
+  if (opts.requireEnabled !== false && !row.comments_enabled) return new Response('Not found', { status: 404 });
   if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
 
   // Admin OR the artifact's own owner is a first-class reader/writer
@@ -389,6 +392,24 @@ async function requireCommentAccess(request: Request, artifactId: string): Promi
   } catch {
     return new Response('Invalid comment grant', { status: 401 });
   }
+}
+
+// Shape comment rows into the API response (threads with nested messages, token
+// hashes stripped). Used by both the latest-version and the ?version=<seq> reads.
+function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
+  const grouped = new Map();
+  for (const row of messageRows) {
+    const items = grouped.get(row.thread_id) || [];
+    const out = { ...row, can_edit: !row.deleted_at && row.thread_status !== 'resolved', can_delete: !row.deleted_at };
+    delete out.author_token_hash;
+    items.push(out);
+    grouped.set(row.thread_id, items);
+  }
+  return threadRows.map((thread) => {
+    const out = { ...thread, anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null, can_delete: true, can_resolve: true, messages: grouped.get(thread.id) || [] };
+    delete out.created_by_token_hash;
+    return out;
+  });
 }
 
 type CommentScope = 'artifact' | 'element' | 'selection';
@@ -1112,6 +1133,25 @@ export default async function handler(request: Request): Promise<Response> {
       return authJson({ id, comments_enabled: enabled });
     }
 
+    const versionsMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/versions$/);
+    if (versionsMatch && request.method === 'GET') {
+      const artifactId = versionsMatch[1];
+      // Listing versions is metadata about the artifact, so it stays available
+      // even when comments are toggled off (counts simply read 0).
+      const access = await requireCommentAccess(request, artifactId, { requireEnabled: false });
+      if (access instanceof Response) return access;
+      const sql = getSQL();
+      const rows = await sql`SELECT av.seq, av.content_hash, av.created_at, (SELECT COUNT(*) FROM comment_threads ct WHERE ct.version_id = av.id AND ct.deleted_at IS NULL) AS comment_count, (av.id = a.current_version_id) AS is_current FROM artifact_versions av JOIN artifacts a ON a.id = av.artifact_id WHERE av.artifact_id = ${artifactId} ORDER BY av.seq DESC`;
+      const versions = rows.map((r: any) => ({
+        seq: Number(r.seq),
+        content_hash: r.content_hash,
+        created_at: Number(r.created_at),
+        comment_count: Number(r.comment_count),
+        is_current: r.is_current === true || r.is_current === 1 || r.is_current === 't',
+      }));
+      return authJson({ artifactId, versions });
+    }
+
     const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
     if (commentListMatch && request.method === 'GET') {
       const artifactId = commentListMatch[1];
@@ -1122,6 +1162,27 @@ export default async function handler(request: Request): Promise<Response> {
       const includeActivity = url.searchParams.get('includeActivity') === '1';
 
       const sql = getSQL();
+
+      // Explore a specific version: ?version=<seq>. Returns the whole version's
+      // threads across every page (page_path per thread), matched strictly by
+      // version_id (no legacy-NULL fallback). Omitted => latest-only, below.
+      const versionParam = url.searchParams.get('version');
+      if (versionParam !== null) {
+        const seq = Number(versionParam);
+        if (!Number.isInteger(seq) || seq < 1) return new Response('version must be a positive integer', { status: 400 });
+        const vrow = await sql`SELECT id FROM artifact_versions WHERE artifact_id = ${artifactId} AND seq = ${seq}`;
+        if (!vrow[0]) {
+          const maxRow = await sql`SELECT MAX(seq) AS max FROM artifact_versions WHERE artifact_id = ${artifactId}`;
+          const max = maxRow[0] && maxRow[0].max ? Number(maxRow[0].max) : 0;
+          return new Response(JSON.stringify({ error: 'version_not_found', seq, hint: max ? `this share has versions 1-${max}` : 'this share has no versions yet' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        }
+        const vid = vrow[0].id;
+        const vThreads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${vid} AND deleted_at IS NULL ORDER BY created_at DESC`;
+        const vMessages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.version_id = ${vid} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+        const vHydrated = hydrateCommentThreads(vThreads, vMessages);
+        return authJson({ version: seq, versionId: vid, viewer: { authenticated: true, label: null }, threads: vHydrated, activityThreads: vHydrated });
+      }
+
       // Latest-only: filter to the artifact's current version. NULL current
       // (legacy artifact, no version minted yet) => show all (no version filter).
       const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;

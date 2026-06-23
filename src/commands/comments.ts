@@ -25,7 +25,7 @@ function readEnvKey(key: string): string | undefined {
 export async function commentsCommand(
   idOrSlug: string,
   state: string | undefined,
-  options: { profile?: string; json?: boolean; passwordEnv?: string } = {}
+  options: { profile?: string; json?: boolean; passwordEnv?: string; seq?: string } = {}
 ) {
   const config = await loadConfig(options.profile);
   if (!config) {
@@ -62,23 +62,31 @@ export async function commentsCommand(
         process.exit(1);
       }
     }
+    let version: number | undefined;
+    if (options.seq !== undefined) {
+      version = Number(options.seq);
+      if (!Number.isInteger(version) || version < 1) {
+        console.error('Error: --seq must be a positive integer.');
+        process.exit(1);
+      }
+    }
     let data: any;
     try {
-      data = await api.getComments(id, { password });
+      data = await api.getComments(id, { password, version });
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
     const threads: any[] = (data && (data.activityThreads || data.threads)) || [];
     if (options.json) {
-      console.log(JSON.stringify({ artifactId: id, threads }, null, 2));
+      console.log(JSON.stringify({ artifactId: id, version, threads }, null, 2));
       return;
     }
     if (!threads.length) {
-      console.log(`No comments on ${idOrSlug}.`);
+      console.log(`No comments on ${idOrSlug}${version != null ? ` version ${version}` : ''}.`);
       return;
     }
-    console.log(`${threads.length} comment thread(s) on ${idOrSlug} (latest version):\n`);
+    console.log(`${threads.length} comment thread(s) on ${idOrSlug} (${version != null ? `version ${version}` : 'latest version'}):\n`);
     for (const t of threads) {
       const scope = t.scope_type === 'artifact' ? 'page' : t.scope_type;
       const anchorText =

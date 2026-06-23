@@ -6,6 +6,7 @@ import { shareCommand } from './commands/share.js';
 import { listCommand } from './commands/list.js';
 import { revokeCommand } from './commands/revoke.js';
 import { commentsCommand } from './commands/comments.js';
+import { versionsCommand } from './commands/versions.js';
 import { doctorCommand } from './commands/doctor.js';
 import { infoCommand } from './commands/info.js';
 import { skillInstallCommand, skillUninstallCommand, skillListCommand, skillUpdateCommand } from './commands/skill.js';
@@ -160,9 +161,18 @@ program
   .command('comments <slug> [state]')
   .description('List a share\'s comments (no state), or enable/disable them (state: on|off)')
   .option('-j, --json', 'Output comments as JSON (list mode)')
+  .option('--seq <n>', 'List comments on a specific version, by its seq from `toss versions` (default: latest)')
   .option('--password-env <key>', 'For a doc you don\'t own: read its password from this env var / .env key (value never in args)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'passwordEnv', 'profile'])));
+  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'seq', 'passwordEnv', 'profile'])));
+
+program
+  .command('versions <slug>')
+  .description('List an artifact\'s versions (seq, date, comment count) for use with `comments --version`')
+  .option('-j, --json', 'Output versions as JSON')
+  .option('--password-env <key>', 'For a doc you don\'t own: read its password from this env var / .env key (value never in args)')
+  .option('--profile <name>', 'Use a specific profile')
+  .action((slug, ...args) => versionsCommand(slug, getCommandOptions(args, ['json', 'passwordEnv', 'profile'])));
 
 program
   .command('info')

@@ -47,16 +47,32 @@ export class TossAPI {
   // Programmatic retrieval. Owner/admin or artifact-owner via the token; for a doc
   // you don't own, pass the document password (sent as X-Toss-Password, never logged
   // in args — the CLI sources it from an env key).
-  async getComments(id: string, opts: { password?: string } = {}): Promise<{ pagePath: string; threads: unknown[]; activityThreads: unknown[] }> {
+  async getComments(id: string, opts: { password?: string; version?: number } = {}): Promise<{ pagePath?: string; version?: number; versionId?: string; threads: unknown[]; activityThreads: unknown[] }> {
     const url = new URL(`/artifacts/${id}/comment-threads`, this.config.endpoint);
     url.searchParams.set('pagePath', 'index.html');
     url.searchParams.set('includeActivity', '1');
+    // version pins the read to a specific seq (whole version, all pages); omitted = latest.
+    if (opts.version != null) url.searchParams.set('version', String(opts.version));
     const headers: Record<string, string> = { Authorization: this.authHeader() };
     if (opts.password) headers['X-Toss-Password'] = opts.password;
     const res = await safeFetch(url.href, { headers });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Failed to fetch comments: ${res.status} ${text}`);
+    }
+    return res.json();
+  }
+
+  // List the artifact's versions (seq, hash, created_at, comment count, current
+  // marker). Same access gating as comment reads; works even if comments are off.
+  async getVersions(id: string, opts: { password?: string } = {}): Promise<{ artifactId: string; versions: Array<{ seq: number; content_hash: string; created_at: number; comment_count: number; is_current: boolean }> }> {
+    const url = new URL(`/artifacts/${id}/versions`, this.config.endpoint);
+    const headers: Record<string, string> = { Authorization: this.authHeader() };
+    if (opts.password) headers['X-Toss-Password'] = opts.password;
+    const res = await safeFetch(url.href, { headers });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Failed to fetch versions: ${res.status} ${text}`);
     }
     return res.json();
   }
