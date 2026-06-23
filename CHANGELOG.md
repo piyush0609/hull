@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.3.0](https://github.com/piyush0609/toss/compare/v0.2.7...v0.3.0) (2026-06-23)
+
+
+### Features
+
+* **comments:** explore comments on a previous version ([e227cd5](https://github.com/piyush0609/toss/commit/e227cd5c8128b5359641e770e161810c831e5570))
+* **serve:** branded default landing page at /, not raw instance JSON ([8177094](https://github.com/piyush0609/toss/commit/817709452621ad870682921ef76bad75aebf0258))
+
+
+### Documentation
+
+* document toss versions + comments --seq ([e037df2](https://github.com/piyush0609/toss/commit/e037df21ae641e9dffd3bea21a4104e2c9f6d277))
+
 ## [0.2.7](https://github.com/piyush0609/toss/compare/v0.2.6...v0.2.7) (2026-06-20)
 
 
