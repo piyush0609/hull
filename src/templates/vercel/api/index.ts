@@ -321,6 +321,23 @@ function passwordForm(slug: string, error: boolean): string {
 </html>`;
 }
 
+// The gate is returned for ANY unauthenticated path under a protected slug —
+// including sub-resource assets (config.js, styles.css, …). Those asset URLs are
+// otherwise served `public, max-age=0, must-revalidate`, so a shared cache could
+// store this 200 gate HTML keyed to e.g. /s/<slug>/config.js and replay it even
+// after the viewer authenticates — the browser then runs HTML as JS. `no-store`
+// keeps the gate out of every cache; `Vary: Cookie` marks it as session-dependent.
+function passwordFormResponse(slug: string, error: boolean, status: number): Response {
+  return new Response(passwordForm(slug, error), {
+    status,
+    headers: {
+      'Content-Type': 'text/html',
+      'Cache-Control': 'no-store',
+      'Vary': 'Cookie',
+    },
+  });
+}
+
 async function requireViewerForArtifact(request: Request, artifactId: string): Promise<true | Response> {
   const token = request.headers.get('X-Toss-Viewer');
   if (!token) return new Response('Missing viewer token', { status: 401 });
@@ -1476,16 +1493,10 @@ export default async function handler(request: Request): Promise<Response> {
               });
             }
 
-            return new Response(passwordForm(slug, true), {
-              status: 401,
-              headers: { 'Content-Type': 'text/html' },
-            });
+            return passwordFormResponse(slug, true, 401);
           }
 
-          return new Response(passwordForm(slug, false), {
-            status: 200,
-            headers: { 'Content-Type': 'text/html' },
-          });
+          return passwordFormResponse(slug, false, 200);
         }
       }
 
