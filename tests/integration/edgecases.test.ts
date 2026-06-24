@@ -234,6 +234,41 @@ describe('Worker Edge Cases', () => {
       expect(correctRes.status).toBe(302);
       expect(correctRes.headers.get('Set-Cookie')).toContain(`toss_pwd_${slug}=1`);
     });
+
+    it('should mark the password gate no-store so it cannot be cached against asset URLs', async () => {
+      // Regression: the gate is returned for ANY unauthenticated path under a
+      // protected slug, including sub-resource assets. Assets are otherwise
+      // `public, max-age=0, must-revalidate`, so without `no-store` a shared
+      // cache could store this 200 gate HTML keyed to /s/<slug>/config.js and
+      // replay it after auth — the browser then runs HTML as JS and the page
+      // breaks (e.g. "config.js missing or stale").
+      const id = 'bbb12345-1234-1234-1234-123456789abc';
+      const slug = 'gated-assets';
+      const now = Math.floor(Date.now() / 1000);
+      const passwordHash = await sha256Hex('pw' + id);
+      db.setRows([{ id, slug, expires_at: now + 3600, password_hash: passwordHash }]);
+
+      // The HTML entry, with no session cookie.
+      const pageRes = await worker.fetch(new Request(`http://localhost/s/${slug}/`), createEnv(kv, db));
+      expect(pageRes.status).toBe(200);
+      expect(await pageRes.text()).toContain('Password Required');
+      expect(pageRes.headers.get('Cache-Control')).toBe('no-store');
+      expect(pageRes.headers.get('Vary')).toBe('Cookie');
+
+      // A sub-resource asset request, still unauthenticated, must also be no-store —
+      // this is the URL that would otherwise get poisoned in a shared cache.
+      const assetRes = await worker.fetch(new Request(`http://localhost/s/${slug}/config.js`), createEnv(kv, db));
+      expect(assetRes.headers.get('Cache-Control')).toBe('no-store');
+
+      // Wrong password (401) is non-cacheable too.
+      const wrongRes = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'nope' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }), createEnv(kv, db));
+      expect(wrongRes.status).toBe(401);
+      expect(wrongRes.headers.get('Cache-Control')).toBe('no-store');
+    });
   });
 
   describe('Stable slug (--id)', () => {
