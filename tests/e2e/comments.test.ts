@@ -187,7 +187,7 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     }
   });
 
-  it('carries forward open threads, excludes resolved threads', async () => {
+  it('carries forward open and resolved threads with status preserved', async () => {
     const V1 = '<!doctype html><h1>CF-V1</h1>';
     const V2 = '<!doctype html><h1>CF-V2</h1>';
 
