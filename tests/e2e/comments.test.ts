@@ -214,17 +214,23 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     const reup = await upload(V2, true);
     expect(reup.status, 'upload v2').toBe(200);
 
-    // 5. Read latest → expect exactly 2 threads (A and C carried forward; B excluded)
+    // 5. Read latest → expect exactly 3 threads (all carried forward; resolved survives)
     const latest = await read({ token: TOKEN });
     expect(latest.status, 'read latest').toBe(200);
-    expect(latest.json.threads.length, 'latest thread count').toBe(2);
+    expect(latest.json.threads.length, 'latest thread count').toBe(3);
 
     const bodies = latest.json.threads.map((t: any) =>
       (t.messages && t.messages[0] && t.messages[0].body) || ''
     );
     expect(bodies).toContain('comment A');
+    expect(bodies).toContain('comment B');
     expect(bodies).toContain('comment C');
-    expect(bodies).not.toContain('comment B');
+    // Resolved thread B carries forward with status preserved
+    const threadB = latest.json.threads.find(
+      (t: any) => (t.messages && t.messages[0] && t.messages[0].body) === 'comment B'
+    );
+    expect(threadB, 'thread B present').toBeTruthy();
+    expect(threadB.status, 'thread B still resolved').toBe('resolved');
 
     // 6. Read v1 again → still has all 3 original threads (A, B, C preserved)
     const v1again = await readVersion(1, TOKEN);
