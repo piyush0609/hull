@@ -21,12 +21,6 @@ Vercel Edge (TypeScript/ESM, commander-based). This file orients an agent workin
 (bump → changelog → commit → tag → publish, plus rollback). Do not improvise a release —
 use `npm run release:patch|minor|major`, which the runbook documents.
 
-## ⚠️ Production guardrail
-The Vercel production backend (`share.realfast.ai`, the `toss-team` project) may
-**auto-deploy on push to `main`**. Never `git push` to `main` unless you intend to
-deploy to production. Develop and test against a separate instance (`--profile test`),
-never against prod.
-
 ## More
 - `SKILL.md` — how to *use* toss (share, comments, profiles, tokens)
 - `README.md` — overview, install, and backend setup
