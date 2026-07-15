@@ -411,30 +411,26 @@ async function requireCommentAccess(request: Request, artifactId: string, opts: 
   }
 }
 
-async function requireCurrentCommentThread(threadId: string): Promise<any | Response> {
+async function getCommentThread(threadId: string): Promise<any | Response> {
   const sql = getSQL();
-  const rows = await sql`SELECT t.*, a.current_version_id FROM comment_threads t INNER JOIN artifacts a ON a.id = t.artifact_id WHERE t.id = ${threadId}`;
+  const rows = await sql`SELECT * FROM comment_threads WHERE id = ${threadId}`;
   const thread = rows[0];
   if (!thread || thread.deleted_at) return new Response('Not found', { status: 404 });
-  if (thread.current_version_id && thread.version_id !== thread.current_version_id) {
-    return new Response('Archived comments cannot be modified', { status: 409 });
-  }
   return thread;
 }
 
-// Shape comment rows into the API response (threads with nested messages, token
-// hashes stripped). Used by both the latest-version and the ?version=<seq> reads.
+// Shape historical comment rows into a read-only API response.
 function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
   const grouped = new Map();
   for (const row of messageRows) {
     const items = grouped.get(row.thread_id) || [];
-    const out = { ...row, can_edit: !row.deleted_at && row.thread_status !== 'resolved', can_delete: !row.deleted_at };
+    const out = { ...row, can_edit: false, can_delete: false };
     delete out.author_token_hash;
     items.push(out);
     grouped.set(row.thread_id, items);
   }
   return threadRows.map((thread) => {
-    const out = { ...thread, anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null, can_delete: true, can_resolve: true, messages: grouped.get(thread.id) || [] };
+    const out = { ...thread, anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null, can_delete: false, can_resolve: false, messages: grouped.get(thread.id) || [] };
     delete out.created_by_token_hash;
     return out;
   });
@@ -1333,7 +1329,7 @@ export default async function handler(request: Request): Promise<Response> {
       const threadId = threadMessageMatch[1];
 
       const sql = getSQL();
-      const thread = await requireCurrentCommentThread(threadId);
+      const thread = await getCommentThread(threadId);
       if (thread instanceof Response) return thread;
       const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
@@ -1346,8 +1342,8 @@ export default async function handler(request: Request): Promise<Response> {
 
       const now = Math.floor(Date.now() / 1000);
       const messageId = generateId();
-      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${now}, ${now})`;
-      await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId}`;
+      const inserted = await sql`WITH current_thread AS (SELECT t.id FROM comment_threads t INNER JOIN artifacts a ON a.id = t.artifact_id WHERE t.id = ${threadId} AND t.deleted_at IS NULL AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id)), new_message AS (INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) SELECT ${messageId}, id, ${NO_TOKEN}, ${name}, ${message}, ${now}, ${now} FROM current_thread RETURNING thread_id) UPDATE comment_threads t SET updated_at = ${now} FROM new_message m WHERE t.id = m.thread_id RETURNING t.id`;
+      if (!inserted[0]) return new Response('Archived comments cannot be modified', { status: 409 });
       return authJson({
         id: messageId,
         threadId,
@@ -1372,7 +1368,7 @@ export default async function handler(request: Request): Promise<Response> {
       const action = threadResolveMatch[2];
 
       const sql = getSQL();
-      const thread = await requireCurrentCommentThread(threadId);
+      const thread = await getCommentThread(threadId);
       if (thread instanceof Response) return thread;
       const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
@@ -1382,11 +1378,13 @@ export default async function handler(request: Request): Promise<Response> {
         ? (rb as { name: string }).name.trim().slice(0, 80) : '';
 
       const now = Math.floor(Date.now() / 1000);
+      let updated;
       if (action === 'resolve') {
-        await sql`UPDATE comment_threads SET status = 'resolved', resolved_by_token_hash = ${NO_TOKEN}, resolved_by_label = ${resolverName}, resolved_at = ${now}, updated_at = ${now} WHERE id = ${threadId}`;
+        updated = await sql`UPDATE comment_threads t SET status = 'resolved', resolved_by_token_hash = ${NO_TOKEN}, resolved_by_label = ${resolverName}, resolved_at = ${now}, updated_at = ${now} FROM artifacts a WHERE t.id = ${threadId} AND a.id = t.artifact_id AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id) RETURNING t.id`;
       } else {
-        await sql`UPDATE comment_threads SET status = 'open', resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ${now} WHERE id = ${threadId}`;
+        updated = await sql`UPDATE comment_threads t SET status = 'open', resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ${now} FROM artifacts a WHERE t.id = ${threadId} AND a.id = t.artifact_id AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id) RETURNING t.id`;
       }
+      if (!updated[0]) return new Response('Archived comments cannot be modified', { status: 409 });
       return authJson({
         id: threadId,
         status: action === 'resolve' ? 'resolved' : 'open',
@@ -1401,13 +1399,14 @@ export default async function handler(request: Request): Promise<Response> {
       const threadId = threadDeleteMatch[1];
 
       const sql = getSQL();
-      const thread = await requireCurrentCommentThread(threadId);
+      const thread = await getCommentThread(threadId);
       if (thread instanceof Response) return thread;
       const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
 
       const now = Math.floor(Date.now() / 1000);
-      await sql`UPDATE comment_threads SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} WHERE id = ${threadId}`;
+      const deleted = await sql`UPDATE comment_threads t SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} FROM artifacts a WHERE t.id = ${threadId} AND a.id = t.artifact_id AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id) RETURNING t.id`;
+      if (!deleted[0]) return new Response('Archived comments cannot be modified', { status: 409 });
       return new Response(null, { status: 204 });
     }
 
@@ -1418,8 +1417,6 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
       if (!rows[0] || rows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const thread = await requireCurrentCommentThread(String(rows[0].thread_id));
-      if (thread instanceof Response) return thread;
       const access = await requireCommentAccess(request, String(rows[0].artifact_id));
       if (access instanceof Response) return access;
 
@@ -1428,13 +1425,13 @@ export default async function handler(request: Request): Promise<Response> {
         if (rows[0].thread_status === 'resolved') return new Response('Resolved comments cannot be edited', { status: 409 });
         const message = normalizeMessageInput(await request.json().catch(() => null));
         if (message instanceof Response) return message;
-        await sql`UPDATE comment_messages SET body = ${message}, updated_at = ${now} WHERE id = ${messageId}`;
-        await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${rows[0].thread_id}`;
+        const updated = await sql`WITH updated_message AS (UPDATE comment_messages m SET body = ${message}, updated_at = ${now} FROM comment_threads t INNER JOIN artifacts a ON a.id = t.artifact_id WHERE m.id = ${messageId} AND t.id = m.thread_id AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id) RETURNING m.thread_id) UPDATE comment_threads t SET updated_at = ${now} FROM updated_message m WHERE t.id = m.thread_id RETURNING t.id`;
+        if (!updated[0]) return new Response('Archived comments cannot be modified', { status: 409 });
         return authJson({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
       }
 
-      await sql`UPDATE comment_messages SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} WHERE id = ${messageId}`;
-      await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${rows[0].thread_id}`;
+      const deleted = await sql`WITH deleted_message AS (UPDATE comment_messages m SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} FROM comment_threads t INNER JOIN artifacts a ON a.id = t.artifact_id WHERE m.id = ${messageId} AND t.id = m.thread_id AND (a.current_version_id IS NULL OR t.version_id = a.current_version_id) RETURNING m.thread_id) UPDATE comment_threads t SET updated_at = ${now} FROM deleted_message m WHERE t.id = m.thread_id RETURNING t.id`;
+      if (!deleted[0]) return new Response('Archived comments cannot be modified', { status: 409 });
       return new Response(null, { status: 204 });
     }
 
