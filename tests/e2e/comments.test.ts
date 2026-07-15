@@ -198,8 +198,12 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     expect(a.status, 'post A').toBe(201);
     expect(b.status, 'post B').toBe(201);
     expect(c.status, 'post C').toBe(201);
+    const threadIdA = a.json.thread?.id || a.json.id;
     const threadIdB = b.json.thread?.id || b.json.id;
+    const messageIdA = a.json.thread?.messages?.[0]?.id;
+    expect(threadIdA, 'thread A id').toBeTruthy();
     expect(threadIdB, 'thread B id').toBeTruthy();
+    expect(messageIdA, 'message A id').toBeTruthy();
 
     // 2. Resolve comment B
     const resolve = await resolveThread(threadIdB, TOKEN);
@@ -231,6 +235,18 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     );
     expect(threadB, 'thread B present').toBeTruthy();
     expect(threadB.status, 'thread B still resolved').toBe('resolved');
+    expect(threadB.resolved_by_label, 'thread B resolver preserved').toBe('E2E');
+    expect(threadB.resolved_at, 'thread B resolution time preserved').toBeTruthy();
+
+    // Carried records have fresh IDs, and stale IDs from archived versions
+    // cannot mutate historical data after republish.
+    const threadA = latest.json.threads.find(
+      (t: any) => (t.messages && t.messages[0] && t.messages[0].body) === 'comment A'
+    );
+    expect(threadA.id, 'thread A copied with fresh id').not.toBe(threadIdA);
+    expect(threadA.messages[0].id, 'message A copied with fresh id').not.toBe(messageIdA);
+    const staleResolve = await resolveThread(threadIdA, TOKEN);
+    expect(staleResolve.status, 'archived thread mutation blocked').toBe(409);
 
     // 6. Read v1 again → still has all 3 original threads (A, B, C preserved)
     const v1again = await readVersion(1, TOKEN);

@@ -411,6 +411,17 @@ async function requireCommentAccess(request: Request, artifactId: string, opts: 
   }
 }
 
+async function requireCurrentCommentThread(threadId: string): Promise<any | Response> {
+  const sql = getSQL();
+  const rows = await sql`SELECT t.*, a.current_version_id FROM comment_threads t INNER JOIN artifacts a ON a.id = t.artifact_id WHERE t.id = ${threadId}`;
+  const thread = rows[0];
+  if (!thread || thread.deleted_at) return new Response('Not found', { status: 404 });
+  if (thread.current_version_id && thread.version_id !== thread.current_version_id) {
+    return new Response('Archived comments cannot be modified', { status: 409 });
+  }
+  return thread;
+}
+
 // Shape comment rows into the API response (threads with nested messages, token
 // hashes stripped). Used by both the latest-version and the ?version=<seq> reads.
 function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
@@ -477,10 +488,10 @@ async function mintVersion(artifactId: string, contentHash: string, now: number)
     // Copy every non-deleted thread (open or resolved) and its
     // non-deleted messages onto the new version with fresh IDs.
     // Only soft-deleted threads are excluded.
-    const threads = await sql`SELECT id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${prevVersionId} AND deleted_at IS NULL`;
+    const threads = await sql`SELECT id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${prevVersionId} AND deleted_at IS NULL`;
     for (const thread of threads) {
       const newThreadId = generateId();
-      await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${newThreadId}, ${artifactId}, ${versionId}, ${thread.page_path}, ${thread.created_by_token_hash}, ${thread.created_by_label}, ${thread.scope_type}, ${thread.anchor_json}, ${thread.status}, ${thread.created_at}, ${thread.updated_at})`;
+      await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at) VALUES (${newThreadId}, ${artifactId}, ${versionId}, ${thread.page_path}, ${thread.created_by_token_hash}, ${thread.created_by_label}, ${thread.scope_type}, ${thread.anchor_json}, ${thread.status}, ${thread.resolved_by_token_hash}, ${thread.resolved_by_label}, ${thread.resolved_at}, ${thread.created_at}, ${thread.updated_at})`;
       const messages = await sql`SELECT author_token_hash, author_label, body, created_at, updated_at FROM comment_messages WHERE thread_id = ${thread.id} AND deleted_at IS NULL ORDER BY created_at ASC`;
       for (const msg of messages) {
         await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${generateId()}, ${newThreadId}, ${msg.author_token_hash}, ${msg.author_label}, ${msg.body}, ${msg.created_at}, ${msg.updated_at})`;
@@ -978,7 +989,7 @@ export default async function handler(request: Request): Promise<Response> {
           }
           const existingId = existing[0].id;
           // Versioning: mint a new immutable version when content changes (or --force);
-          // fail-closed on a no-op re-share that would hide existing comments.
+          // fail-closed on an implicit no-op version mint when comments exist.
           const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
           const newHash = await sha256(html);
           const curV = await sql`SELECT av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ${existingId}`;
@@ -1322,9 +1333,9 @@ export default async function handler(request: Request): Promise<Response> {
       const threadId = threadMessageMatch[1];
 
       const sql = getSQL();
-      const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
-      if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      const thread = await requireCurrentCommentThread(threadId);
+      if (thread instanceof Response) return thread;
+      const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
 
       const reqBody = await request.json().catch(() => null);
@@ -1361,9 +1372,9 @@ export default async function handler(request: Request): Promise<Response> {
       const action = threadResolveMatch[2];
 
       const sql = getSQL();
-      const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
-      if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      const thread = await requireCurrentCommentThread(threadId);
+      if (thread instanceof Response) return thread;
+      const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
 
       const rb = await request.json().catch(() => null);
@@ -1390,9 +1401,9 @@ export default async function handler(request: Request): Promise<Response> {
       const threadId = threadDeleteMatch[1];
 
       const sql = getSQL();
-      const threadRows = await sql`SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ${threadId}`;
-      if (!threadRows[0] || threadRows[0].deleted_at) return new Response('Not found', { status: 404 });
-      const access = await requireCommentAccess(request, String(threadRows[0].artifact_id));
+      const thread = await requireCurrentCommentThread(threadId);
+      if (thread instanceof Response) return thread;
+      const access = await requireCommentAccess(request, String(thread.artifact_id));
       if (access instanceof Response) return access;
 
       const now = Math.floor(Date.now() / 1000);
@@ -1407,6 +1418,8 @@ export default async function handler(request: Request): Promise<Response> {
       const sql = getSQL();
       const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
       if (!rows[0] || rows[0].deleted_at) return new Response('Not found', { status: 404 });
+      const thread = await requireCurrentCommentThread(String(rows[0].thread_id));
+      if (thread instanceof Response) return thread;
       const access = await requireCommentAccess(request, String(rows[0].artifact_id));
       if (access instanceof Response) return access;
 
