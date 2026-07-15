@@ -461,8 +461,9 @@ function normalizeName(body: unknown): string | Response {
 const NO_TOKEN = '';
 
 // Append-only immutable version record. Mints seq N+1, advances the artifact's
-// current_version_id pointer, and on the first version grandfathers any
-// pre-versioning threads (version_id NULL) to it so the latest-only filter shows them.
+// current_version_id pointer, carries forward open threads from the previous
+// version, and on the first version grandfathers any pre-versioning threads
+// (version_id NULL) to it so the latest-only filter shows them.
 async function mintVersion(artifactId: string, contentHash: string, now: number): Promise<string> {
   const sql = getSQL();
   const last = await sql`SELECT seq FROM artifact_versions WHERE artifact_id = ${artifactId} ORDER BY seq DESC LIMIT 1`;
@@ -470,6 +471,25 @@ async function mintVersion(artifactId: string, contentHash: string, now: number)
   const versionId = generateId();
   await sql`INSERT INTO artifact_versions (id, artifact_id, seq, content_hash, created_at) VALUES (${versionId}, ${artifactId}, ${seq}, ${contentHash}, ${now})`;
   await sql`UPDATE artifacts SET current_version_id = ${versionId} WHERE id = ${artifactId}`;
+  // Carry forward open (non-resolved, non-deleted) threads from the previous
+  // version so comments survive a republish. Each carried thread and its
+  // messages are copied onto the new version with fresh IDs; resolved/deleted
+  // threads stay on their original version only.
+  if (seq > 1) {
+    const prevRow = await sql`SELECT id FROM artifact_versions WHERE artifact_id = ${artifactId} AND seq = ${seq - 1}`;
+    const prevVersionId = prevRow[0]?.id;
+    if (prevVersionId) {
+      const openThreads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${prevVersionId} AND status = 'open' AND deleted_at IS NULL`;
+      for (const t of openThreads) {
+        const newThreadId = generateId();
+        await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${newThreadId}, ${t.artifact_id}, ${versionId}, ${t.page_path}, ${t.created_by_token_hash}, ${t.created_by_label}, ${t.scope_type}, ${t.anchor_json}, ${t.status}, ${t.created_at}, ${t.updated_at})`;
+        const msgs = await sql`SELECT author_token_hash, author_label, body, created_at, updated_at FROM comment_messages WHERE thread_id = ${t.id} AND deleted_at IS NULL ORDER BY created_at ASC`;
+        for (const m of msgs) {
+          await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${generateId()}, ${newThreadId}, ${m.author_token_hash}, ${m.author_label}, ${m.body}, ${m.created_at}, ${m.updated_at})`;
+        }
+      }
+    }
+  }
   if (seq === 1) {
     await sql`UPDATE comment_threads SET version_id = ${versionId} WHERE artifact_id = ${artifactId} AND version_id IS NULL`;
   }
