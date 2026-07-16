@@ -699,6 +699,7 @@ function injectCommentsUI(html: string, config: {
     input.disabled = true;
     try {
       await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify({ name, body }) });
+      input.value = '';
       setStatus('');
       loadThreads();
     } catch (e) { setStatus(e.message || 'Failed to post reply.'); input.disabled = false; }
@@ -762,7 +763,7 @@ function injectCommentsUI(html: string, config: {
       return html;
     }).join('');
     // Restore typed reply text.
-    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) {
+    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) => {
       const item = inp.closest('.item'); if (item && savedInputs[item.getAttribute('data-id')]) inp.value = savedInputs[item.getAttribute('data-id')];
     });
     Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', () => onItem(el.getAttribute('data-id'), el)); });
