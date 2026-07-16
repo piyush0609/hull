@@ -314,19 +314,24 @@ value lives in `.env`/the environment and is read by the CLI — the agent never
 ### Versioning (per version)
 
 Each comment is tied to the document version it was made on. Re-sharing the same
-slug with **changed** content mints a new version, and only the **latest** version's
-comments are shown by default (older ones are retained). To explore history, run
-`toss versions <id-or-slug>` to list versions (seq, date, comment count, current),
-then `toss comments <id-or-slug> --seq <n>` to read a previous version's comments.
+slug with **changed** content (or with `--force`) mints a new version. All non-deleted
+threads — open and resolved — and their non-deleted messages are carried forward,
+with thread status preserved. The latest version's carried-forward and newly added
+comments are shown by default; each older version retains its own comment history.
 
-Re-sharing **unchanged** content when comments exist is **blocked** to avoid silently
-hiding them:
+To explore history, run `toss versions <id-or-slug>` to list versions (seq, date,
+comment count, current), then `toss comments <id-or-slug> --seq <n>` to read a
+previous version's comments.
+
+Re-sharing **unchanged** content when comment history exists is **blocked** unless
+you explicitly request a new version:
 
 ```
 Upload failed: 409 {"error":"comments_present_no_change","comment_count":N,"hint":"--force"}
 ```
 
-Pass `--force` to publish a new version anyway (this hides the prior version's comments):
+Pass `--force` to publish a new version anyway. Existing non-deleted threads and
+messages are carried forward just as they are for a changed-content re-share:
 
 ```bash
 toss share ./report.html --id <slug> --comments --force
