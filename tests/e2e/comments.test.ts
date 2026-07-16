@@ -238,3 +238,107 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     expect(v1again.json.threads.length, 'v1 still has 3').toBe(3);
   });
 });
+
+describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
+  const TOKEN = testToken();
+  const SLUG = 'e2erpl-' + Math.random().toString(36).slice(2, 8);
+  let ID = '';
+  let threadId = '';
+
+  const read = async (auth: { token?: string; password?: string } = {}) => {
+    const headers: Record<string, string> = {};
+    if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
+    if (auth.password) headers['X-Toss-Password'] = auth.password;
+    const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads?pagePath=index.html`, { headers });
+    return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  const postThread = async (body: string, auth: { token?: string; password?: string }) => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
+    if (auth.password) headers['X-Toss-Password'] = auth.password;
+    const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'E2E', body, pagePath: 'index.html', scopeType: 'artifact' }),
+    });
+    return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  const postReply = async (threadId: string, body: string, token: string) => {
+    const res = await fetch(`${BASE}/comment-threads/${threadId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'E2E Reply', body }),
+    });
+    return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  beforeAll(async () => {
+    expect(TOKEN, 'test profile token in ~/.toss/config.json').toBeTruthy();
+    const html = '<!doctype html><html><body><h1>E2E Replies</h1><p>test</p></body></html>';
+    const u = new URL(BASE + '/artifacts');
+    u.searchParams.set('name', 'e2e.html');
+    u.searchParams.set('comments', '1');
+    u.searchParams.set('id', SLUG);
+    const res = await fetch(u, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'text/html' },
+      body: html,
+    });
+    expect(res.status, 'create share').toBe(200);
+    const json = await res.json().catch(() => null) as any;
+    ID = json?.id;
+    expect(ID, 'artifact id').toBeTruthy();
+
+    // Create the thread once so both tests can share it.
+    const t = await postThread('root comment', { token: TOKEN });
+    expect(t.status, 'create thread').toBe(201);
+    threadId = t.json.thread.id;
+    expect(threadId, 'thread id').toBeTruthy();
+  });
+
+  afterAll(async () => {
+    if (ID) await fetch(`${BASE}/artifacts/${ID}`, { method: 'DELETE', headers: { Authorization: `Bearer ${TOKEN}` } }).catch(() => {});
+  });
+
+  it('posts a reply and sees it in thread messages', async () => {
+    expect(threadId, 'thread id from beforeAll').toBeTruthy();
+
+    // Post a reply
+    const reply = await postReply(threadId, 'first reply', TOKEN);
+    expect(reply.status, 'post reply').toBe(201);
+    expect(reply.json.message.body, 'reply body').toBe('first reply');
+    expect(reply.json.message.author_label, 'reply author').toBe('E2E Reply');
+
+    // Read again — verify reply is in messages
+    const after = await read({ token: TOKEN });
+    const msgs = after.json.threads[0]?.messages || [];
+    expect(msgs.length, 'messages count includes reply').toBeGreaterThanOrEqual(2);
+    expect(msgs[1].body, 'second message is the reply').toBe('first reply');
+    expect(msgs[1].author_label, 'reply author label').toBe('E2E Reply');
+  });
+
+  it('multiple replies are ordered chronologically', async () => {
+    expect(threadId, 'thread id from beforeAll').toBeTruthy();
+
+    await postReply(threadId, 'reply A', TOKEN);
+    await postReply(threadId, 'reply B', TOKEN);
+    await postReply(threadId, 'reply C', TOKEN);
+
+    const after = await read({ token: TOKEN });
+    const msgs = after.json.threads[0]?.messages || [];
+    // root + first reply + 3 new replies = 5
+    expect(msgs.length, 'all messages present').toBeGreaterThanOrEqual(5);
+    const bodies = msgs.map((m: any) => m.body);
+    expect(bodies).toContain('root comment');
+    expect(bodies).toContain('first reply');
+    expect(bodies).toContain('reply A');
+    expect(bodies).toContain('reply B');
+    expect(bodies).toContain('reply C');
+    // Verify chronological ordering (all replies must be in index order)
+    expect(bodies.indexOf('first reply')).toBeLessThan(bodies.indexOf('reply A'));
+    expect(bodies.indexOf('reply A')).toBeLessThan(bodies.indexOf('reply B'));
+    expect(bodies.indexOf('reply B')).toBeLessThan(bodies.indexOf('reply C'));
+  });
+});
