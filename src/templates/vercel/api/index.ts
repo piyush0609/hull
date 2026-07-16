@@ -273,17 +273,26 @@ function generateSlug(): string {
 }
 
 // --- MIME ---
+// Text responses must declare charset=utf-8. Without it the browser applies a locale
+// default (windows-1252 for en) and decodes UTF-8 bytes as mojibake; for a <script src>
+// the default is the *referencing document's* encoding, so a UTF-8 asset under a
+// charset-less page breaks too. Everything toss ingests is UTF-8 end to end.
+// application/json is excluded deliberately: RFC 8259 defines no charset parameter
+// (JSON is always UTF-8). Binary types are unaffected.
 function mimeType(path: string): string {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const map: Record<string, string> = {
-    html: 'text/html', htm: 'text/html', js: 'application/javascript',
-    jsx: 'application/javascript', ts: 'application/typescript',
-    tsx: 'application/typescript', css: 'text/css', json: 'application/json',
+    html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8',
+    js: 'application/javascript; charset=utf-8',
+    jsx: 'application/javascript; charset=utf-8',
+    ts: 'application/typescript; charset=utf-8',
+    tsx: 'application/typescript; charset=utf-8',
+    css: 'text/css; charset=utf-8', json: 'application/json',
     png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-    svg: 'image/svg+xml', webp: 'image/webp', ico: 'image/x-icon',
+    svg: 'image/svg+xml; charset=utf-8', webp: 'image/webp', ico: 'image/x-icon',
     woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
-    txt: 'text/plain', xml: 'application/xml', pdf: 'application/pdf',
-    md: 'text/markdown',
+    txt: 'text/plain; charset=utf-8', xml: 'application/xml; charset=utf-8',
+    pdf: 'application/pdf', md: 'text/markdown; charset=utf-8',
   };
   return map[ext] || 'application/octet-stream';
 }
@@ -331,7 +340,7 @@ function passwordFormResponse(slug: string, error: boolean, status: number): Res
   return new Response(passwordForm(slug, error), {
     status,
     headers: {
-      'Content-Type': 'text/html',
+      'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
       'Vary': 'Cookie',
     },
@@ -777,7 +786,7 @@ async function serveArtifact(
       if (indexStream) {
         return new Response(indexStream, {
           status: 200,
-          headers: { 'Content-Type': 'text/html', 'X-Content-Type-Options': 'nosniff' },
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
         });
       }
     }
