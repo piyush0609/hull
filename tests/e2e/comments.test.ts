@@ -290,6 +290,12 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     const json = await res.json().catch(() => null) as any;
     ID = json?.id;
     expect(ID, 'artifact id').toBeTruthy();
+
+    // Create the thread once so both tests can share it.
+    const t = await postThread('root comment', { token: TOKEN });
+    expect(t.status, 'create thread').toBe(201);
+    threadId = t.json.thread.id;
+    expect(threadId, 'thread id').toBeTruthy();
   });
 
   afterAll(async () => {
@@ -297,16 +303,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
   });
 
   it('posts a reply and sees it in thread messages', async () => {
-    // Create a thread
-    const t = await postThread('root comment', { token: TOKEN });
-    expect(t.status, 'create thread').toBe(201);
-
-    // Get thread ID from the response or from reading threads
-    const threads = await read({ token: TOKEN });
-    expect(threads.status, 'read threads').toBe(200);
-    expect(threads.json.threads.length, 'at least one thread').toBeGreaterThanOrEqual(1);
-    threadId = threads.json.threads[0].id;
-    expect(threadId, 'thread id present').toBeTruthy();
+    expect(threadId, 'thread id from beforeAll').toBeTruthy();
 
     // Post a reply
     const reply = await postReply(threadId, 'first reply', TOKEN);
@@ -323,7 +320,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
   });
 
   it('multiple replies are ordered chronologically', async () => {
-    expect(threadId, 'thread id from first test').toBeTruthy();
+    expect(threadId, 'thread id from beforeAll').toBeTruthy();
 
     await postReply(threadId, 'reply A', TOKEN);
     await postReply(threadId, 'reply B', TOKEN);
@@ -331,7 +328,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
 
     const after = await read({ token: TOKEN });
     const msgs = after.json.threads[0]?.messages || [];
-    // root + first reply (test 1) + 3 new replies = 5
+    // root + first reply + 3 new replies = 5
     expect(msgs.length, 'all messages present').toBeGreaterThanOrEqual(5);
     const bodies = msgs.map((m: any) => m.body);
     expect(bodies).toContain('root comment');
@@ -339,5 +336,9 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     expect(bodies).toContain('reply A');
     expect(bodies).toContain('reply B');
     expect(bodies).toContain('reply C');
+    // Verify chronological ordering (all replies must be in index order)
+    expect(bodies.indexOf('first reply')).toBeLessThan(bodies.indexOf('reply A'));
+    expect(bodies.indexOf('reply A')).toBeLessThan(bodies.indexOf('reply B'));
+    expect(bodies.indexOf('reply B')).toBeLessThan(bodies.indexOf('reply C'));
   });
 });
