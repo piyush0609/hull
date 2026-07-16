@@ -56,8 +56,19 @@ describe.skipIf(!RUN)('folder --id e2e (live toss-test)', () => {
     ID = up.json.id;
     expect(await uploadFile('p.html', '<!doctype html><body>page</body>')).toBe(200);
     expect(await uploadFile('s.css', 'body{color:red}')).toBe(200);
-    expect((await serve(`/s/${SLUG}/p.html`)).status).toBe(200);
-    expect((await serve(`/s/${SLUG}/s.css`)).status).toBe(200);
+    const page = await serve(`/s/${SLUG}/p.html`);
+    expect(page.status).toBe(200);
+    const css = await serve(`/s/${SLUG}/s.css`);
+    expect(css.status).toBe(200);
+
+    // Text assets must declare charset=utf-8. Without it the browser applies a locale
+    // default (windows-1252 for en) and decodes UTF-8 bytes as mojibake — and a UTF-8
+    // <script src>/<link> inherits the referencing document's encoding, so assets break
+    // under a charset-less page too.
+    const entry = await serve(`/s/${SLUG}/`);
+    expect(entry.headers.get('content-type'), 'entry html charset').toMatch(/text\/html;\s*charset=utf-8/i);
+    expect(page.headers.get('content-type'), 'sub-page html charset').toMatch(/text\/html;\s*charset=utf-8/i);
+    expect(css.headers.get('content-type'), 'css charset').toMatch(/text\/css;\s*charset=utf-8/i);
   }, 30000);
 
   it('redirects the bare slug to the trailing-slash form', async () => {

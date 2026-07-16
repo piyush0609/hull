@@ -560,7 +560,7 @@ describe('Worker Routes', () => {
       const req = new Request(`http://localhost/a/abc123/?t=${token}`);
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(200);
-      expect(res.headers.get('Content-Type')).toBe('text/html');
+      expect(res.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
       expect(res.headers.get('Content-Security-Policy')).toContain("default-src 'self'");
 
       const body = await res.text();
