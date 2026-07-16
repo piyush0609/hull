@@ -739,30 +739,31 @@ function injectCommentsUI(html: string, config: {
     countEl.textContent = state.threads.length;
     if (!state.threads.length) { list.innerHTML = '<div class="empty">No comments yet.<br>Click <b>Comment</b>, then click a component (or select text).</div>'; return; }
     // Preserve typed reply text across poll-cycle re-renders.
-    var savedInputs = {};
-    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), function(inp) {
-      var item = inp.closest('.item'); if (item) savedInputs[item.getAttribute('data-id')] = inp.value;
+    const savedInputs = {};
+    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) => {
+      if (inp.disabled) return;
+      const item = inp.closest('.item'); if (item) savedInputs[item.getAttribute('data-id')] = inp.value;
     });
     list.innerHTML = state.threads.map((th) => {
       const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {};
       const label = a.quote ? ('“' + a.quote.exact + '”') : (st.text || (th.scope_type === 'artifact' ? 'Whole page' : '(element)'));
       const msgs = th.messages || [];
       const first = msgs[0] || {};
-      var html = '<div class="item" data-id="' + esc(th.id) + '">' +
+      let html = '<div class="item" data-id="' + esc(th.id) + '">' +
         '<div class="ctxline">📍 ' + esc(view.navLabel || view.heading || 'Page') + ' · <span class="sel">' + esc(label.slice(0, 46)) + (label.length > 46 ? '…' : '') + '</span></div>' +
         '<div class="meta"><b>' + esc(th.created_by_label || first.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span></div>' +
         '<div class="body">' + esc(first.body || '') + '</div>';
-      for (var i = 1; i < msgs.length; i++) {
-        var r = msgs[i];
-        html += '<div class="reply"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b> <span class="agox">' + ago(r.created_at) + '</span></div><div class="body">' + esc(r.body || '') + '</div></div>';
+      for (let i = 1; i < msgs.length; i++) {
+        const r = msgs[i];
+        html += '<div class="reply"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b><span class="agox">' + ago(r.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="body">' + esc(r.body || '') + '</div></div>';
       }
       html += '<div class="replyForm"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
         '<div class="orphan" hidden></div></div>';
       return html;
     }).join('');
     // Restore typed reply text.
-    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), function(inp) {
-      var item = inp.closest('.item'); if (item && savedInputs[item.getAttribute('data-id')]) inp.value = savedInputs[item.getAttribute('data-id')];
+    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) {
+      const item = inp.closest('.item'); if (item && savedInputs[item.getAttribute('data-id')]) inp.value = savedInputs[item.getAttribute('data-id')];
     });
     Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', () => onItem(el.getAttribute('data-id'), el)); });
     Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => {

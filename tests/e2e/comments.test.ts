@@ -243,6 +243,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
   const TOKEN = testToken();
   const SLUG = 'e2erpl-' + Math.random().toString(36).slice(2, 8);
   let ID = '';
+  let threadId = '';
 
   const read = async (auth: { token?: string; password?: string } = {}) => {
     const headers: Record<string, string> = {};
@@ -285,8 +286,10 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
       headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'text/html' },
       body: html,
     });
+    expect(res.status, 'create share').toBe(200);
     const json = await res.json().catch(() => null) as any;
     ID = json?.id;
+    expect(ID, 'artifact id').toBeTruthy();
   });
 
   afterAll(async () => {
@@ -302,7 +305,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     const threads = await read({ token: TOKEN });
     expect(threads.status, 'read threads').toBe(200);
     expect(threads.json.threads.length, 'at least one thread').toBeGreaterThanOrEqual(1);
-    const threadId = threads.json.threads[0].id;
+    threadId = threads.json.threads[0].id;
     expect(threadId, 'thread id present').toBeTruthy();
 
     // Post a reply
@@ -320,8 +323,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
   });
 
   it('multiple replies are ordered chronologically', async () => {
-    const threads = await read({ token: TOKEN });
-    const threadId = threads.json.threads[0].id;
+    expect(threadId, 'thread id from first test').toBeTruthy();
 
     await postReply(threadId, 'reply A', TOKEN);
     await postReply(threadId, 'reply B', TOKEN);
@@ -329,9 +331,7 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
 
     const after = await read({ token: TOKEN });
     const msgs = after.json.threads[0]?.messages || [];
-    // Root + 1st reply from previous test + 3 new = 5 from this test,
-    // but previous test already added one reply, so total is root + 4 replies = 5
-    // However, the previous test added to the same artifact, so total = root + 4 = 5
+    // root + first reply (test 1) + 3 new replies = 5
     expect(msgs.length, 'all messages present').toBeGreaterThanOrEqual(5);
     const bodies = msgs.map((m: any) => m.body);
     expect(bodies).toContain('root comment');
