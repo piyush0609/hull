@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.0](https://github.com/piyush0609/toss/compare/v0.3.0...v0.4.0) (2026-07-16)
+
+
+### Features
+
+* add reply UI to comment widget ([#11](https://github.com/piyush0609/toss/issues/11)) ([dfeb030](https://github.com/piyush0609/toss/commit/dfeb0305d8a1dff1a1cc876fc2a64f8d7c93b60e))
+* **comments:** carry forward open threads on republish (mintVersion) ([420e83d](https://github.com/piyush0609/toss/commit/420e83d969e39d958f56c1658381dae799573fe5))
+* **comments:** carry forward resolved threads too, not just open ([c37ac8c](https://github.com/piyush0609/toss/commit/c37ac8c4fb0bdedae32d723f12518d970dd8100b))
+* resolve/reopen + status badge on comment widget ([9dd2fb0](https://github.com/piyush0609/toss/commit/9dd2fb0d59ca7a7ee437fca74f40358a36987249))
+
+
+### Bug Fixes
+
+* mark password gate no-store so it can't poison asset URLs ([7971abd](https://github.com/piyush0609/toss/commit/7971abd56fb504c71baa597909252b7e5ff1c93a))
+* **serve:** declare charset=utf-8 on text responses ([f9a3fb5](https://github.com/piyush0609/toss/commit/f9a3fb5d4c0e6746d370cd93435268b3a976d39e))
+
+
+### Refactoring
+
+* **comments:** simplify mintVersion carry-forward ([c2e0cc5](https://github.com/piyush0609/toss/commit/c2e0cc5294d7c81b0b933428365e1c05d58958e6))
+
 ## [0.3.0](https://github.com/piyush0609/toss/compare/v0.2.7...v0.3.0) (2026-06-23)
 
 
