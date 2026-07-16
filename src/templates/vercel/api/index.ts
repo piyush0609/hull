@@ -789,7 +789,7 @@ function injectCommentsUI(html: string, config: {
       html += '<div class="threadActions">' + (resolved
         ? '<button class="btn small reopen" data-act="reopen">Reopen</button>'
         : '<button class="btn small resolve" data-act="resolve">Resolve</button>') + '</div>';
-      html += '<div class="replyForm"><input class="replyName" type="text" placeholder="Your name" maxlength="80" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
+      html += '<div class="replyForm"' + (resolved ? ' hidden' : '') + '><input class="replyName" type="text" placeholder="Your name" maxlength="80" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
         '<div class="orphan" hidden></div></div>';
       return html;
     }).join('');
