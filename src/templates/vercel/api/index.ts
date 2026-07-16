@@ -743,9 +743,11 @@ function injectCommentsUI(html: string, config: {
     if (!state.threads.length) { list.innerHTML = '<div class="empty">No comments yet.<br>Click <b>Comment</b>, then click a component (or select text).</div>'; return; }
     // Preserve typed reply text across poll-cycle re-renders.
     const savedInputs = {};
-    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) => {
-      if (inp.disabled) return;
-      const item = inp.closest('.item'); if (item) savedInputs[item.getAttribute('data-id')] = inp.value;
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (item) => {
+      const inp = item.querySelector('.replyInput');
+      if (inp && inp.disabled) return; // just-posted: don't restore
+      const nm = item.querySelector('.replyName');
+      savedInputs[item.getAttribute('data-id')] = { body: inp ? inp.value : '', name: nm ? nm.value : '' };
     });
     list.innerHTML = state.threads.map((th) => {
       const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {};
@@ -760,13 +762,15 @@ function injectCommentsUI(html: string, config: {
         const r = msgs[i];
         html += '<div class="reply"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b><span class="agox">' + ago(r.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="body">' + esc(r.body || '') + '</div></div>';
       }
-      html += '<div class="replyForm"><input class="replyName" type="text" placeholder="Your name" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
+      html += '<div class="replyForm"><input class="replyName" type="text" placeholder="Your name" maxlength="80" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
         '<div class="orphan" hidden></div></div>';
       return html;
     }).join('');
     // Restore typed reply text.
-    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) => {
-      const item = inp.closest('.item'); if (item && savedInputs[item.getAttribute('data-id')]) inp.value = savedInputs[item.getAttribute('data-id')];
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (item) => {
+      const s = savedInputs[item.getAttribute('data-id')]; if (!s) return;
+      const inp = item.querySelector('.replyInput'); if (inp && s.body) inp.value = s.body;
+      const nm = item.querySelector('.replyName'); if (nm && s.name) nm.value = s.name;
     });
     Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm')) return; onItem(el.getAttribute('data-id'), el); }); });
     Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => {
