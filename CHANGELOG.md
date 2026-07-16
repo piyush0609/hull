@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.1](https://github.com/piyush0609/toss/compare/v0.4.0...v0.4.1) (2026-07-16)
+
+
+### Documentation
+
+* **skill:** document comment carry-forward ([edd055a](https://github.com/piyush0609/toss/commit/edd055a254b002e9481d8ad20ee526ac888129b2))
+
 ## [0.4.0](https://github.com/piyush0609/toss/compare/v0.3.0...v0.4.0) (2026-07-16)
 
 
