@@ -700,7 +700,7 @@ function injectCommentsUI(html: string, config: {
     input.disabled = true;
     try {
       await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify({ name, body }) });
-      state.name = name; localStorage.setItem('toss-comment-name', name);
+      state.name = name; localStorage.setItem(NAME_KEY, name);
       input.value = '';
       setStatus('');
       await loadThreads();
@@ -768,7 +768,7 @@ function injectCommentsUI(html: string, config: {
     Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (inp) => {
       const item = inp.closest('.item'); if (item && savedInputs[item.getAttribute('data-id')]) inp.value = savedInputs[item.getAttribute('data-id')];
     });
-    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', () => onItem(el.getAttribute('data-id'), el)); });
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm')) return; onItem(el.getAttribute('data-id'), el); }); });
     Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => {
       btn.addEventListener('click', (e) => { e.stopPropagation(); var item = btn.closest('.item'); if (item) postReply(item.getAttribute('data-id'), item); });
     });
