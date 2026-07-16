@@ -342,3 +342,104 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     expect(bodies.indexOf('reply B')).toBeLessThan(bodies.indexOf('reply C'));
   });
 });
+
+// Backs the widget's resolve/reopen controls: the reviewer who raised a thread must
+// see that it was addressed (status + who), and that it can be un-addressed.
+describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
+  const TOKEN = testToken();
+  const SLUG = 'e2eres-' + Math.random().toString(36).slice(2, 8);
+  let ID = '';
+
+  const read = async () => {
+    const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads?pagePath=index.html`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  const setStatus = async (threadId: string, action: 'resolve' | 'reopen', name?: string) => {
+    const res = await fetch(`${BASE}/comment-threads/${threadId}/${action}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(name === undefined ? {} : { name }),
+    });
+    return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  const newThread = async (body: string) => {
+    const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'E2E', body, pagePath: 'index.html', scopeType: 'artifact' }),
+    });
+    const json = (await res.json().catch(() => null)) as any;
+    return json?.thread?.id as string;
+  };
+
+  beforeAll(async () => {
+    expect(TOKEN, 'test profile token in ~/.toss/config.json').toBeTruthy();
+    const u = new URL(BASE + '/artifacts');
+    u.searchParams.set('name', 'e2e.html');
+    u.searchParams.set('comments', '1');
+    u.searchParams.set('id', SLUG);
+    const res = await fetch(u, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'text/html' },
+      body: '<!doctype html><html><body><h1>E2E resolve</h1></body></html>',
+    });
+    expect(res.status, 'create share').toBe(200);
+    ID = ((await res.json().catch(() => null)) as any)?.id;
+    expect(ID, 'artifact id').toBeTruthy();
+  }, 30000);
+
+  afterAll(async () => {
+    if (ID) await fetch(`${BASE}/artifacts/${ID}`, { method: 'DELETE', headers: { Authorization: `Bearer ${TOKEN}` } }).catch(() => {});
+  });
+
+  // Live round-trips need more than vitest's 5s default (see tests/e2e/folder-id.test.ts).
+  it('resolve marks the thread resolved and records who, reopen clears it', async () => {
+    const threadId = await newThread('please fix the header');
+    expect(threadId, 'thread id').toBeTruthy();
+
+    // Open by default — this is what the widget's "open" badge reflects.
+    const before = await read();
+    const openThread = before.json.threads.find((t: any) => t.id === threadId);
+    expect(openThread.status, 'starts open').toBe('open');
+
+    const resolved = await setStatus(threadId, 'resolve', 'Reviewer');
+    expect(resolved.status, 'resolve call').toBe(200);
+    expect(resolved.json.status).toBe('resolved');
+    expect(resolved.json.resolvedByLabel, 'records who resolved it').toBe('Reviewer');
+    expect(resolved.json.resolvedAt, 'records when').toBeTruthy();
+
+    // The badge reads from a re-fetch, so the state must survive a read.
+    const after = await read();
+    const t2 = after.json.threads.find((t: any) => t.id === threadId);
+    expect(t2.status, 'persisted as resolved').toBe('resolved');
+    expect(t2.resolved_by_label, 'resolver persisted').toBe('Reviewer');
+    expect(t2.resolved_at, 'resolved_at persisted').toBeTruthy();
+
+    const reopened = await setStatus(threadId, 'reopen');
+    expect(reopened.status, 'reopen call').toBe(200);
+    expect(reopened.json.status).toBe('open');
+
+    const after2 = await read();
+    const t3 = after2.json.threads.find((t: any) => t.id === threadId);
+    expect(t3.status, 'back to open').toBe('open');
+    expect(t3.resolved_by_label, 'resolver cleared on reopen').toBeFalsy();
+    expect(t3.resolved_at, 'resolved_at cleared on reopen').toBeFalsy();
+  }, 30000);
+
+  it('resolving without a name still resolves (badge degrades to bare "resolved")', async () => {
+    const threadId = await newThread('nameless resolve');
+    const res = await setStatus(threadId, 'resolve');
+    expect(res.status, 'resolve without name').toBe(200);
+    expect(res.json.status).toBe('resolved');
+    expect(res.json.resolvedByLabel, 'no name → null, not a dangling label').toBeNull();
+
+    const after = await read();
+    const t = after.json.threads.find((x: any) => x.id === threadId);
+    expect(t.status, 'resolved persisted').toBe('resolved');
+    expect((t.resolved_by_label || '').trim(), 'empty resolver label').toBe('');
+  }, 30000);
+});

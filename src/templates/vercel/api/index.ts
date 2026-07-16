@@ -550,7 +550,7 @@ function injectCommentsUI(html: string, config: {
 
   const host = document.getElementById('toss-comments-root');
   const sr = host.attachShadow({ mode: 'open' });
-  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,system-ui,sans-serif}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;border:0;cursor:pointer;border-radius:999px;font-size:14px;font-weight:600;color:#fff;background:#d9654a;box-shadow:0 6px 20px rgba(0,0,0,.18);padding:11px 18px}.launcher{right:20px;bottom:20px}.launcher.active{background:#111827}.panelBtn{right:20px;bottom:72px;background:#fff;color:#374151;padding:9px 14px;font-size:13px;box-shadow:0 4px 14px rgba(0,0,0,.14)}#count{display:inline-block;min-width:18px;padding:0 6px;margin-left:4px;background:#d9654a;color:#fff;border-radius:999px;font-size:11px;line-height:18px;text-align:center}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:92vw;height:100vh;background:#fff;box-shadow:-8px 0 30px rgba(0,0,0,.16);display:flex;flex-direction:column}.panel header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;color:#111827}.panel header button{border:0;background:none;font-size:16px;cursor:pointer;color:#9ca3af}#status{padding:0 18px;font-size:12px;color:#9a3412}#list{overflow:auto;padding:10px;display:flex;flex-direction:column;gap:10px}.empty{color:#9ca3af;text-align:center;padding:40px 16px;font-size:13px;line-height:1.7}.item{border:1px solid #eef0f2;border-radius:12px;padding:12px;cursor:pointer}.item:hover{box-shadow:0 4px 14px rgba(0,0,0,.1)}.ctxline{font-size:12px;color:#6b7280;margin-bottom:6px}.ctxline .sel{color:#d9654a}.meta{font-size:13px;color:#111827}.meta .agox{color:#9ca3af;font-weight:400;font-size:12px;margin-left:6px}.body{font-size:13px;color:#374151;line-height:1.5;margin-top:2px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.55);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.3);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 12px;font-size:15px;color:#111827}#ctx{background:#f8fafc;border:1px solid #eef0f2;border-radius:10px;padding:10px 12px;margin-bottom:12px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.7;color:#111827}#ctx .cr span{color:#9ca3af;min-width:80px}#ctx code{font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d7dadf;border-radius:10px;padding:10px 12px;font-size:14px;color:#111827}textarea{min-height:84px;resize:vertical}.actions{display:flex;justify-content:flex-end;gap:8px}.btn{border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer}.btn.ghost{background:#f1f2f4;color:#374151}.btn.primary{background:#d9654a;color:#fff}.reply{padding:8px 0 0 16px;border-left:2px solid #eef0f2;margin-top:6px}.reply .meta{font-size:12px}.reply .meta b{color:#111827}.reply .body{font-size:12px;color:#6b7280}.replyForm{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #eef0f2}.replyName{width:110px;border:1px solid #d7dadf;border-radius:8px;padding:6px 10px;font-size:12px;color:#111827;min-width:0;flex-shrink:0}.replyInput{flex:1;border:1px solid #d7dadf;border-radius:8px;padding:6px 10px;font-size:12px;color:#111827;min-width:0}.replyBtn{border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;background:#d9654a;color:#fff;white-space:nowrap}.replyBtn:hover{background:#c85a41}</style>';
+  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,system-ui,sans-serif}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;border:0;cursor:pointer;border-radius:999px;font-size:14px;font-weight:600;color:#fff;background:#d9654a;box-shadow:0 6px 20px rgba(0,0,0,.18);padding:11px 18px}.launcher{right:20px;bottom:20px}.launcher.active{background:#111827}.panelBtn{right:20px;bottom:72px;background:#fff;color:#374151;padding:9px 14px;font-size:13px;box-shadow:0 4px 14px rgba(0,0,0,.14)}#count{display:inline-block;min-width:18px;padding:0 6px;margin-left:4px;background:#d9654a;color:#fff;border-radius:999px;font-size:11px;line-height:18px;text-align:center}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:92vw;height:100vh;background:#fff;box-shadow:-8px 0 30px rgba(0,0,0,.16);display:flex;flex-direction:column}.panel header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;color:#111827}.panel header button{border:0;background:none;font-size:16px;cursor:pointer;color:#9ca3af}#status{padding:0 18px;font-size:12px;color:#9a3412}#list{overflow:auto;padding:10px;display:flex;flex-direction:column;gap:10px}.empty{color:#9ca3af;text-align:center;padding:40px 16px;font-size:13px;line-height:1.7}.item{border:1px solid #eef0f2;border-radius:12px;padding:12px;cursor:pointer}.item:hover{box-shadow:0 4px 14px rgba(0,0,0,.1)}.ctxline{font-size:12px;color:#6b7280;margin-bottom:6px}.ctxline .sel{color:#d9654a}.meta{font-size:13px;color:#111827}.meta .agox{color:#9ca3af;font-weight:400;font-size:12px;margin-left:6px}.body{font-size:13px;color:#374151;line-height:1.5;margin-top:2px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.55);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border-radius:16px;box-shadow:0 24px 60px rgba(0,0,0,.3);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 12px;font-size:15px;color:#111827}#ctx{background:#f8fafc;border:1px solid #eef0f2;border-radius:10px;padding:10px 12px;margin-bottom:12px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.7;color:#111827}#ctx .cr span{color:#9ca3af;min-width:80px}#ctx code{font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d7dadf;border-radius:10px;padding:10px 12px;font-size:14px;color:#111827}textarea{min-height:84px;resize:vertical}.actions{display:flex;justify-content:flex-end;gap:8px}.btn{border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer}.btn.ghost{background:#f1f2f4;color:#374151}.btn.primary{background:#d9654a;color:#fff}.reply{padding:8px 0 0 16px;border-left:2px solid #eef0f2;margin-top:6px}.reply .meta{font-size:12px}.reply .meta b{color:#111827}.reply .body{font-size:12px;color:#6b7280}.replyForm{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #eef0f2}.replyName{width:110px;border:1px solid #d7dadf;border-radius:8px;padding:6px 10px;font-size:12px;color:#111827;min-width:0;flex-shrink:0}.replyInput{flex:1;border:1px solid #d7dadf;border-radius:8px;padding:6px 10px;font-size:12px;color:#111827;min-width:0}.replyBtn{border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;background:#d9654a;color:#fff;white-space:nowrap}.replyBtn:hover{background:#c85a41}.btn.small{padding:6px 12px;font-size:12px}.btn.resolve{background:#1d9e75;color:#fff}.btn.resolve:hover{background:#178a65}.btn.reopen{background:#f1f2f4;color:#374151}.btn:disabled{opacity:.6;cursor:default}.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-left:6px}.badge.open{background:#e0f2fe;color:#0369a1}.badge.resolved{background:#dcfce7;color:#15803d}.threadActions{display:flex;justify-content:flex-end;margin-top:8px}</style>';
   const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose">&times;</button></header><div id="status"></div><div id="list"></div></aside><div id="composer" class="composer" hidden><div class="card"><div class="pad"><h3>Add a comment</h3><div id="ctx"></div><div class="row"><input id="cName" type="text" placeholder="Your name" maxlength="80"></div><div class="row"><textarea id="cText" placeholder="Describe the issue or suggestion"></textarea></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div>';
   sr.innerHTML = STYLE + MARKUP;
   const $ = (s) => sr.querySelector(s);
@@ -719,6 +719,23 @@ function injectCommentsUI(html: string, config: {
     } catch (e) { if (!state.loaded) setStatus(e.message || 'Failed to load.'); }
   }
 
+  // Resolve/reopen a thread. The reviewer who raised it sees the state change, so
+  // "something was done about it" is visible without leaving the page. Reloads from
+  // the server rather than trusting a local mutation; the status is part of the poll
+  // signature, so the refresh re-renders. The button is always re-enabled on failure.
+  async function setThreadStatus(threadId, action, btn) {
+    const label = action === 'resolve' ? 'Resolve' : 'Reopen';
+    if (btn) { btn.disabled = true; btn.textContent = label + '\\u2026'; }
+    try {
+      await api('/comment-threads/' + threadId + '/' + action, { method: 'POST', body: JSON.stringify({ name: (state.name || '').trim() || 'Anonymous' }) });
+      setStatus('');
+      await loadThreads();
+    } catch (e) {
+      setStatus(e.message || ('Failed to ' + label.toLowerCase() + '.'));
+      if (btn) { btn.disabled = false; btn.textContent = label; }
+    }
+  }
+
   // ---- recovery ladder ----
   function attrSel(name, val) { return '[' + name + '="' + String(val).split('"').join('') + '"]'; }
   function findByText(needle) {
@@ -754,14 +771,24 @@ function injectCommentsUI(html: string, config: {
       const label = a.quote ? ('“' + a.quote.exact + '”') : (st.text || (th.scope_type === 'artifact' ? 'Whole page' : '(element)'));
       const msgs = th.messages || [];
       const first = msgs[0] || {};
+      const resolved = th.status === 'resolved';
+      // resolved_by_label is '' when the resolver had no stored name — degrade to
+      // a bare "resolved" rather than a dangling "resolved by".
+      const who = (th.resolved_by_label || '').trim();
+      const badge = resolved
+        ? '<span class="badge resolved">resolved' + (who ? ' by ' + esc(who) : '') + (th.resolved_at ? ' \\u00b7 ' + ago(th.resolved_at) : '') + '</span>'
+        : '<span class="badge open">open</span>';
       let html = '<div class="item" data-id="' + esc(th.id) + '">' +
         '<div class="ctxline">📍 ' + esc(view.navLabel || view.heading || 'Page') + ' · <span class="sel">' + esc(label.slice(0, 46)) + (label.length > 46 ? '…' : '') + '</span></div>' +
-        '<div class="meta"><b>' + esc(th.created_by_label || first.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span></div>' +
+        '<div class="meta"><b>' + esc(th.created_by_label || first.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span>' + badge + '</div>' +
         '<div class="body">' + esc(first.body || '') + '</div>';
       for (let i = 1; i < msgs.length; i++) {
         const r = msgs[i];
         html += '<div class="reply"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b><span class="agox">' + ago(r.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="body">' + esc(r.body || '') + '</div></div>';
       }
+      html += '<div class="threadActions">' + (resolved
+        ? '<button class="btn small reopen" data-act="reopen">Reopen</button>'
+        : '<button class="btn small resolve" data-act="resolve">Resolve</button>') + '</div>';
       html += '<div class="replyForm"><input class="replyName" type="text" placeholder="Your name" maxlength="80" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
         '<div class="orphan" hidden></div></div>';
       return html;
@@ -772,7 +799,16 @@ function injectCommentsUI(html: string, config: {
       const inp = item.querySelector('.replyInput'); if (inp && s.body) inp.value = s.body;
       const nm = item.querySelector('.replyName'); if (nm && s.name) nm.value = s.name;
     });
-    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm')) return; onItem(el.getAttribute('data-id'), el); }); });
+    // Clicks in the reply form or on a thread action must not also fire the card's
+    // scroll-to-anchor.
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm') || ev.target.closest('.threadActions')) return; onItem(el.getAttribute('data-id'), el); }); });
+    Array.prototype.forEach.call(list.querySelectorAll('.threadActions button'), (btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const item = btn.closest('.item'); if (!item) return;
+        setThreadStatus(item.getAttribute('data-id'), btn.getAttribute('data-act'), btn);
+      });
+    });
     Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => {
       btn.addEventListener('click', (e) => { e.stopPropagation(); var item = btn.closest('.item'); if (item) postReply(item.getAttribute('data-id'), item); });
     });
