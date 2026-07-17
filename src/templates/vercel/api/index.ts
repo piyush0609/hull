@@ -131,6 +131,10 @@ function blobUrl(pathname: string): string {
   return `https://${storeId.toLowerCase()}.private.blob.vercel-storage.com/${pathname}`;
 }
 
+function versionEntryBlobPath(artifactId: string, versionId: string): string {
+  return `artifacts/${artifactId}/versions/${versionId}/index.html`;
+}
+
 function blobHeaders(): Record<string, string> {
   return { authorization: `Bearer ${BLOB_TOKEN}` };
 }
@@ -426,7 +430,11 @@ function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
   const grouped = new Map();
   for (const row of messageRows) {
     const items = grouped.get(row.thread_id) || [];
-    const out = { ...row, can_edit: !row.deleted_at && row.thread_status !== 'resolved', can_delete: !row.deleted_at };
+    const out = {
+      ...row,
+      can_edit: !row.deleted_at && row.thread_status !== 'resolved',
+      can_delete: !row.deleted_at && !(row.kind === 'resolution' && row.thread_status === 'resolved'),
+    };
     delete out.author_token_hash;
     items.push(out);
     grouped.set(row.thread_id, items);
@@ -439,6 +447,8 @@ function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
 }
 
 type CommentScope = 'artifact' | 'element' | 'selection';
+type CommentMessageKind = 'note' | 'blocker' | 'concern' | 'question' | 'action' | 'nit' | 'resolution';
+const COMMENT_MESSAGE_KINDS = new Set<CommentMessageKind>(['note', 'blocker', 'concern', 'question', 'action', 'nit', 'resolution']);
 
 function normalizePagePath(value: unknown): string | Response {
   if (typeof value !== 'string') return new Response('Page path is required', { status: 400 });
@@ -465,6 +475,16 @@ function normalizeName(body: unknown): string | Response {
   return raw;
 }
 
+function normalizeMessageKind(body: unknown): CommentMessageKind | Response {
+  const raw = body && typeof body === 'object' && (body as { kind?: unknown }).kind !== undefined
+    ? (body as { kind?: unknown }).kind
+    : 'note';
+  if (typeof raw !== 'string' || !COMMENT_MESSAGE_KINDS.has(raw as CommentMessageKind) || raw === 'resolution') {
+    return new Response('Invalid comment kind', { status: 400 });
+  }
+  return raw as CommentMessageKind;
+}
+
 // Legacy token columns are NOT NULL but identity is now author_label; write a
 // sentinel so old (token-based) and new (name-based) rows coexist, no migration.
 const NO_TOKEN = '';
@@ -474,29 +494,76 @@ const NO_TOKEN = '';
 // (open or resolved) from the previous version, and on the first version
 // grandfathers any pre-versioning threads (version_id NULL) to it so the
 // latest-only filter shows them.
-async function mintVersion(artifactId: string, contentHash: string, now: number): Promise<string> {
+async function mintVersion(
+  artifactId: string,
+  contentHash: string,
+  now: number,
+  versionId = generateId(),
+  artifactUpdate?: { name: string; sizeBytes: number; expiresAt: number; passwordHash: string | null }
+): Promise<string> {
   const sql = getSQL();
-  const last = await sql`SELECT id, seq FROM artifact_versions WHERE artifact_id = ${artifactId} ORDER BY seq DESC LIMIT 1`;
-  const seq = (last[0] && last[0].seq ? Number(last[0].seq) : 0) + 1;
-  const versionId = generateId();
-  await sql`INSERT INTO artifact_versions (id, artifact_id, seq, content_hash, created_at) VALUES (${versionId}, ${artifactId}, ${seq}, ${contentHash}, ${now})`;
-  await sql`UPDATE artifacts SET current_version_id = ${versionId} WHERE id = ${artifactId}`;
-  if (seq > 1) {
-    const prevVersionId = last[0]?.id;
-    // Copy every non-deleted thread (open or resolved) and its
-    // non-deleted messages onto the new version with fresh IDs.
-    // Only soft-deleted threads are excluded.
-    const threads = await sql`SELECT id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${prevVersionId} AND deleted_at IS NULL`;
-    for (const thread of threads) {
-      const newThreadId = generateId();
-      await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${newThreadId}, ${artifactId}, ${versionId}, ${thread.page_path}, ${thread.created_by_token_hash}, ${thread.created_by_label}, ${thread.scope_type}, ${thread.anchor_json}, ${thread.status}, ${thread.created_at}, ${thread.updated_at})`;
-      const messages = await sql`SELECT author_token_hash, author_label, body, created_at, updated_at FROM comment_messages WHERE thread_id = ${thread.id} AND deleted_at IS NULL ORDER BY created_at ASC`;
-      for (const msg of messages) {
-        await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${generateId()}, ${newThreadId}, ${msg.author_token_hash}, ${msg.author_label}, ${msg.body}, ${msg.created_at}, ${msg.updated_at})`;
-      }
-    }
-  } else if (seq === 1) {
-    await sql`UPDATE comment_threads SET version_id = ${versionId} WHERE artifact_id = ${artifactId} AND version_id IS NULL`;
+  // Neon HTTP transactions are non-interactive but execute their predefined
+  // statements sequentially. Lock in its own statement so a waiter gets a new
+  // READ COMMITTED snapshot before allocating MAX(seq)+1. Copy the complete
+  // comment snapshot set-wise, then publish the pointer as the final statement.
+  // Any query failure rolls the version, copies, and pointer back together.
+  const results = await sql.transaction((tx) => [
+    tx`SELECT id FROM artifacts WHERE id = ${artifactId} FOR UPDATE`,
+    tx`
+      WITH next_seq AS (
+        SELECT COALESCE(MAX(seq), 0) + 1 AS seq
+        FROM artifact_versions
+        WHERE artifact_id = ${artifactId}
+      ), inserted_version AS (
+        INSERT INTO artifact_versions (id, artifact_id, seq, content_hash, created_at)
+        SELECT ${versionId}, ${artifactId}, seq, ${contentHash}, ${now}
+        FROM next_seq
+        RETURNING id, seq
+      ), thread_map AS MATERIALIZED (
+        SELECT
+          source.*,
+          md5(${versionId} || ':thread:' || source.id) AS new_id
+        FROM comment_threads source
+        CROSS JOIN inserted_version version
+        WHERE version.seq > 1
+          AND source.artifact_id = ${artifactId}
+          AND source.version_id = (SELECT current_version_id FROM artifacts WHERE id = ${artifactId})
+          AND source.deleted_at IS NULL
+      ), copied_threads AS (
+        INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at)
+        SELECT new_id, ${artifactId}, ${versionId}, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at
+        FROM thread_map
+        RETURNING id
+      ), copied_messages AS (
+        INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at)
+        SELECT md5(${versionId} || ':message:' || message.id), thread.new_id, message.author_token_hash, message.author_label, message.body, message.kind, message.created_at, message.updated_at
+        FROM comment_messages message
+        INNER JOIN thread_map thread ON thread.id = message.thread_id
+        WHERE message.deleted_at IS NULL
+          AND (SELECT COUNT(*) FROM copied_threads) >= 0
+        RETURNING id
+      ), grandfathered_threads AS (
+        UPDATE comment_threads
+        SET version_id = ${versionId}
+        WHERE artifact_id = ${artifactId}
+          AND version_id IS NULL
+          AND (SELECT seq FROM inserted_version) = 1
+        RETURNING id
+      )
+      SELECT
+        id,
+        seq,
+        (SELECT COUNT(*) FROM copied_threads) AS copied_thread_count,
+        (SELECT COUNT(*) FROM copied_messages) AS copied_message_count,
+        (SELECT COUNT(*) FROM grandfathered_threads) AS grandfathered_thread_count
+      FROM inserted_version
+    `,
+    artifactUpdate
+      ? tx`UPDATE artifacts SET name = ${artifactUpdate.name}, size_bytes = ${artifactUpdate.sizeBytes}, expires_at = ${artifactUpdate.expiresAt}, password_hash = ${artifactUpdate.passwordHash}, current_version_id = ${versionId} WHERE id = ${artifactId} AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ${versionId}) RETURNING id`
+      : tx`UPDATE artifacts SET current_version_id = ${versionId} WHERE id = ${artifactId} AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ${versionId}) RETURNING id`,
+  ]);
+  if (!results[0]?.[0] || !results[1]?.[0] || !results[2]?.[0]) {
+    throw new Error('Artifact version transaction did not publish');
   }
   return versionId;
 }
@@ -536,6 +603,13 @@ function normalizeMessageInput(body: unknown): string | Response {
   return message;
 }
 
+function serializeInlineScriptValue(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 function injectCommentsUI(html: string, config: {
   artifactId: string;
   viewerToken: string;
@@ -543,7 +617,7 @@ function injectCommentsUI(html: string, config: {
   artifactBasePath: string;
   currentPagePath: string;
 }): string {
-  const payload = JSON.stringify(config);
+  const payload = serializeInlineScriptValue(config);
   const shell = `
 <div id="toss-comments-root"></div>
 <script>
@@ -551,7 +625,7 @@ function injectCommentsUI(html: string, config: {
   const cfg = ${payload};
   const NAME_KEY = 'toss-comment-name';
   const PAGE = cfg.currentPagePath || 'index.html';
-  const state = { mode: 'browse', threads: [], name: localStorage.getItem(NAME_KEY) || '', pending: null, hoverEl: null, loaded: false };
+  const state = { mode: 'browse', threads: [], name: localStorage.getItem(NAME_KEY) || '', kind: 'note', statusFilter: 'open', kindFilter: 'all', pending: null, resolving: null, hoverEl: null, loaded: false, replyDrafts: {}, expandedThreadId: null, replyOriginThreadId: null, replyFocusAfterRender: null, replySubmitting: null, threadLoadGeneration: 0 };
 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
   const txt = (el) => (el && (el.innerText || el.textContent) || '').trim();
@@ -559,18 +633,25 @@ function injectCommentsUI(html: string, config: {
 
   const host = document.getElementById('toss-comments-root');
   const sr = host.attachShadow({ mode: 'open' });
-  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;height:40px;border:0;cursor:pointer;border-radius:999px;font-size:13px;font-weight:650;color:#fff;background:#b94732;box-shadow:0 5px 14px rgba(185,71,50,.24);padding:0 17px}.launcher{right:20px;bottom:20px}.launcher:hover,.replyBtn:hover,.btn.primary:hover{background:#a63d2b}.launcher.active{background:#111827;box-shadow:0 5px 14px rgba(15,23,42,.22)}.panelBtn{right:20px;bottom:72px;height:38px;background:#fff;color:#374151;padding:0 12px 0 14px;font-weight:600;border:1px solid #e5e7eb;box-shadow:0 4px 12px rgba(15,23,42,.08)}#count{display:inline-grid;place-items:center;min-width:19px;height:19px;padding:0 5px;margin-left:6px;background:#b94732;color:#fff;border-radius:999px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(15,23,42,.22)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:92vw;height:100vh;background:#fff;border-left:1px solid #e6e9ed;box-shadow:-12px 0 32px rgba(15,23,42,.1);display:flex;flex-direction:column}.panel header{height:56px;flex:0 0 56px;display:flex;align-items:center;justify-content:space-between;padding:0 14px 0 16px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.012em;color:#111827}.panel header button{width:32px;height:32px;border:0;border-radius:8px;background:transparent;font-size:20px;line-height:1;cursor:pointer;color:#8b95a5}.panel header button:hover{background:#f6f7f9;color:#4b5563}#status{padding:0 16px;font-size:12px;color:#9a3412}#list{min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:#c5cbd4 transparent;padding:12px;display:flex;flex-direction:column;gap:10px;background:#fbfcfd}#list::-webkit-scrollbar{width:8px}#list::-webkit-scrollbar-track{background:transparent}#list::-webkit-scrollbar-thumb{background:#c5cbd4;border:2px solid #fbfcfd;border-radius:999px}#list::-webkit-scrollbar-thumb:hover{background:#9ca3af}.empty{color:#8b95a5;text-align:center;padding:44px 18px;font-size:13px;line-height:1.65}.item{border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:12px;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.035);transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}.item:hover{border-color:#d7dce3;box-shadow:0 4px 12px rgba(15,23,42,.07);transform:translateY(-1px)}.ctxline{font-size:11px;line-height:1.4;color:#667085;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ctxline:before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;border:1.5px solid #a8b0bc;border-radius:50% 50% 50% 3px;background:radial-gradient(circle at 54% 46%,#a8b0bc 0 1.5px,transparent 1.6px);transform:rotate(-45deg);vertical-align:-1px}.ctxline .sel{color:#be4b2f;font-weight:600}.meta{display:flex;flex-wrap:wrap;align-items:center;min-width:0;font-size:12px;line-height:18px;color:#1f2937;font-weight:650}.meta b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta .agox{color:#9ca3af;font-weight:400;font-size:11px;margin-left:6px;font-variant-numeric:tabular-nums}.body{font-size:13px;color:#374151;line-height:1.48;margin-top:3px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.52);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border:1px solid rgba(255,255,255,.55);border-radius:14px;box-shadow:0 24px 64px rgba(15,23,42,.28),0 2px 8px rgba(15,23,42,.12);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 14px;font-size:15px;font-weight:650;letter-spacing:-.01em;color:#111827}#ctx{background:#f8fafc;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;margin-bottom:14px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.65;color:#293548}#ctx .cr span{color:#9ca3af;min-width:76px}#ctx code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d5dae1;border-radius:9px;background:#fff;padding:10px 11px;font-size:13px;color:#111827;outline:0;box-shadow:0 1px 1px rgba(15,23,42,.02);transition:border-color .15s ease,box-shadow .15s ease}input::placeholder,textarea::placeholder{color:#9da5b0}input:focus,textarea:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1)}textarea{min-height:92px;resize:vertical;line-height:1.45}.actions{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}.btn{height:36px;border:1px solid transparent;border-radius:8px;padding:0 14px;font-size:13px;font-weight:650;cursor:pointer}.btn.ghost{border-color:#dfe3e8;background:#fff;color:#475569;box-shadow:0 1px 2px rgba(15,23,42,.03)}.btn.ghost:hover{background:#f8fafc}.btn.primary{border-color:#b94732;background:#b94732;color:#fff;box-shadow:0 1px 2px rgba(217,101,74,.18)}.reply{padding:8px 0 0 12px;border-left:2px solid #eceff3;margin-top:8px}.reply .meta{font-size:11px}.reply .body{font-size:12px;color:#596579;line-height:1.45;margin-top:2px}.replyForm{display:grid;grid-template-columns:78px minmax(0,1fr) auto;gap:5px;margin-top:8px;padding-top:8px;border-top:1px solid #eef0f2}.replyName,.replyInput{width:auto;height:30px;border:1px solid #d9dde3;border-radius:7px;padding:0 8px;font-size:11px;color:#111827;min-width:0}.replyBtn{height:30px;border:0;border-radius:7px;padding:0 10px;font-size:11px;font-weight:650;cursor:pointer;background:#b94732;color:#fff;white-space:nowrap}.btn.small{height:28px;padding:0 10px;font-size:11px;border-radius:7px}.btn.resolve{border-color:#b7e4d2;background:#f3fbf8;color:#14795c}.btn.resolve:hover{background:#e8f7f1}.btn.reopen{border-color:#dfe3e8;background:#fff;color:#475569}.btn.reopen:hover{background:#f8fafc}.btn:disabled{opacity:.6;cursor:default}.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:1px solid;border-radius:999px;font-size:10px;font-weight:650;line-height:16px;margin-left:auto;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge:before{content:"";width:5px;height:5px;flex:0 0 5px;border-radius:50%;background:currentColor}.badgeText{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge.open{background:#f0f9ff;border-color:#bae6fd;color:#0369a1}.badge.resolved{background:#f0fdf4;border-color:#bbf7d0;color:#15803d}.threadActions{display:flex;justify-content:flex-end;margin-top:8px}</style>';
-  const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose">&times;</button></header><div id="status"></div><div id="list"></div></aside><div id="composer" class="composer" hidden><div class="card"><div class="pad"><h3>Add a comment</h3><div id="ctx"></div><div class="row"><input id="cName" type="text" placeholder="Your name" maxlength="80"></div><div class="row"><textarea id="cText" placeholder="Describe the issue or suggestion"></textarea></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div>';
+  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;height:40px;border:0;cursor:pointer;border-radius:999px;font-size:13px;font-weight:650;color:#fff;background:#b94732;box-shadow:0 5px 14px rgba(185,71,50,.24);padding:0 17px}.launcher{right:20px;bottom:20px}.launcher:hover,.replyBtn:hover,.btn.primary:hover{background:#a63d2b}.launcher.active{background:#111827;box-shadow:0 5px 14px rgba(15,23,42,.22)}.panelBtn{right:20px;bottom:72px;height:38px;background:#fff;color:#374151;padding:0 12px 0 14px;font-weight:600;border:1px solid #e5e7eb;box-shadow:0 4px 12px rgba(15,23,42,.08)}#count{display:inline-grid;place-items:center;min-width:19px;height:19px;padding:0 5px;margin-left:6px;background:#b94732;color:#fff;border-radius:999px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(15,23,42,.22)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:360px;height:100vh;background:#fff;border-left:1px solid #e6e9ed;box-shadow:-12px 0 32px rgba(15,23,42,.1);display:flex;flex-direction:column}.panel header{height:56px;flex:0 0 56px;display:flex;align-items:center;justify-content:space-between;padding:0 14px 0 16px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.012em;color:#111827}.panel header button{width:32px;height:32px;border:0;border-radius:8px;background:transparent;font-size:20px;line-height:1;cursor:pointer;color:#8b95a5}.panel header button:hover{background:#f6f7f9;color:#4b5563}#status{padding:0 16px;font-size:12px;color:#9a3412}#list{min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:#c5cbd4 transparent;padding:12px;display:flex;flex-direction:column;gap:10px;background:#fbfcfd}#list::-webkit-scrollbar{width:8px}#list::-webkit-scrollbar-track{background:transparent}#list::-webkit-scrollbar-thumb{background:#c5cbd4;border:2px solid #fbfcfd;border-radius:999px}#list::-webkit-scrollbar-thumb:hover{background:#9ca3af}.empty{color:#8b95a5;text-align:center;padding:44px 18px;font-size:13px;line-height:1.65}.item{min-width:0;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:12px;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.035);transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}.item:hover{border-color:#d7dce3;box-shadow:0 4px 12px rgba(15,23,42,.07);transform:translateY(-1px)}.ctxline{font-size:11px;line-height:1.4;color:#667085;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ctxline:before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;border:1.5px solid #a8b0bc;border-radius:50% 50% 50% 3px;background:radial-gradient(circle at 54% 46%,#a8b0bc 0 1.5px,transparent 1.6px);transform:rotate(-45deg);vertical-align:-1px}.ctxline .sel{color:#be4b2f;font-weight:600}.meta{display:flex;flex-wrap:wrap;align-items:center;min-width:0;font-size:12px;line-height:18px;color:#1f2937;font-weight:650}.meta b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta .agox{color:#9ca3af;font-weight:400;font-size:11px;margin-left:6px;font-variant-numeric:tabular-nums}.body{font-size:13px;color:#374151;line-height:1.48;margin-top:3px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.52);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border:1px solid rgba(255,255,255,.55);border-radius:14px;box-shadow:0 24px 64px rgba(15,23,42,.28),0 2px 8px rgba(15,23,42,.12);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 14px;font-size:15px;font-weight:650;letter-spacing:-.01em;color:#111827}#ctx{background:#f8fafc;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;margin-bottom:14px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.65;color:#293548}#ctx .cr span{color:#9ca3af;min-width:76px}#ctx code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d5dae1;border-radius:9px;background:#fff;padding:10px 11px;font-size:13px;color:#111827;outline:0;box-shadow:0 1px 1px rgba(15,23,42,.02);transition:border-color .15s ease,box-shadow .15s ease}input::placeholder,textarea::placeholder{color:#9da5b0}input:focus,textarea:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1)}textarea{min-height:92px;resize:vertical;line-height:1.45}.actions{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}.btn{height:36px;border:1px solid transparent;border-radius:8px;padding:0 14px;font-size:13px;font-weight:650;cursor:pointer}.btn.ghost{border-color:#dfe3e8;background:#fff;color:#475569;box-shadow:0 1px 2px rgba(15,23,42,.03)}.btn.ghost:hover{background:#f8fafc}.btn.primary{border-color:#b94732;background:#b94732;color:#fff;box-shadow:0 1px 2px rgba(217,101,74,.18)}.reply{padding:8px 0 0 12px;border-left:2px solid #eceff3;margin-top:8px}.reply .meta{font-size:11px}.reply .body{font-size:12px;color:#596579;line-height:1.45;margin-top:2px}.replyForm{margin-top:10px;padding-top:10px;border-top:1px solid #eef0f2;min-width:0}.replyIdentity,.identitySummary,.identityEditor,.replyField,.replyKinds,.replyActions{min-width:0}.identitySummary{display:flex;align-items:center;gap:7px;color:#667085;font-size:11px}.identitySummary strong{color:#374151;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identityAvatar{width:24px;height:24px;flex:0 0 24px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px;font-weight:750}.identityChange{margin-left:auto;border:0;background:transparent;color:#b94732;padding:3px;font-size:10.5px;font-weight:650}.identityEditor label,.replyField label,.replyKindsLabel{display:block;margin:0 0 5px;color:#475569;font-size:10.5px;font-weight:650}.identityEditor input{width:100%;height:32px;padding:0 8px;font-size:11px}.identityActions,.replyActions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin-top:6px}.replyField{margin-top:8px}.replyInput{width:100%;height:64px;min-height:64px;resize:none;padding:8px;font-size:11px}.replyKinds{margin-top:8px}.replyKindChips{display:flex;gap:5px;flex-wrap:wrap;min-width:0}.replyKindChip{height:27px;display:inline-flex;align-items:center;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#596579;padding:0 8px;font-size:10px;font-weight:650}.replyKindChip[aria-pressed=true]{border-color:#dc8d7b;background:#fff4f1;color:#9f3826;box-shadow:0 0 0 2px rgba(217,101,74,.08)}.replyActions .replyBtn{height:30px}.identityActions .btn,.replyActions .btn{height:30px;padding:0 10px;font-size:11px}.replyName,.replyInput{width:auto;height:30px;border:1px solid #d9dde3;border-radius:7px;padding:0 8px;font-size:11px;color:#111827;min-width:0}.replyBtn{height:30px;border:0;border-radius:7px;padding:0 10px;font-size:11px;font-weight:650;cursor:pointer;background:#b94732;color:#fff;white-space:nowrap}.btn.small{height:28px;padding:0 10px;font-size:11px;border-radius:7px}.btn.resolve{border-color:#b7e4d2;background:#f3fbf8;color:#14795c}.btn.resolve:hover{background:#e8f7f1}.btn.reopen{border-color:#dfe3e8;background:#fff;color:#475569}.btn.reopen:hover{background:#f8fafc}.btn:disabled{opacity:.6;cursor:default}.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:1px solid;border-radius:999px;font-size:10px;font-weight:650;line-height:16px;margin-left:auto;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge:before{content:"";width:5px;height:5px;flex:0 0 5px;border-radius:50%;background:currentColor}.badgeText{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge.open{background:#f0f9ff;border-color:#bae6fd;color:#0369a1}.badge.resolved{background:#f0fdf4;border-color:#bbf7d0;color:#15803d}.threadActions{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;min-width:0}.threadActionGroup{display:flex;gap:8px;flex-wrap:wrap;min-width:0}.replyToggle{border:0;background:transparent;color:#b94732;padding:0 2px;font-size:11px;font-weight:650;cursor:pointer}.typeLabel{display:block;margin:2px 0 6px;color:#475569;font-size:11px;font-weight:650}.kindHelp{margin:6px 0 0;color:#7c8797;font-size:10.5px;line-height:1.4}.kindChips{display:flex;gap:5px;flex-wrap:wrap}.kindChip{height:28px;display:inline-flex;align-items:center;gap:5px;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#596579;padding:0 8px;font-size:10.5px;font-weight:650;cursor:pointer}.kindChip:before,.kindBadge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}.kindChip[aria-pressed=true]{border-color:#dc8d7b;background:#fff4f1;color:#9f3826;box-shadow:0 0 0 2px rgba(217,101,74,.08)}.kindBadge{display:inline-flex;align-items:center;gap:5px;height:20px;border:1px solid #d8dde4;border-radius:999px;padding:0 7px;background:#f8fafc;color:#52606f;font-size:9px;font-weight:750;letter-spacing:.045em;text-transform:uppercase;white-space:nowrap}.kindBadge.blocker{color:#9f3826;border-color:#efc3b8;background:#fff8f6}.kindBadge.concern{color:#9a5b13;border-color:#ead4aa;background:#fffbf2}.kindBadge.question{color:#285e8e;border-color:#bfdaee;background:#f7fbff}.kindBadge.action{color:#4d568c;border-color:#ccd0eb;background:#fafaff}.kindBadge.nit{color:#667085}.kindBadge.resolution{color:#14795c;border-color:#b7e4d2;background:#f3fbf8}.messageHead{display:flex;align-items:center;gap:6px;min-width:0}.messageHead .meta{flex:1}.readiness{padding:9px 12px;border-bottom:1px solid #eef0f2;background:#fbfcfd}.readiness strong{display:block;color:#111827;font-size:11px;margin-bottom:6px}.readyStats{display:flex;flex-wrap:wrap;gap:5px;color:#596579;font-size:10.5px}.readyStats span{border:1px solid #e5e7eb;border-radius:999px;background:#fff;padding:3px 7px}.filters{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px 12px;border-bottom:1px solid #eef0f2;background:#fff}.filters select{height:30px;min-width:0;border:1px solid #d9dde3;border-radius:7px;background:#fff;color:#475569;padding:0 7px;font-size:11px;outline:0}.filters select:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1)}.replyForm,.replyField,.replyKinds,.replyActions{max-width:100%;overflow-wrap:anywhere}.replyInput{width:100%;height:64px;min-height:64px;resize:none;padding:8px}.reply .kindBadge{height:18px;font-size:8px;padding:0 6px}.resolveCard{width:440px}.resolveCard p{margin:0 0 12px;color:#667085;font-size:12px;line-height:1.5}.resolveCard textarea{min-height:76px}.required{color:#9f3826}.srOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:430px){.composer{padding:12px}.card{max-height:calc(100vh - 24px);overflow:auto}.launcher,.panelBtn{right:12px}.panel{left:0;right:auto;max-width:100vw;width:100vw;border:0;box-shadow:none}.filters{grid-template-columns:1fr 1fr}}.messageHead{align-items:flex-start;flex-wrap:wrap}.messageHead .meta{display:flex;flex:1 1 92px;flex-wrap:nowrap;overflow:hidden;white-space:nowrap}.messageHead .meta b{flex:0 1 auto;max-width:100%}.messageHead .meta .agox{flex:0 0 auto;white-space:nowrap}.messageBadges{display:flex;flex:0 1 auto;align-items:center;justify-content:flex-end;gap:5px;min-width:0;max-width:100%}.messageHead.resolvedHead .messageBadges{flex:1 0 100%;width:100%}.readiness{padding:10px 12px 12px}.readiness strong{margin-bottom:8px}.readyStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.readyStat{min-width:0;border:1px solid #e5e7eb;border-radius:9px;background:#fff;padding:8px 7px}.readyStat span{display:block;border:0;border-radius:0;background:transparent;padding:0;font-size:8px;font-weight:750;letter-spacing:.07em;text-transform:uppercase;color:#8b95a5;overflow:hidden;text-overflow:ellipsis}.readyStat b{display:block;margin-top:2px;color:#111827;font-size:16px;line-height:1.1;font-weight:670;font-variant-numeric:tabular-nums}.resolveHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}.resolveHead h3{margin:0}.resolveContext{flex:0 0 auto}.attribution{display:flex;align-items:center;gap:8px;margin:10px 0 2px;color:#667085;font-size:10.5px;line-height:1.4}.avatar{width:22px;height:22px;flex:0 0 22px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px;font-weight:750}.attribution strong{color:#374151}.resolveCard .actions{margin-top:12px}@media(max-width:430px){.readyStats{gap:5px}.readyStat{padding:7px 5px}.resolveCard{width:100%}.resolveHead{align-items:flex-start}.messageHead.resolvedHead .messageBadges{justify-content:flex-start}.badge.resolved{max-width:220px}}</style>';
+  const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose" aria-label="Close comments">&times;</button></header><div id="status" role="status" aria-live="polite"></div><div class="readiness"><strong>Review readiness</strong><div id="readyStats" class="readyStats"></div></div><div class="filters"><label><span class="srOnly">Thread status</span><select id="statusFilter" aria-label="Filter by thread status"><option value="open">Open threads</option><option value="resolved">Resolved threads</option><option value="all">All threads</option></select></label><label><span class="srOnly">Review type</span><select id="kindFilter" aria-label="Filter by review type"><option value="all">All review types</option><option value="note">Note</option><option value="blocker">Blocker</option><option value="concern">Concern</option><option value="question">Question</option><option value="action">Action</option><option value="nit">Nit</option><option value="resolution">Resolution</option></select></label></div><div id="list" tabindex="-1" aria-label="Comment threads"></div></aside><div id="composer" class="composer" hidden><div class="card" role="dialog" aria-modal="true" aria-labelledby="composerTitle"><div class="pad"><h3 id="composerTitle">Add a comment</h3><div id="ctx"></div><div class="row"><label class="typeLabel" for="cName">Your name</label><input id="cName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label class="typeLabel" for="cText">Comment</label><textarea id="cText" placeholder="Describe the issue or suggestion" required></textarea></div><div class="row"><span class="typeLabel">Review type</span><div id="kindChips" class="kindChips" role="group" aria-label="Review type"><button class="kindChip" data-kind="note" aria-pressed="true">Note</button><button class="kindChip" data-kind="blocker" aria-pressed="false">Blocker</button><button class="kindChip" data-kind="concern" aria-pressed="false">Concern</button><button class="kindChip" data-kind="question" aria-pressed="false">Question</button><button class="kindChip" data-kind="action" aria-pressed="false">Action</button><button class="kindChip" data-kind="nit" aria-pressed="false">Nit</button></div><p class="kindHelp">Choose the signal that best describes what reviewers need next.</p></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div><div id="resolveDialog" class="composer" hidden><div class="card resolveCard" role="dialog" aria-modal="true" aria-labelledby="resolveTitle"><div class="pad"><div class="resolveHead"><h3 id="resolveTitle">Resolve thread</h3><span id="resolveContext" class="kindBadge resolveContext note">NOTE</span></div><p>Add a required resolution note so reviewers can see what changed.</p><div class="row"><label class="typeLabel" for="resolveName">Your name <span class="required">*</span></label><input id="resolveName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label class="typeLabel" for="resolveText">Resolution note <span class="required">*</span></label><textarea id="resolveText" required></textarea></div><div class="attribution" aria-live="polite"><span id="resolveAvatar" class="avatar" aria-hidden="true">?</span><span>This resolution will be attributed to <strong id="resolveAttribution">the named reviewer</strong>.</span></div><div class="actions"><button id="resolveCancel" class="btn ghost">Cancel</button><button id="resolveConfirm" class="btn primary">Resolve thread</button></div></div></div></div>';
   sr.innerHTML = STYLE + MARKUP;
   const $ = (s) => sr.querySelector(s);
   const launcher = $('#launcher'), panelBtn = $('#panelBtn'), countEl = $('#count'), hint = $('#hint'), hl = $('#hl');
   const panel = $('#panel'), list = $('#list'), composer = $('#composer'), ctx = $('#ctx'), cName = $('#cName'), cText = $('#cText'), statusEl = $('#status');
+  const resolveDialog = $('#resolveDialog'), resolveName = $('#resolveName'), resolveText = $('#resolveText'), resolveContext = $('#resolveContext'), resolveAvatar = $('#resolveAvatar'), resolveAttribution = $('#resolveAttribution'), statusFilter = $('#statusFilter'), kindFilter = $('#kindFilter');
 
   launcher.addEventListener('click', () => setMode(state.mode === 'comment' ? 'browse' : 'comment'));
   panelBtn.addEventListener('click', () => { if (panel.hidden) openPanel(); else panel.hidden = true; });
   $('#panelClose').addEventListener('click', () => { panel.hidden = true; });
   $('#cCancel').addEventListener('click', closeComposer);
   $('#cAdd').addEventListener('click', addComment);
+  $('#resolveCancel').addEventListener('click', closeResolve);
+  $('#resolveConfirm').addEventListener('click', confirmResolve);
+  resolveName.addEventListener('input', updateResolveAttribution);
+  statusFilter.addEventListener('change', () => { state.statusFilter = statusFilter.value; render(true); });
+  kindFilter.addEventListener('change', () => { state.kindFilter = kindFilter.value; render(true); });
+  Array.prototype.forEach.call(sr.querySelectorAll('.kindChip'), (chip) => chip.addEventListener('click', () => { state.kind = chip.getAttribute('data-kind'); Array.prototype.forEach.call(sr.querySelectorAll('.kindChip'), (c) => c.setAttribute('aria-pressed', String(c === chip))); }));
 
   function setStatus(t) { statusEl.textContent = t || ''; }
 
@@ -686,63 +767,247 @@ function injectCommentsUI(html: string, config: {
 
   async function addComment() {
     if (!state.pending) return;
-    const name = (cName.value || '').trim() || 'Anonymous';
+    const name = (cName.value || '').trim();
     const body = (cText.value || '').trim();
+    if (!name) { cName.focus(); return; }
     if (!body) { cText.focus(); return; }
-    state.name = name; localStorage.setItem(NAME_KEY, name);
+    commitGlobalIdentity(state.name, name);
     const t = state.pending; const scopeType = scopeOf(t.kind);
     const anchor = { kind: t.kind, locator: t.locator, state: t.state, view: t.view }; if (t.quote) anchor.quote = t.quote;
     closeComposer(); setStatus('Posting…');
     try {
-      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ name: name, body: body, pagePath: PAGE, scopeType: scopeType, anchor: scopeType === 'artifact' ? undefined : anchor }) });
+      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ name: name, body: body, kind: state.kind, pagePath: PAGE, scopeType: scopeType, anchor: scopeType === 'artifact' ? undefined : anchor }) });
       if (data && data.thread) { state.threads.unshift(data.thread); }
       setStatus(''); openPanel();
     } catch (e) { setStatus(e.message || 'Failed to post.'); panel.hidden = false; }
   }
 
-  async function postReply(threadId, itemEl) {
-    const input = itemEl.querySelector('.replyInput');
-    const nameInput = itemEl.querySelector('.replyName');
-    const body = (input.value || '').trim();
-    if (!body) { input.focus(); return; }
-    const name = (nameInput && nameInput.value || state.name || '').trim() || 'Anonymous';
-    input.disabled = true;
-    try {
-      await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify({ name, body }) });
-      state.name = name; localStorage.setItem(NAME_KEY, name);
-      input.value = '';
-      setStatus('');
-      await loadThreads();
-    } catch (e) { setStatus(e.message || 'Failed to post reply.'); } finally { input.disabled = false; }
+  function replyDraft(threadId) {
+    if (!state.replyDrafts[threadId]) {
+      const committed = (state.name || '').trim();
+      state.replyDrafts[threadId] = { name: committed, body: '', kind: 'note', identityEditing: !committed, identityEditorValue: committed, priorIdentity: committed };
+    }
+    return state.replyDrafts[threadId];
   }
-
-  function applyThreads(threads) {
-    const sig = threads.length + ':' + threads.map((t) => t.id + ':' + ((t.messages && t.messages.length) || 0) + ':' + (t.status || '')).join(',');
-    if (sig === state.sig) return;
-    state.sig = sig; state.threads = threads; render();
+  function commitGlobalIdentity(oldName, newName) {
+    const previous = (oldName || '').trim();
+    const committed = (newName || '').trim();
+    state.name = committed;
+    cName.value = committed;
+    localStorage.setItem(NAME_KEY, committed);
+    Object.keys(state.replyDrafts).forEach((threadId) => {
+      const draft = state.replyDrafts[threadId];
+      if (draft.name !== previous) return;
+      draft.name = committed;
+      draft.priorIdentity = committed;
+      if (!draft.identityEditing || draft.identityEditorValue === previous) draft.identityEditorValue = committed;
+    });
+    return committed;
   }
-  async function loadThreads() {
-    try {
-      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(PAGE) + '&includeActivity=1');
-      state.loaded = true; setStatus(''); applyThreads((data && data.threads) || []);
-    } catch (e) { if (!state.loaded) setStatus(e.message || 'Failed to load.'); }
+  function focusReplyControl(threadId, selector) {
+    setTimeout(() => { const item = list.querySelector('[data-id="' + String(threadId).split('"').join('') + '"]'); const control = item && item.querySelector(selector); if (control) control.focus(); }, 0);
   }
-
-  // Resolve/reopen a thread. The reviewer who raised it sees the state change, so
-  // "something was done about it" is visible without leaving the page. Reloads from
-  // the server rather than trusting a local mutation; the status is part of the poll
-  // signature, so the refresh re-renders. The button is always re-enabled on failure.
-  async function setThreadStatus(threadId, action, btn) {
-    const label = action === 'resolve' ? 'Resolve' : 'Reopen';
-    if (btn) { btn.disabled = true; btn.textContent = label + '\\u2026'; }
+  function focusAfterReplyCollapse(threadId) {
+    setTimeout(() => {
+      const reply = list.querySelector('.replyToggle[data-thread-id="' + String(threadId).split('"').join('') + '"]');
+      if (reply) { reply.focus(); return; }
+      const activeFilter = sr.activeElement === kindFilter ? kindFilter : (sr.activeElement === statusFilter ? statusFilter : null);
+      if (activeFilter && !activeFilter.hidden) { activeFilter.focus(); return; }
+      const action = list.querySelector('.threadActions button');
+      if (action) { action.focus(); return; }
+      list.focus();
+    }, 0);
+  }
+  function queueReplyCollapseFocus(threadId) {
+    state.replyOriginThreadId = threadId;
+    state.replyFocusAfterRender = { threadId: threadId, fallback: true };
+    state.expandedThreadId = null;
+  }
+  function captureReplyFocus() {
+    const active = sr.activeElement;
+    const composerEl = active && active.closest && active.closest('.replyForm');
+    const item = composerEl && composerEl.closest('.item');
+    if (!item || item.getAttribute('data-id') !== state.expandedThreadId) return null;
+    let selector = '';
+    if (active.classList.contains('replyInput')) selector = '.replyInput';
+    else if (active.classList.contains('replyName')) selector = '.replyName';
+    else if (active.classList.contains('identityChange')) selector = '.identityChange';
+    else if (active.classList.contains('identitySave')) selector = '.identitySave';
+    else if (active.classList.contains('identityCancel')) selector = '.identityCancel';
+    else if (active.classList.contains('replyCancel')) selector = '.replyCancel';
+    else if (active.classList.contains('replyBtn')) selector = '.replyBtn';
+    else if (active.classList.contains('replyKindChip')) selector = '.replyKindChip[data-kind="' + active.getAttribute('data-kind') + '"]';
+    if (!selector) return null;
+    const hasSelection = typeof active.selectionStart === 'number' && typeof active.selectionEnd === 'number';
+    return { threadId: state.expandedThreadId, selector: selector, selectionStart: hasSelection ? active.selectionStart : null, selectionEnd: hasSelection ? active.selectionEnd : null };
+  }
+  function restoreReplyFocus(intent) {
+    if (!intent) return;
+    if (intent.fallback) { focusAfterReplyCollapse(intent.threadId); return; }
+    setTimeout(() => {
+      const item = list.querySelector('[data-id="' + String(intent.threadId).split('"').join('') + '"]');
+      const control = item && item.querySelector(intent.selector);
+      if (!control) { focusAfterReplyCollapse(intent.threadId); return; }
+      control.focus();
+      if (intent.selectionStart !== null && typeof control.setSelectionRange === 'function') control.setSelectionRange(intent.selectionStart, intent.selectionEnd);
+    }, 0);
+  }
+  function restoreQueuedReplyFocus() {
+    const intent = state.replyFocusAfterRender;
+    state.replyFocusAfterRender = null;
+    restoreReplyFocus(intent);
+  }
+  function openReply(threadId) {
+    state.expandedThreadId = threadId;
+    state.replyOriginThreadId = threadId;
+    const draft = replyDraft(threadId);
+    if (!draft.name) draft.identityEditing = true;
+    render();
+    focusReplyControl(threadId, draft.name && !draft.identityEditing ? '.replyInput' : '.replyName');
+  }
+  function cancelIdentity(threadId, focus) {
+    const draft = replyDraft(threadId);
+    const fallback = (draft.name || '').trim();
+    draft.identityEditorValue = fallback;
+    draft.priorIdentity = fallback;
+    draft.identityEditing = !fallback;
+    render();
+    focusReplyControl(threadId, fallback ? '.identityChange' : '.replyName');
+  }
+  function saveIdentity(threadId) {
+    const draft = replyDraft(threadId);
+    const nextName = (draft.identityEditorValue || '').trim();
+    if (!nextName) { focusReplyControl(threadId, '.replyName'); return false; }
+    commitGlobalIdentity(draft.name, nextName);
+    draft.identityEditing = false;
+    draft.identityEditorValue = nextName;
+    draft.priorIdentity = nextName;
+    render();
+    focusReplyControl(threadId, '.identityChange');
+    return true;
+  }
+  function collapseReply(threadId, revertIdentity) {
+    const draft = replyDraft(threadId);
+    if (revertIdentity && draft.identityEditing) {
+      const fallback = (draft.name || '').trim();
+      draft.identityEditorValue = fallback;
+      draft.priorIdentity = fallback;
+      draft.identityEditing = !fallback;
+    }
+    state.expandedThreadId = null;
+    render();
+    focusAfterReplyCollapse(state.replyOriginThreadId || threadId);
+  }
+  function canRestoreReplyDraft(threadId, threads) {
+    const thread = (threads || []).filter((item) => item.id === threadId)[0];
+    return !!thread && !thread.deleted_at && (thread.status || 'open') !== 'resolved';
+  }
+  async function postReply(threadId) {
+    const draft = replyDraft(threadId);
+    if (draft.identityEditing && !saveIdentity(threadId)) return;
+    const name = (draft.name || '').trim();
+    const body = (draft.body || '').trim();
+    if (!name) { draft.identityEditing = true; render(); focusReplyControl(threadId, '.replyName'); return; }
+    if (!body) { focusReplyControl(threadId, '.replyInput'); return; }
+    const snapshot = { threadId: threadId, name: draft.name, body: draft.body, kind: draft.kind, identityEditing: draft.identityEditing, identityEditorValue: draft.identityEditorValue, priorIdentity: draft.priorIdentity };
+    state.replySubmitting = threadId;
+    render();
     try {
-      await api('/comment-threads/' + threadId + '/' + action, { method: 'POST', body: JSON.stringify({ name: (state.name || '').trim() || 'Anonymous' }) });
+      await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify({ name: snapshot.name, body: snapshot.body, kind: snapshot.kind }) });
+      delete state.replyDrafts[threadId];
+      state.expandedThreadId = null;
+      state.replySubmitting = null;
       setStatus('');
       await loadThreads();
     } catch (e) {
-      setStatus(e.message || ('Failed to ' + label.toLowerCase() + '.'));
-      if (btn) { btn.disabled = false; btn.textContent = label; }
+      state.replySubmitting = null;
+      setStatus(e.message || 'Failed to post reply.');
+      if (canRestoreReplyDraft(threadId, state.threads)) {
+        state.replyDrafts[threadId] = snapshot;
+        state.expandedThreadId = threadId;
+        render();
+        focusReplyControl(threadId, snapshot.name ? '.replyInput' : '.replyName');
+      } else {
+        delete state.replyDrafts[threadId];
+        state.replyOriginThreadId = threadId;
+        state.replyFocusAfterRender = { threadId: threadId, fallback: true };
+        state.expandedThreadId = null;
+        render(true);
+      }
     }
+  }
+
+  function reconcileReplyDrafts(threads) {
+    const openIds = {};
+    threads.forEach((thread) => { if ((thread.status || 'open') !== 'resolved' && !thread.deleted_at) openIds[thread.id] = true; });
+    Object.keys(state.replyDrafts).forEach((threadId) => { if (!openIds[threadId]) delete state.replyDrafts[threadId]; });
+    if (state.expandedThreadId && !openIds[state.expandedThreadId]) queueReplyCollapseFocus(state.expandedThreadId);
+  }
+  function threadsDigest(threads) {
+    return JSON.stringify((threads || []).map((thread) => ({
+      id: thread.id, status: thread.status || 'open', updated_at: thread.updated_at || null, deleted_at: thread.deleted_at || null,
+      resolved_by_label: thread.resolved_by_label || '', resolved_at: thread.resolved_at || null,
+      messages: (thread.messages || []).map((message) => ({ id: message.id, author_label: message.author_label || '', body: message.body || '', kind: message.kind || 'note', updated_at: message.updated_at || null, deleted_at: message.deleted_at || null })),
+    })));
+  }
+  function applyThreads(threads) {
+    reconcileReplyDrafts(threads);
+    const sig = threadsDigest(threads);
+    if (sig === state.sig) return;
+    state.sig = sig; state.threads = threads; render(true);
+  }
+  function beginThreadLoad() { state.threadLoadGeneration += 1; return state.threadLoadGeneration; }
+  function isLatestThreadLoad(generation) { return generation === state.threadLoadGeneration; }
+  async function loadThreads() {
+    const generation = beginThreadLoad();
+    try {
+      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(PAGE) + '&includeActivity=1');
+      if (!isLatestThreadLoad(generation)) return;
+      state.loaded = true; setStatus(''); applyThreads((data && data.threads) || []);
+    } catch (e) { if (isLatestThreadLoad(generation) && !state.loaded) setStatus(e.message || 'Failed to load.'); }
+  }
+
+  // Resolve requires an attributed note; reopen only requires attribution.
+  function closeResolve() { resolveDialog.hidden = true; state.resolving = null; resolveText.value = ''; }
+  function initials(name) { const parts = (name || '').trim().split(/ +/).filter(Boolean); return parts.length ? (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase() : '?'; }
+  function updateResolveAttribution() { const name = (resolveName.value || '').trim(); resolveAvatar.textContent = initials(name); resolveAttribution.textContent = name || 'the named reviewer'; }
+  function openResolve(threadId, btn) {
+    const thread = state.threads.filter((item) => item.id === threadId)[0] || {};
+    const first = (thread.messages || [])[0] || {};
+    const contextKind = first.kind || 'note';
+    state.resolving = { threadId: threadId };
+    resolveName.value = state.name || '';
+    resolveText.value = '';
+    resolveContext.className = 'kindBadge resolveContext ' + contextKind;
+    resolveContext.textContent = kindLabel(contextKind);
+    updateResolveAttribution();
+    resolveDialog.hidden = false;
+    setTimeout(() => { (resolveName.value ? resolveText : resolveName).focus(); }, 30);
+  }
+  async function confirmResolve() {
+    if (!state.resolving) return;
+    const name = (resolveName.value || '').trim(), body = (resolveText.value || '').trim();
+    if (!name) { resolveName.focus(); return; }
+    if (!body) { resolveText.focus(); return; }
+    const pending = state.resolving;
+    commitGlobalIdentity(state.name, name);
+    $('#resolveConfirm').disabled = true;
+    try {
+      await api('/comment-threads/' + pending.threadId + '/resolve', { method: 'POST', body: JSON.stringify({ name: name, body: body }) });
+      closeResolve(); setStatus(''); await loadThreads();
+    } catch (e) { setStatus(e.message || 'Failed to resolve.'); }
+    finally { $('#resolveConfirm').disabled = false; }
+  }
+  async function setThreadStatus(threadId, action, btn, itemEl) {
+    if (action === 'resolve') { openResolve(threadId, btn); return; }
+    const draft = replyDraft(threadId);
+    const name = (draft.name || state.name || '').trim();
+    if (!name) { openReply(threadId); return; }
+    btn.disabled = true; btn.textContent = 'Reopen\u2026';
+    try {
+      await api('/comment-threads/' + threadId + '/reopen', { method: 'POST', body: JSON.stringify({ name: name }) });
+      commitGlobalIdentity(state.name, name); setStatus(''); await loadThreads();
+    } catch (e) { setStatus(e.message || 'Failed to reopen.'); btn.disabled = false; btn.textContent = 'Reopen'; }
   }
 
   // ---- recovery ladder ----
@@ -764,70 +1029,91 @@ function injectCommentsUI(html: string, config: {
   }
 
   // ---- render ----
-  function render() {
+  const kindLabel = (kind) => (kind || 'note').charAt(0).toUpperCase() + (kind || 'note').slice(1);
+  const kindBadge = (kind) => '<span class="kindBadge ' + esc(kind || 'note') + '">' + esc(kindLabel(kind)) + '</span>';
+  const visibleMessages = (thread) => (thread.messages || []).filter((message) => !message.deleted_at);
+  const readinessCount = (threads, kind) => threads.reduce((total, thread) => total + (thread.status === 'resolved' ? 0 : visibleMessages(thread).filter((message) => (message.kind || 'note') === kind).length), 0);
+  const threadMatchesKind = (thread, kind) => kind === 'all' || visibleMessages(thread).some((message) => (message.kind || 'note') === kind);
+  function render(preserveReplyFocus) {
     countEl.textContent = state.threads.length;
-    if (!state.threads.length) { list.innerHTML = '<div class="empty">No comments yet.<br>Click <b>Comment</b>, then click a component (or select text).</div>'; return; }
-    // Preserve typed reply text across poll-cycle re-renders.
-    const savedInputs = {};
-    Array.prototype.forEach.call(list.querySelectorAll('.item'), (item) => {
-      const inp = item.querySelector('.replyInput');
-      if (inp && inp.disabled) return; // just-posted: don't restore
-      const nm = item.querySelector('.replyName');
-      savedInputs[item.getAttribute('data-id')] = { body: inp ? inp.value : '', name: nm ? nm.value : '' };
+    $('#readyStats').innerHTML = '<div class="readyStat"><span>Blockers</span><b>' + readinessCount(state.threads, 'blocker') + '</b></div><div class="readyStat"><span>Questions</span><b>' + readinessCount(state.threads, 'question') + '</b></div><div class="readyStat"><span>Actions</span><b>' + readinessCount(state.threads, 'action') + '</b></div>';
+    const visible = state.threads.filter((th) => {
+      if (state.statusFilter !== 'all' && (th.status || 'open') !== state.statusFilter) return false;
+      return threadMatchesKind(th, state.kindFilter);
     });
-    list.innerHTML = state.threads.map((th) => {
-      const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {};
+    if (state.expandedThreadId && !visible.some((thread) => thread.id === state.expandedThreadId)) queueReplyCollapseFocus(state.expandedThreadId);
+    else if (preserveReplyFocus && !state.replyFocusAfterRender) state.replyFocusAfterRender = captureReplyFocus();
+    if (!visible.length) { list.innerHTML = '<div class="empty">No comments match these filters.</div>'; restoreQueuedReplyFocus(); return; }
+    list.innerHTML = visible.map((th) => {
+      const a = th.anchor || {}, view = a.view || {}, st = a.state || {};
       const label = a.quote ? ('“' + a.quote.exact + '”') : (st.text || (th.scope_type === 'artifact' ? 'Whole page' : '(element)'));
-      const msgs = th.messages || [];
-      const first = msgs[0] || {};
-      const resolved = th.status === 'resolved';
-      // resolved_by_label is '' when the resolver had no stored name — degrade to
-      // a bare "resolved" rather than a dangling "resolved by".
+      const msgs = th.messages || [], first = msgs[0] || {}, resolved = th.status === 'resolved';
       const who = (th.resolved_by_label || '').trim();
-      const badge = resolved
-        ? '<span class="badge resolved"><span class="badgeText">resolved' + (who ? ' by ' + esc(who) : '') + (th.resolved_at ? ' \\u00b7 ' + ago(th.resolved_at) : '') + '</span></span>'
+      const statusBadge = resolved
+        ? '<span class="badge resolved"><span class="badgeText">resolved' + (who ? ' by ' + esc(who) : '') + (th.resolved_at ? ' \u00b7 ' + ago(th.resolved_at) : '') + '</span></span>'
         : '<span class="badge open"><span class="badgeText">open</span></span>';
+      const key = Array.from(String(th.id)).map((char) => char.codePointAt(0).toString(16)).join('-');
+      const composerId = 'reply-composer-' + key, editorId = 'reply-identity-editor-' + key, nameId = 'reply-name-' + key, replyId = 'reply-body-' + key, kindsId = 'reply-kinds-' + key;
+      const draft = resolved ? null : replyDraft(th.id);
+      const expanded = !resolved && state.expandedThreadId === th.id;
       let html = '<div class="item" data-id="' + esc(th.id) + '">' +
         '<div class="ctxline">' + esc(view.navLabel || view.heading || 'Page') + ' · <span class="sel">' + esc(label.slice(0, 46)) + (label.length > 46 ? '…' : '') + '</span></div>' +
-        '<div class="meta"><b>' + esc(th.created_by_label || first.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span>' + badge + '</div>' +
+        '<div class="messageHead' + (resolved ? ' resolvedHead' : '') + '"><div class="meta"><b>' + esc(th.created_by_label || first.author_label || 'Someone') + '</b><span class="agox">' + ago(th.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="messageBadges">' + kindBadge(first.kind) + statusBadge + '</div></div>' +
         '<div class="body">' + esc(first.body || '') + '</div>';
       for (let i = 1; i < msgs.length; i++) {
         const r = msgs[i];
-        html += '<div class="reply"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b><span class="agox">' + ago(r.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="body">' + esc(r.body || '') + '</div></div>';
+        html += '<div class="reply"><div class="messageHead"><div class="meta"><b>' + esc(r.author_label || 'Someone') + '</b><span class="agox">' + ago(r.created_at || Math.floor(Date.now() / 1000)) + '</span></div><div class="messageBadges">' + kindBadge(r.kind) + '</div></div><div class="body">' + esc(r.body || '') + '</div></div>';
       }
-      html += '<div class="threadActions">' + (resolved
-        ? '<button class="btn small reopen" data-act="reopen">Reopen</button>'
-        : '<button class="btn small resolve" data-act="resolve">Resolve</button>') + '</div>';
-      html += '<div class="replyForm"' + (resolved ? ' hidden' : '') + '><input class="replyName" type="text" placeholder="Your name" maxlength="80" value="' + esc(state.name || '') + '"><input class="replyInput" type="text" placeholder="Reply…"><button class="replyBtn">Reply</button></div>' +
-        '<div class="orphan" hidden></div></div>';
-      return html;
+      html += '<div class="threadActions">' + (!resolved ? '<button type="button" class="replyToggle" data-thread-id="' + esc(th.id) + '" aria-expanded="' + String(expanded) + '" aria-controls="' + composerId + '">Reply</button>' : '<span></span>') + '<div class="threadActionGroup">' + (resolved
+        ? '<button type="button" class="btn small reopen" data-act="reopen">Reopen</button>'
+        : '<button type="button" class="btn small resolve" data-act="resolve">Resolve</button>') + '</div></div>';
+      if (!resolved) {
+        const summaryHidden = draft.identityEditing || !draft.name;
+        const editorHidden = !draft.identityEditing && !!draft.name;
+        html += '<div id="' + composerId + '" class="replyForm"' + (expanded ? '' : ' hidden') + '>' +
+          '<div class="replyIdentity" aria-label="Reply identity"><div class="identitySummary"' + (summaryHidden ? ' hidden' : '') + '><span class="identityAvatar" aria-hidden="true">' + esc(initials(draft.name)) + '</span><span>Replying as <strong>' + esc(draft.name) + '</strong></span><button type="button" class="identityChange" aria-controls="' + editorId + '" aria-expanded="' + String(!editorHidden) + '">Change</button></div>' +
+          '<div id="' + editorId + '" class="identityEditor"' + (editorHidden ? ' hidden' : '') + '><label for="' + nameId + '">Your name <span class="required">*</span></label><input id="' + nameId + '" class="replyName" type="text" autocomplete="name" maxlength="80" required value="' + esc(draft.identityEditorValue) + '"><div class="identityActions"><button type="button" class="btn ghost identityCancel">Cancel</button><button type="button" class="btn primary identitySave">Save</button></div></div></div>' +
+          '<div class="replyField"><label for="' + replyId + '">Reply</label><textarea id="' + replyId + '" class="replyInput" placeholder="Write a reply…" required>' + esc(draft.body) + '</textarea></div>' +
+          '<div class="replyKinds"><span id="' + kindsId + '" class="replyKindsLabel">Reply type</span><div class="replyKindChips" role="group" aria-labelledby="' + kindsId + '">' + ['note','blocker','concern','question','action','nit'].map((kind) => '<button type="button" class="replyKindChip" data-kind="' + kind + '" aria-pressed="' + String(draft.kind === kind) + '">' + kindLabel(kind) + '</button>').join('') + '</div></div>' +
+          '<div class="replyActions"><button type="button" class="btn ghost replyCancel">Cancel</button><button type="button" class="replyBtn"' + (state.replySubmitting === th.id ? ' disabled' : '') + '>Reply</button></div></div>';
+      }
+      return html + '<div class="orphan" hidden></div></div>';
     }).join('');
-    // Restore typed reply text.
-    Array.prototype.forEach.call(list.querySelectorAll('.item'), (item) => {
-      const s = savedInputs[item.getAttribute('data-id')]; if (!s) return;
-      const inp = item.querySelector('.replyInput'); if (inp && s.body) inp.value = s.body;
-      const nm = item.querySelector('.replyName'); if (nm && s.name) nm.value = s.name;
+    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm,.threadActions,button,input,textarea,select,label,[role=group]')) return; onItem(el.getAttribute('data-id'), el); }));
+    Array.prototype.forEach.call(list.querySelectorAll('.threadActions [data-act]'), (btn) => btn.addEventListener('click', (ev) => { ev.stopPropagation(); const item = btn.closest('.item'); if (item) setThreadStatus(item.getAttribute('data-id'), btn.getAttribute('data-act'), btn, item); }));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyToggle'), (btn) => btn.addEventListener('click', (ev) => { ev.stopPropagation(); openReply(btn.getAttribute('data-thread-id')); }));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyName'), (input) => input.addEventListener('input', () => { replyDraft(input.closest('.item').getAttribute('data-id')).identityEditorValue = input.value; input.setCustomValidity(''); }));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyInput'), (input) => input.addEventListener('input', () => { replyDraft(input.closest('.item').getAttribute('data-id')).body = input.value; }));
+    Array.prototype.forEach.call(list.querySelectorAll('.identityChange'), (btn) => btn.addEventListener('click', () => { const id = btn.closest('.item').getAttribute('data-id'), draft = replyDraft(id); draft.priorIdentity = draft.name; draft.identityEditorValue = draft.name; draft.identityEditing = true; render(); focusReplyControl(id, '.replyName'); }));
+    Array.prototype.forEach.call(list.querySelectorAll('.identitySave'), (btn) => btn.addEventListener('click', () => saveIdentity(btn.closest('.item').getAttribute('data-id'))));
+    Array.prototype.forEach.call(list.querySelectorAll('.identityCancel'), (btn) => btn.addEventListener('click', () => cancelIdentity(btn.closest('.item').getAttribute('data-id'), true)));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyCancel'), (btn) => btn.addEventListener('click', () => collapseReply(btn.closest('.item').getAttribute('data-id'), true)));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => btn.addEventListener('click', () => postReply(btn.closest('.item').getAttribute('data-id'))));
+    Array.prototype.forEach.call(list.querySelectorAll('.replyKindChip'), (chip) => {
+      const selectChip = () => { const id = chip.closest('.item').getAttribute('data-id'), draft = replyDraft(id); draft.kind = chip.getAttribute('data-kind'); Array.prototype.forEach.call(chip.parentElement.querySelectorAll('.replyKindChip'), (candidate) => candidate.setAttribute('aria-pressed', String(candidate === chip))); };
+      chip.addEventListener('click', selectChip);
+      chip.addEventListener('keydown', (event) => { if (event.key !== 'ArrowRight' && event.key !== 'ArrowDown' && event.key !== 'ArrowLeft' && event.key !== 'ArrowUp') return; event.preventDefault(); const chips = Array.prototype.slice.call(chip.parentElement.querySelectorAll('.replyKindChip')); const delta = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1; const next = chips[(chips.indexOf(chip) + delta + chips.length) % chips.length]; next.click(); next.focus(); });
     });
-    // Clicks in the reply form or on a thread action must not also fire the card's
-    // scroll-to-anchor.
-    Array.prototype.forEach.call(list.querySelectorAll('.item'), (el) => { el.addEventListener('click', (ev) => { if (ev.target.closest('.replyForm') || ev.target.closest('.threadActions')) return; onItem(el.getAttribute('data-id'), el); }); });
-    Array.prototype.forEach.call(list.querySelectorAll('.threadActions button'), (btn) => {
-      btn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        const item = btn.closest('.item'); if (!item) return;
-        setThreadStatus(item.getAttribute('data-id'), btn.getAttribute('data-act'), btn);
-      });
-    });
-    Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => {
-      btn.addEventListener('click', (e) => { e.stopPropagation(); var item = btn.closest('.item'); if (item) postReply(item.getAttribute('data-id'), item); });
-    });
+    restoreQueuedReplyFocus();
   }
+
   function onItem(id, el) {
     const th = state.threads.filter((x) => x.id === id)[0]; if (!th) return;
     const target = relocate(th.anchor || {}), orphan = el.querySelector('.orphan');
     if (target) { orphan.hidden = true; target.scrollIntoView({ behavior: 'smooth', block: 'center' }); setTimeout(() => flash(target), 300); }
     else { const a = th.anchor || {}; const view = a.view || {}; const st = a.state || {}; orphan.hidden = false; orphan.innerHTML = '⚠ The page changed since this was written. It referred to <b>“' + esc((st.text || '').slice(0, 80)) + '”</b> on the <b>' + esc(view.navLabel || view.heading || 'page') + '</b> screen.'; }
   }
+
+  sr.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (resolveDialog.hidden === false) { const threadId = state.resolving && state.resolving.threadId; event.preventDefault(); closeResolve(); if (threadId) focusReplyControl(threadId, '.resolve'); return; }
+    if (composer.hidden === false) { event.preventDefault(); closeComposer(); return; }
+    if (state.mode === 'comment' || !state.expandedThreadId) return;
+    event.preventDefault(); event.stopPropagation();
+    const threadId = state.expandedThreadId, draft = replyDraft(threadId);
+    if (draft.identityEditing) cancelIdentity(threadId, true);
+    else collapseReply(threadId, false);
+  });
 
   cName.value = state.name;
   setMode('browse');
@@ -855,7 +1141,20 @@ async function serveArtifact(
     return new Response('Link expired', { status: 410 });
   }
 
-  const stream = await blobGet(`artifacts/${meta.id}/files/${filePath}`);
+  let contentPath = `artifacts/${meta.id}/files/${filePath}`;
+  if (filePath === 'index.html') {
+    const sql = getSQL();
+    const versionRows = await sql`SELECT current_version_id FROM artifacts WHERE id = ${meta.id}`;
+    const currentVersionId = versionRows[0]?.current_version_id;
+    if (currentVersionId) contentPath = versionEntryBlobPath(meta.id, String(currentVersionId));
+  }
+  let stream = await blobGet(contentPath);
+  // Legacy artifacts created before version-scoped entry blobs continue to use
+  // the shared file path until their next publication.
+  if (!stream && filePath === 'index.html' && contentPath !== `artifacts/${meta.id}/files/${filePath}`) {
+    contentPath = `artifacts/${meta.id}/files/${filePath}`;
+    stream = await blobGet(contentPath);
+  }
   if (!stream) {
     if (!filePath.endsWith('.html')) {
       const indexStream = await blobGet(`artifacts/${meta.id}/files/${filePath}/index.html`);
@@ -876,7 +1175,7 @@ async function serveArtifact(
   };
 
   if (filePath.endsWith('.html')) {
-    const response = await fetch(blobUrl(`artifacts/${meta.id}/files/${filePath}`), { headers: blobHeaders() });
+    const response = await fetch(blobUrl(contentPath), { headers: blobHeaders() });
     if (!response.ok) return new Response('Not found', { status: 404 });
     const html = await response.text();
     headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'; base-uri 'none';";
@@ -1082,19 +1381,26 @@ export default async function handler(request: Request): Promise<Response> {
           const passwordParam = url.searchParams.get('password');
           const newPasswordHash = passwordParam ? await sha256(passwordParam + existingId) : null;
           const newExpiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
-          // Folder re-share reconciliation: drop stale sub-files (anything other than
-          // the entry) so a page removed/renamed in the new version can't orphan and
-          // keep serving the old blob. index.html is overwritten in place just below;
-          // the client re-uploads the current sub-files next via /files. Single-file
-          // re-shares are unaffected (their only blob is index.html, which is skipped).
-          const staleFiles = await blobList(`artifacts/${existingId}/files/`);
-          for (const p of staleFiles) {
-            if (p !== `artifacts/${existingId}/files/index.html`) await blobDelete(p);
-          }
-          await blobPut(`artifacts/${existingId}/files/index.html`, html, 'text/html');
-          await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${sizeBytes}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           if (contentChanged || force) {
-            await mintVersion(existingId, newHash, now);
+            // Stage immutable content under the candidate version. It is not
+            // reachable from serveArtifact until mintVersion serializes ownership,
+            // copies comments, updates metadata, and advances the pointer last.
+            const candidateVersionId = generateId();
+            const stagedPath = versionEntryBlobPath(existingId, candidateVersionId);
+            await blobPut(stagedPath, html, 'text/html');
+            try {
+              await mintVersion(existingId, newHash, now, candidateVersionId, {
+                name,
+                sizeBytes,
+                expiresAt: newExpiresAt,
+                passwordHash: newPasswordHash,
+              });
+            } catch (error) {
+              await blobDelete(stagedPath).catch(() => {});
+              throw error;
+            }
+          } else {
+            await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${sizeBytes}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           }
           const shortUrl = `${url.origin}/s/${requestedId}`;
           return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
@@ -1124,11 +1430,18 @@ export default async function handler(request: Request): Promise<Response> {
       const commentsParam = url.searchParams.get('comments');
       const commentsEnabled = commentsParam === '1' || commentsParam === 'true' ? 1 : 0;
 
-      await blobPut(`artifacts/${id}/files/index.html`, html, 'text/html');
-
       const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
       await sql`INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (${id}, ${slug}, ${name}, ${sizeBytes}, ${now}, ${expiresAt}, ${auth.tokenHash}, ${passwordHash}, ${commentsEnabled})`;
-      await mintVersion(id, await sha256(html), now);
+      const initialVersionId = generateId();
+      const stagedPath = versionEntryBlobPath(id, initialVersionId);
+      await blobPut(stagedPath, html, 'text/html');
+      try {
+        await mintVersion(id, await sha256(html), now, initialVersionId);
+      } catch (error) {
+        await blobDelete(stagedPath).catch(() => {});
+        await sql`DELETE FROM artifacts WHERE id = ${id} AND current_version_id IS NULL`.catch(() => {});
+        throw error;
+      }
 
       // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
       // time-bound distinction so the verifier can normalize correctly.
@@ -1296,7 +1609,7 @@ export default async function handler(request: Request): Promise<Response> {
         }
         const vid = vrow[0].id;
         const vThreads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${vid} AND deleted_at IS NULL ORDER BY created_at DESC`;
-        const vMessages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.version_id = ${vid} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+        const vMessages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.version_id = ${vid} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
         const vHydrated = hydrateCommentThreads(vThreads, vMessages);
         return authJson({ version: seq, versionId: vid, viewer: { authenticated: true, label: null }, threads: vHydrated, activityThreads: vHydrated });
       }
@@ -1306,12 +1619,12 @@ export default async function handler(request: Request): Promise<Response> {
       const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
       const curVid = curVerRow[0] ? curVerRow[0].vid : null;
       const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`;
-      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
+      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
       const activityThreads = includeActivity
         ? await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`
         : threads;
       const activityMessages = includeActivity
-        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
+        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
         : messages;
 
       // Access is already proven (grant or owner); anyone may edit/delete/resolve.
@@ -1322,7 +1635,7 @@ export default async function handler(request: Request): Promise<Response> {
           const out = {
             ...row,
             can_edit: !row.deleted_at && row.thread_status !== 'resolved',
-            can_delete: !row.deleted_at,
+            can_delete: !row.deleted_at && !(row.kind === 'resolution' && row.thread_status === 'resolved'),
           };
           delete out.author_token_hash; // never expose the legacy author token hash
           items.push(out);
@@ -1360,6 +1673,8 @@ export default async function handler(request: Request): Promise<Response> {
       if (name instanceof Response) return name;
       const normalized = normalizeThreadInput(reqBody);
       if (normalized instanceof Response) return normalized;
+      const kind = normalizeMessageKind(reqBody);
+      if (kind instanceof Response) return kind;
 
       const sql = getSQL();
       const now = Math.floor(Date.now() / 1000);
@@ -1367,8 +1682,10 @@ export default async function handler(request: Request): Promise<Response> {
       const messageId = generateId();
       const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
       const versionId = curVerRow[0] ? curVerRow[0].vid : null;
-      await sql`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${versionId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`;
-      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${normalized.body}, ${now}, ${now})`;
+      await sql.transaction((tx) => [
+        tx`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${versionId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`,
+        tx`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${normalized.body}, ${kind}, ${now}, ${now})`,
+      ]);
       return authJson({
         id: threadId,
         messageId,
@@ -1392,6 +1709,7 @@ export default async function handler(request: Request): Promise<Response> {
             thread_id: threadId,
             author_label: name,
             body: normalized.body,
+            kind,
             created_at: now,
             updated_at: now,
             deleted_at: null,
@@ -1417,11 +1735,15 @@ export default async function handler(request: Request): Promise<Response> {
       if (name instanceof Response) return name;
       const message = normalizeMessageInput(reqBody);
       if (message instanceof Response) return message;
+      const kind = normalizeMessageKind(reqBody);
+      if (kind instanceof Response) return kind;
 
       const now = Math.floor(Date.now() / 1000);
       const messageId = generateId();
-      await sql`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${now}, ${now})`;
-      await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId}`;
+      await sql.transaction((tx) => [
+        tx`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${kind}, ${now}, ${now})`,
+        tx`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId}`,
+      ]);
       return authJson({
         id: messageId,
         threadId,
@@ -1431,6 +1753,7 @@ export default async function handler(request: Request): Promise<Response> {
           thread_id: threadId,
           author_label: name,
           body: message,
+          kind,
           created_at: now,
           updated_at: now,
           deleted_at: null,
@@ -1452,21 +1775,52 @@ export default async function handler(request: Request): Promise<Response> {
       if (access instanceof Response) return access;
 
       const rb = await request.json().catch(() => null);
-      const resolverName = rb && typeof rb === 'object' && typeof (rb as { name?: unknown }).name === 'string'
-        ? (rb as { name: string }).name.trim().slice(0, 80) : '';
+      const resolverName = normalizeName(rb);
+      if (resolverName instanceof Response) return resolverName;
 
       const now = Math.floor(Date.now() / 1000);
+      let resolutionMessage = null;
       if (action === 'resolve') {
-        await sql`UPDATE comment_threads SET status = 'resolved', resolved_by_token_hash = ${NO_TOKEN}, resolved_by_label = ${resolverName}, resolved_at = ${now}, updated_at = ${now} WHERE id = ${threadId}`;
+        const resolutionBody = normalizeMessageInput(rb);
+        if (resolutionBody instanceof Response) return resolutionBody;
+        const messageId = generateId();
+        const transition = await sql`
+          WITH transitioned AS (
+            UPDATE comment_threads
+            SET status = 'resolved', resolved_by_token_hash = ${NO_TOKEN}, resolved_by_label = ${resolverName}, resolved_at = ${now}, updated_at = ${now}
+            WHERE id = ${threadId} AND status = 'open' AND deleted_at IS NULL
+            RETURNING id
+          ), inserted AS (
+            INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at)
+            SELECT ${messageId}, id, ${NO_TOKEN}, ${resolverName}, ${resolutionBody}, 'resolution', ${now}, ${now}
+            FROM transitioned
+            RETURNING id
+          )
+          SELECT id FROM inserted
+        `;
+        if (!transition[0]) return new Response('Thread is already resolved', { status: 409 });
+        resolutionMessage = {
+          id: messageId,
+          thread_id: threadId,
+          author_label: resolverName,
+          body: resolutionBody,
+          kind: 'resolution',
+          created_at: now,
+          updated_at: now,
+          deleted_at: null,
+          can_edit: false,
+          can_delete: false,
+        };
       } else {
         await sql`UPDATE comment_threads SET status = 'open', resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ${now} WHERE id = ${threadId}`;
       }
       return authJson({
         id: threadId,
         status: action === 'resolve' ? 'resolved' : 'open',
-        resolvedByLabel: action === 'resolve' ? (resolverName || null) : null,
+        resolvedByLabel: action === 'resolve' ? resolverName : null,
         resolvedAt: action === 'resolve' ? now : null,
         updatedAt: now,
+        ...(action === 'resolve' ? { message: resolutionMessage } : {}),
       });
     }
 
@@ -1490,7 +1844,7 @@ export default async function handler(request: Request): Promise<Response> {
       const messageId = messageMatch[1];
 
       const sql = getSQL();
-      const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
+      const rows = await sql`SELECT m.thread_id, m.author_token_hash, m.kind, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ${messageId} AND t.deleted_at IS NULL`;
       if (!rows[0] || rows[0].deleted_at) return new Response('Not found', { status: 404 });
       const access = await requireCommentAccess(request, String(rows[0].artifact_id));
       if (access instanceof Response) return access;
@@ -1505,6 +1859,9 @@ export default async function handler(request: Request): Promise<Response> {
         return authJson({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
       }
 
+      if (rows[0].kind === 'resolution' && rows[0].thread_status === 'resolved') {
+        return new Response('Resolution messages cannot be deleted while the thread is resolved', { status: 409 });
+      }
       await sql`UPDATE comment_messages SET deleted_at = ${now}, deleted_by_token_hash = ${NO_TOKEN}, updated_at = ${now} WHERE id = ${messageId}`;
       await sql`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${rows[0].thread_id}`;
       return new Response(null, { status: 204 });

@@ -3,14 +3,17 @@ import { readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
-// Live end-to-end test of the comment feature against a deployed toss-test (Vercel).
+// Live end-to-end test of the comment feature against a deployed test backend.
 // Gated like tests/e2e/live.test.ts — skipped under `npm test`; run explicitly with:
 //   TOSS_E2E_COMMENTS=1 npx vitest run tests/e2e/comments.test.ts
-// Uses the `test` profile's owner token from ~/.toss/config.json and the stable alias.
+// Override the default Vercel endpoint with TOSS_E2E_BASE (for example, a Worker
+// test endpoint) and provide its owner token with TOSS_E2E_TOKEN. Otherwise the
+// selected `test` profile's token from ~/.toss/config.json is used.
 const RUN = process.env.TOSS_E2E_COMMENTS === '1';
 const BASE = process.env.TOSS_E2E_BASE || 'https://toss-test-jade.vercel.app';
 
 function testToken(): string {
+  if (process.env.TOSS_E2E_TOKEN) return process.env.TOSS_E2E_TOKEN;
   try {
     const cfg = JSON.parse(readFileSync(join(homedir(), '.toss', 'config.json'), 'utf-8'));
     return cfg.profiles?.test?.token || '';
@@ -19,7 +22,7 @@ function testToken(): string {
   }
 }
 
-describe.skipIf(!RUN)('comments e2e (live toss-test)', () => {
+describe.skipIf(!RUN)('comments e2e (deployed test backend)', () => {
   const TOKEN = testToken();
   const SLUG = 'e2e-' + Math.random().toString(36).slice(2, 8);
   const PW = 'e2epw-' + Math.random().toString(36).slice(2, 6);
@@ -63,7 +66,7 @@ describe.skipIf(!RUN)('comments e2e (live toss-test)', () => {
   };
 
   beforeAll(async () => {
-    expect(TOKEN, 'test profile token in ~/.toss/config.json').toBeTruthy();
+    expect(TOKEN, 'TOSS_E2E_TOKEN or test profile token').toBeTruthy();
     const c = await upload(V1);
     expect(c.status, 'create share').toBe(200);
     ID = c.json?.id;
@@ -109,7 +112,7 @@ describe.skipIf(!RUN)('comments e2e (live toss-test)', () => {
   }, 30000); // ~7 live round-trips (uploads mint versions); default 5s is too tight
 });
 
-describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
+describe.skipIf(!RUN)('carry-forward e2e (deployed test backend)', () => {
   const TOKEN = testToken();
   const SLUG = 'e2ecf-' + Math.random().toString(36).slice(2, 8);
   let ID = '';
@@ -140,14 +143,14 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     return { status: res.status, json: await res.json().catch(() => null) as any };
   };
 
-  const postWithId = async (body: string, auth: { token?: string; password?: string }) => {
+  const postWithId = async (body: string, auth: { token?: string; password?: string }, kind?: string) => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
     if (auth.password) headers['X-Toss-Password'] = auth.password;
     const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ name: 'E2E', body, pagePath: 'index.html', scopeType: 'artifact' }),
+      body: JSON.stringify({ name: 'E2E', body, kind, pagePath: 'index.html', scopeType: 'artifact' }),
     });
     return { status: res.status, json: await res.json().catch(() => null) as any };
   };
@@ -156,7 +159,7 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     const res = await fetch(`${BASE}/comment-threads/${threadId}/resolve`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'E2E' }),
+      body: JSON.stringify({ name: 'E2E', body: 'Addressed in the new version' }),
     });
     return { status: res.status, json: await res.json().catch(() => null) as any };
   };
@@ -193,7 +196,7 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
 
     // 1. Post 3 comments: A, B, C
     const a = await postWithId('comment A', { token: TOKEN });
-    const b = await postWithId('comment B', { token: TOKEN });
+    const b = await postWithId('comment B', { token: TOKEN }, 'blocker');
     const c = await postWithId('comment C', { token: TOKEN });
     expect(a.status, 'post A').toBe(201);
     expect(b.status, 'post B').toBe(201);
@@ -231,6 +234,7 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
     );
     expect(threadB, 'thread B present').toBeTruthy();
     expect(threadB.status, 'thread B still resolved').toBe('resolved');
+    expect(threadB.messages.map((m: any) => m.kind), 'message kinds carried forward').toEqual(['blocker', 'resolution']);
 
     // 6. Read v1 again → still has all 3 original threads (A, B, C preserved)
     const v1again = await readVersion(1, TOKEN);
@@ -239,7 +243,7 @@ describe.skipIf(!RUN)('carry-forward e2e (live toss-test)', () => {
   });
 });
 
-describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
+describe.skipIf(!RUN)('reply e2e (deployed test backend)', () => {
   const TOKEN = testToken();
   const SLUG = 'e2erpl-' + Math.random().toString(36).slice(2, 8);
   let ID = '';
@@ -253,29 +257,29 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     return { status: res.status, json: (await res.json().catch(() => null)) as any };
   };
 
-  const postThread = async (body: string, auth: { token?: string; password?: string }) => {
+  const postThread = async (body: string, auth: { token?: string; password?: string }, kind?: string, name = 'E2E') => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
     if (auth.password) headers['X-Toss-Password'] = auth.password;
     const res = await fetch(`${BASE}/artifacts/${ID}/comment-threads`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ name: 'E2E', body, pagePath: 'index.html', scopeType: 'artifact' }),
+      body: JSON.stringify({ name, body, kind, pagePath: 'index.html', scopeType: 'artifact' }),
     });
     return { status: res.status, json: (await res.json().catch(() => null)) as any };
   };
 
-  const postReply = async (threadId: string, body: string, token: string) => {
+  const postReply = async (threadId: string, body: string, token: string, kind?: string, name = 'E2E Reply') => {
     const res = await fetch(`${BASE}/comment-threads/${threadId}/messages`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'E2E Reply', body }),
+      body: JSON.stringify({ name, body, kind }),
     });
     return { status: res.status, json: (await res.json().catch(() => null)) as any };
   };
 
   beforeAll(async () => {
-    expect(TOKEN, 'test profile token in ~/.toss/config.json').toBeTruthy();
+    expect(TOKEN, 'TOSS_E2E_TOKEN or test profile token').toBeTruthy();
     const html = '<!doctype html><html><body><h1>E2E Replies</h1><p>test</p></body></html>';
     const u = new URL(BASE + '/artifacts');
     u.searchParams.set('name', 'e2e.html');
@@ -306,17 +310,20 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     expect(threadId, 'thread id from beforeAll').toBeTruthy();
 
     // Post a reply
-    const reply = await postReply(threadId, 'first reply', TOKEN);
+    const reply = await postReply(threadId, 'first reply', TOKEN, 'question');
     expect(reply.status, 'post reply').toBe(201);
     expect(reply.json.message.body, 'reply body').toBe('first reply');
     expect(reply.json.message.author_label, 'reply author').toBe('E2E Reply');
+    expect(reply.json.message.kind, 'reply kind').toBe('question');
 
     // Read again — verify reply is in messages
     const after = await read({ token: TOKEN });
     const msgs = after.json.threads[0]?.messages || [];
     expect(msgs.length, 'messages count includes reply').toBeGreaterThanOrEqual(2);
+    expect(msgs[0].kind, 'absent root kind defaults to note').toBe('note');
     expect(msgs[1].body, 'second message is the reply').toBe('first reply');
     expect(msgs[1].author_label, 'reply author label').toBe('E2E Reply');
+    expect(msgs[1].kind, 'reply kind persisted').toBe('question');
   });
 
   it('multiple replies are ordered chronologically', async () => {
@@ -341,11 +348,31 @@ describe.skipIf(!RUN)('reply e2e (live toss-test)', () => {
     expect(bodies.indexOf('reply A')).toBeLessThan(bodies.indexOf('reply B'));
     expect(bodies.indexOf('reply B')).toBeLessThan(bodies.indexOf('reply C'));
   });
+
+  it('accepts exact normal kinds and rejects unknown, resolution, and nameless writes', async () => {
+    for (const kind of ['note', 'blocker', 'concern', 'question', 'action', 'nit']) {
+      const created = await postThread(`typed ${kind}`, { token: TOKEN }, kind);
+      expect(created.status, `create ${kind}`).toBe(201);
+      expect(created.json.thread.messages[0].kind, `${kind} response kind`).toBe(kind);
+    }
+
+    expect((await postThread('bad kind', { token: TOKEN }, 'idea')).status, 'unknown create kind').toBe(400);
+    expect((await postThread('normal resolution forbidden', { token: TOKEN }, 'resolution')).status, 'resolution create kind').toBe(400);
+    expect((await postThread('missing author', { token: TOKEN }, 'note', '  ')).status, 'nameless create').toBe(400);
+    expect((await postReply(threadId, 'bad reply kind', TOKEN, 'idea')).status, 'unknown reply kind').toBe(400);
+    expect((await postReply(threadId, 'normal resolution reply forbidden', TOKEN, 'resolution')).status, 'resolution reply kind').toBe(400);
+    expect((await postReply(threadId, 'missing reply author', TOKEN, 'note', '  ')).status, 'nameless reply').toBe(400);
+
+    const after = await read({ token: TOKEN });
+    const typed = after.json.threads.filter((t: any) => t.messages[0]?.body.startsWith('typed '));
+    expect(typed.map((t: any) => t.messages[0].kind).sort(), 'all exact kinds persist in render payload')
+      .toEqual(['action', 'blocker', 'concern', 'nit', 'note', 'question']);
+  }, 30000);
 });
 
 // Backs the widget's resolve/reopen controls: the reviewer who raised a thread must
 // see that it was addressed (status + who), and that it can be un-addressed.
-describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
+describe.skipIf(!RUN)('resolve/reopen e2e (deployed test backend)', () => {
   const TOKEN = testToken();
   const SLUG = 'e2eres-' + Math.random().toString(36).slice(2, 8);
   let ID = '';
@@ -357,13 +384,21 @@ describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
     return { status: res.status, json: (await res.json().catch(() => null)) as any };
   };
 
-  const setStatus = async (threadId: string, action: 'resolve' | 'reopen', name?: string) => {
+  const setStatus = async (threadId: string, action: 'resolve' | 'reopen', name?: string, body?: string) => {
     const res = await fetch(`${BASE}/comment-threads/${threadId}/${action}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(name === undefined ? {} : { name }),
+      body: JSON.stringify({ ...(name === undefined ? {} : { name }), ...(body === undefined ? {} : { body }) }),
     });
     return { status: res.status, json: (await res.json().catch(() => null)) as any };
+  };
+
+  const deleteMessage = async (messageId: string) => {
+    const res = await fetch(`${BASE}/comment-messages/${messageId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    return res.status;
   };
 
   const newThread = async (body: string) => {
@@ -377,7 +412,7 @@ describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
   };
 
   beforeAll(async () => {
-    expect(TOKEN, 'test profile token in ~/.toss/config.json').toBeTruthy();
+    expect(TOKEN, 'TOSS_E2E_TOKEN or test profile token').toBeTruthy();
     const u = new URL(BASE + '/artifacts');
     u.searchParams.set('name', 'e2e.html');
     u.searchParams.set('comments', '1');
@@ -406,11 +441,24 @@ describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
     const openThread = before.json.threads.find((t: any) => t.id === threadId);
     expect(openThread.status, 'starts open').toBe('open');
 
-    const resolved = await setStatus(threadId, 'resolve', 'Reviewer');
+    const resolved = await setStatus(threadId, 'resolve', 'Reviewer', 'Fixed the header hierarchy');
     expect(resolved.status, 'resolve call').toBe(200);
     expect(resolved.json.status).toBe('resolved');
     expect(resolved.json.resolvedByLabel, 'records who resolved it').toBe('Reviewer');
     expect(resolved.json.resolvedAt, 'records when').toBeTruthy();
+    expect(resolved.json.message, 'returns the created resolution message').toMatchObject({
+      thread_id: threadId,
+      author_label: 'Reviewer',
+      body: 'Fixed the header hierarchy',
+      kind: 'resolution',
+      deleted_at: null,
+      can_edit: false,
+      can_delete: false,
+    });
+    expect(resolved.json.message.id, 'resolution message id').toBeTruthy();
+
+    const duplicate = await setStatus(threadId, 'resolve', 'Other reviewer', 'A duplicate resolution');
+    expect(duplicate.status, 'duplicate resolve is rejected').toBe(409);
 
     // The badge reads from a re-fetch, so the state must survive a read.
     const after = await read();
@@ -418,8 +466,13 @@ describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
     expect(t2.status, 'persisted as resolved').toBe('resolved');
     expect(t2.resolved_by_label, 'resolver persisted').toBe('Reviewer');
     expect(t2.resolved_at, 'resolved_at persisted').toBeTruthy();
+    expect(t2.messages.at(-1)?.kind, 'resolution message kind').toBe('resolution');
+    expect(t2.messages.at(-1)?.body, 'resolution note persisted').toBe('Fixed the header hierarchy');
+    expect(t2.messages.at(-1)?.can_delete, 'resolved resolution is immutable').toBe(false);
+    expect(t2.messages.filter((message: any) => message.kind === 'resolution'), 'duplicate resolve creates no message').toHaveLength(1);
+    expect(await deleteMessage(resolved.json.message.id), 'cannot delete resolution while resolved').toBe(409);
 
-    const reopened = await setStatus(threadId, 'reopen');
+    const reopened = await setStatus(threadId, 'reopen', 'Reviewer');
     expect(reopened.status, 'reopen call').toBe(200);
     expect(reopened.json.status).toBe('open');
 
@@ -430,16 +483,108 @@ describe.skipIf(!RUN)('resolve/reopen e2e (live toss-test)', () => {
     expect(t3.resolved_at, 'resolved_at cleared on reopen').toBeFalsy();
   }, 30000);
 
-  it('resolving without a name still resolves (badge degrades to bare "resolved")', async () => {
-    const threadId = await newThread('nameless resolve');
-    const res = await setStatus(threadId, 'resolve');
-    expect(res.status, 'resolve without name').toBe(200);
-    expect(res.json.status).toBe('resolved');
-    expect(res.json.resolvedByLabel, 'no name → null, not a dangling label').toBeNull();
+  it('requires attribution and a resolution note without partially resolving', async () => {
+    const threadId = await newThread('required resolve fields');
+    expect((await setStatus(threadId, 'resolve', undefined, 'fixed')).status, 'resolve without name').toBe(400);
+    expect((await setStatus(threadId, 'resolve', 'Reviewer')).status, 'resolve without note').toBe(400);
+    expect((await setStatus(threadId, 'reopen')).status, 'reopen without name').toBe(400);
 
     const after = await read();
-    const t = after.json.threads.find((x: any) => x.id === threadId);
-    expect(t.status, 'resolved persisted').toBe('resolved');
-    expect((t.resolved_by_label || '').trim(), 'empty resolver label').toBe('');
+    const thread = after.json.threads.find((x: any) => x.id === threadId);
+    expect(thread.status, 'failed resolves leave thread open').toBe('open');
+    expect(thread.messages, 'failed resolves create no messages').toHaveLength(1);
+  }, 30000);
+});
+
+describe.skipIf(!RUN)('concurrent version publication e2e (deployed test backend)', () => {
+  const TOKEN = testToken();
+  const SLUG = 'e2econ-' + Math.random().toString(36).slice(2, 8);
+  let ID = '';
+
+  const upload = async (content: string, name = 'concurrent-version.html') => {
+    const url = new URL(`${BASE}/artifacts`);
+    url.searchParams.set('name', name);
+    url.searchParams.set('comments', '1');
+    url.searchParams.set('id', SLUG);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'text/html' },
+      body: content,
+    });
+    return { status: response.status, json: await response.json().catch(() => null) as any };
+  };
+
+  const readVersion = async (seq: number) => {
+    const response = await fetch(`${BASE}/artifacts/${ID}/comment-threads?version=${seq}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    return { status: response.status, json: await response.json().catch(() => null) as any };
+  };
+
+  afterAll(async () => {
+    if (ID) await fetch(`${BASE}/artifacts/${ID}`, { method: 'DELETE', headers: { Authorization: `Bearer ${TOKEN}` } }).catch(() => {});
+  });
+
+  it('allocates unique sequences and publishes complete carried snapshots', async () => {
+    expect(TOKEN, 'TOSS_E2E_TOKEN or test profile token').toBeTruthy();
+    const initial = await upload('<!doctype html><body>concurrent v1</body>');
+    expect(initial.status, 'initial upload').toBe(200);
+    ID = initial.json.id;
+
+    const comment = await fetch(`${BASE}/artifacts/${ID}/comment-threads`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Concurrent E2E', body: 'carried root', kind: 'note', scopeType: 'artifact', pagePath: 'index.html' }),
+    });
+    expect(comment.status, 'seed comment').toBe(201);
+    const threadId = ((await comment.json()) as any).thread.id;
+    const reply = await fetch(`${BASE}/comment-threads/${threadId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Concurrent E2E', body: 'carried blocker reply', kind: 'blocker' }),
+    });
+    expect(reply.status, 'seed reply').toBe(201);
+
+    const candidates = [
+      { html: '<!doctype html><body>concurrent candidate alpha</body>', name: 'candidate-alpha.html' },
+      { html: '<!doctype html><body>concurrent candidate beta</body>', name: 'candidate-beta.html' },
+    ];
+    const publications = await Promise.all(candidates.map((candidate) => upload(candidate.html, candidate.name)));
+    expect(publications.map((result) => result.status), 'both publications succeed').toEqual([200, 200]);
+
+    const versionsResponse = await fetch(`${BASE}/artifacts/${ID}/versions`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(versionsResponse.status, 'version list').toBe(200);
+    const versions = ((await versionsResponse.json()) as any).versions;
+    expect(versions.map((version: any) => version.seq), 'unique contiguous sequences').toEqual([3, 2, 1]);
+    expect(versions.filter((version: any) => version.is_current), 'one published pointer').toHaveLength(1);
+    expect(versions.find((version: any) => version.is_current).seq, 'latest pointer').toBe(3);
+
+    const digest = async (value: string) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))))
+      .map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    const candidateHashes = new Map(await Promise.all(candidates.map(async (candidate) => [await digest(candidate.html), candidate] as const)));
+    const current = versions.find((version: any) => version.is_current);
+    const winningCandidate = candidateHashes.get(current.content_hash);
+    expect(winningCandidate, 'current version hash belongs to one candidate').toBeTruthy();
+
+    const served = await fetch(`${BASE}/s/${SLUG}/`);
+    expect(served.status, 'serve current HTML').toBe(200);
+    const servedHtml = await served.text();
+    expect(servedHtml, 'served HTML matches the current version hash winner').toContain(
+      winningCandidate!.html.includes('alpha') ? 'concurrent candidate alpha' : 'concurrent candidate beta'
+    );
+    const artifactsResponse = await fetch(`${BASE}/artifacts`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    const artifact = ((await artifactsResponse.json()) as any[]).find((item) => item.id === ID);
+    expect(artifact.name, 'artifact metadata belongs to the same publication').toBe(winningCandidate!.name);
+    expect(Number(artifact.size_bytes), 'artifact size belongs to the same publication').toBe(winningCandidate!.html.length);
+
+    for (const seq of [2, 3]) {
+      const snapshot = await readVersion(seq);
+      expect(snapshot.status, `read version ${seq}`).toBe(200);
+      const messages = snapshot.json.threads.flatMap((thread: any) => thread.messages.map((message: any) => [message.body, message.kind]));
+      expect(messages, `complete carried snapshot ${seq}`).toEqual([
+        ['carried root', 'note'],
+        ['carried blocker reply', 'blocker'],
+      ]);
+    }
   }, 30000);
 });

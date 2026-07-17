@@ -2,6 +2,47 @@ import { readFileSync } from 'node:fs';
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
+const COMMENT_KINDS = ['note', 'blocker', 'concern', 'question', 'action', 'nit', 'resolution'] as const;
+const COMMENT_STATUSES = ['open', 'resolved'] as const;
+
+type CommentKind = typeof COMMENT_KINDS[number];
+type CommentStatus = typeof COMMENT_STATUSES[number];
+
+export type CommentsCommandOptions = {
+  profile?: string;
+  json?: boolean;
+  passwordEnv?: string;
+  seq?: string;
+  type?: string;
+  status?: string;
+  check?: boolean;
+};
+
+function messageKind(message: any): CommentKind {
+  // Messages created before attributed feedback kinds existed are ordinary notes.
+  return message.kind || 'note';
+}
+
+function filterThreads(threads: any[], kind?: CommentKind, status?: CommentStatus): any[] {
+  return threads
+    .filter((thread) => !status || (status === 'resolved' ? thread.status === 'resolved' : thread.status !== 'resolved'))
+    .map((thread) => {
+      if (!kind) return thread;
+      return {
+        ...thread,
+        messages: (thread.messages || []).filter((message: any) => !message.deleted_at && messageKind(message) === kind),
+      };
+    })
+    .filter((thread) => !kind || thread.messages.length > 0);
+}
+
+function unresolvedBlockerThreadCount(threads: any[]): number {
+  return threads.filter((thread) =>
+    thread.status !== 'resolved' &&
+    (thread.messages || []).some((message: any) => !message.deleted_at && messageKind(message) === 'blocker')
+  ).length;
+}
+
 // Resolve a secret from an env var NAME, falling back to ./.env — so the agent
 // passes only the KEY (e.g. --password-env REVIEW_PW), never the value.
 function readEnvKey(key: string): string | undefined {
@@ -25,8 +66,19 @@ function readEnvKey(key: string): string | undefined {
 export async function commentsCommand(
   idOrSlug: string,
   state: string | undefined,
-  options: { profile?: string; json?: boolean; passwordEnv?: string; seq?: string } = {}
+  options: CommentsCommandOptions = {}
 ) {
+  const kind = options.type as CommentKind | undefined;
+  if (kind && !COMMENT_KINDS.includes(kind)) {
+    console.error(`Error: --type must be one of: ${COMMENT_KINDS.join(', ')}.`);
+    process.exit(1);
+  }
+  const status = options.status as CommentStatus | undefined;
+  if (status && !COMMENT_STATUSES.includes(status)) {
+    console.error(`Error: --status must be one of: ${COMMENT_STATUSES.join(', ')}.`);
+    process.exit(1);
+  }
+
   const config = await loadConfig(options.profile);
   if (!config) {
     console.error('Error: No toss connection found. Run "toss login <endpoint> --token <token>" or "toss admin deploy" first.');
@@ -77,7 +129,17 @@ export async function commentsCommand(
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
-    const threads: any[] = (data && (data.activityThreads || data.threads)) || [];
+    const allThreads: any[] = (data && (data.activityThreads || data.threads)) || [];
+    const threads = filterThreads(allThreads, kind, status);
+    if (options.check) {
+      const blockerThreads = unresolvedBlockerThreadCount(allThreads);
+      if (blockerThreads > 0) {
+        console.error(`Check failed: ${blockerThreads} unresolved blocker thread(s).`);
+        process.exitCode = 1;
+      } else {
+        console.error('Check passed: no unresolved blocker threads.');
+      }
+    }
     if (options.json) {
       console.log(JSON.stringify({ artifactId: id, version, threads }, null, 2));
       return;
@@ -101,7 +163,8 @@ export async function commentsCommand(
       );
       for (const m of (t.messages || [])) {
         const when = new Date((m.created_at || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
-        console.log(`    ${m.author_label || 'anon'} · ${when}${m.deleted_at ? ' (deleted)' : ''}`);
+        const kindLabel = messageKind(m) === 'note' ? '' : `[${messageKind(m).toUpperCase()}] `;
+        console.log(`    ${kindLabel}${m.author_label || '<unknown author>'} · ${when}${m.deleted_at ? ' (deleted)' : ''}`);
         if (!m.deleted_at) console.log(`      ${String(m.body || '').replace(/\s+/g, ' ').trim()}`);
       }
       console.log('');

@@ -300,3 +300,141 @@ describe('versions + comments --version', () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 });
+
+describe('comments feedback kinds, filters, and checks', () => {
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
+
+  const HEXID = 'abc12345';
+  const ownerCfg = { endpoint: 'https://example.com', token: 'owner-token', subdomain: 'team', role: 'owner' } as any;
+  const threads = [
+    {
+      id: 'open-thread', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
+        { id: 'blocker', kind: 'blocker', author_label: 'Alice', body: 'Must fix', created_at: 1700000000 },
+        { id: 'note', kind: 'note', author_label: 'Bob', body: 'For context', created_at: 1700000001 },
+        { id: 'legacy', body: 'Old comment', created_at: 1700000002 },
+        { id: 'concern', kind: 'concern', author_label: 'Cara', body: 'Risky', created_at: 1700000003 },
+        { id: 'question', kind: 'question', author_label: 'Dan', body: 'Why?', created_at: 1700000004 },
+        { id: 'action', kind: 'action', author_label: 'Eli', body: 'Follow up', created_at: 1700000005 },
+        { id: 'nit', kind: 'nit', author_label: 'Fran', body: 'Small polish', created_at: 1700000006 },
+      ],
+    },
+    {
+      id: 'resolved-thread', status: 'resolved', scope_type: 'artifact', page_path: 'index.html', messages: [
+        { id: 'resolution', kind: 'resolution', author_label: '', body: 'Fixed', created_at: 1700000003 },
+        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+      throw new Error(`process.exit(${code})`);
+    });
+    process.exitCode = undefined;
+    vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ threads, activityThreads: threads }),
+    } as Response);
+  });
+
+  afterEach(() => {
+    process.exitCode = undefined;
+    vi.restoreAllMocks();
+  });
+
+  it('labels attributed kinds, omits NOTE, and never prints anon for legacy authors', async () => {
+    await commentsCommand(HEXID, undefined);
+    const out = consoleLogSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(out).toContain('[BLOCKER] Alice');
+    expect(out).toContain('[CONCERN] Cara');
+    expect(out).toContain('[QUESTION] Dan');
+    expect(out).toContain('[ACTION] Eli');
+    expect(out).toContain('[NIT] Fran');
+    expect(out).toContain('[RESOLUTION] <unknown author>');
+    expect(out).not.toContain('[NOTE]');
+    expect(out).not.toContain('anon');
+  });
+
+  it('applies type and status filters to JSON without changing retained messages', async () => {
+    await commentsCommand(HEXID, undefined, { type: 'resolution', status: 'resolved', json: true });
+    const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.threads).toHaveLength(1);
+    expect(parsed.threads[0].id).toBe('resolved-thread');
+    expect(parsed.threads[0].messages).toEqual([threads[1].messages[0]]);
+  });
+
+  it('treats legacy messages without a kind as notes when filtering', async () => {
+    await commentsCommand(HEXID, undefined, { type: 'note', json: true });
+    const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.threads[0].messages.map((message: any) => message.id)).toEqual(['note', 'legacy']);
+  });
+
+  it('excludes a thread whose only matching blocker message is deleted', async () => {
+    const deletedOnlyThreads = [{
+      id: 'deleted-only', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
+        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
+      ],
+    }];
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ threads: deletedOnlyThreads, activityThreads: deletedOnlyThreads }),
+    } as Response);
+
+    await commentsCommand(HEXID, undefined, { type: 'blocker', json: true });
+    const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.threads).toEqual([]);
+  });
+
+  it('rejects invalid type and status values with accepted values in the error', async () => {
+    await expect(commentsCommand(HEXID, undefined, { type: 'urgent' })).rejects.toThrow('process.exit(1)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('note, blocker, concern, question, action, nit, resolution'));
+
+    await expect(commentsCommand(HEXID, undefined, { status: 'closed' })).rejects.toThrow('process.exit(1)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('open, resolved'));
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('checks all unfiltered threads and sets exitCode for an unresolved blocker', async () => {
+    await commentsCommand(HEXID, undefined, { type: 'resolution', status: 'resolved', check: true, json: true });
+    expect(process.exitCode).toBe(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Check failed: 1 unresolved blocker thread(s).');
+    const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.threads).toHaveLength(1);
+    expect(parsed.threads[0].id).toBe('resolved-thread');
+  });
+
+  it('passes check when blockers are resolved or deleted', async () => {
+    const safeThreads = [
+      { ...threads[0], messages: threads[0].messages.filter((message) => message.kind !== 'blocker') },
+      threads[1],
+    ];
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ threads: safeThreads, activityThreads: safeThreads }),
+    } as Response);
+
+    await commentsCommand(HEXID, undefined, { check: true });
+    expect(process.exitCode).toBeUndefined();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Check passed: no unresolved blocker threads.');
+  });
+
+  it('passes check when an open thread\'s only blocker is deleted', async () => {
+    const deletedOnlyThreads = [{
+      id: 'deleted-only', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
+        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
+      ],
+    }];
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ threads: deletedOnlyThreads, activityThreads: deletedOnlyThreads }),
+    } as Response);
+
+    await commentsCommand(HEXID, undefined, { check: true });
+    expect(process.exitCode).toBeUndefined();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Check passed: no unresolved blocker threads.');
+  });
+});

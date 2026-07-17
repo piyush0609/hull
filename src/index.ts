@@ -162,9 +162,12 @@ program
   .description('List a share\'s comments (no state), or enable/disable them (state: on|off)')
   .option('-j, --json', 'Output comments as JSON (list mode)')
   .option('--seq <n>', 'List comments on a specific version, by its seq from `toss versions` (default: latest)')
+  .option('--type <kind>', 'Only show messages of kind: note|blocker|concern|question|action|nit|resolution')
+  .option('--status <status>', 'Only show threads with status: open|resolved')
+  .option('--check', 'Set exit status 1 if any open thread contains a non-deleted blocker (ignores filters)')
   .option('--password-env <key>', 'For a doc you don\'t own: read its password from this env var / .env key (value never in args)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'seq', 'passwordEnv', 'profile'])));
+  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'seq', 'type', 'status', 'check', 'passwordEnv', 'profile'])));
 
 program
   .command('versions <slug>')

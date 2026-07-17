@@ -73,4 +73,19 @@ describe('comments argument name (CLI)', () => {
     expect(stderr).toContain("missing required argument 'slug'");
     expect(stderr).not.toContain("missing required argument 'id'");
   }, 20000);
+
+  it('registers feedback filtering and check options in help', () => {
+    try {
+      const stdout = execFileSync(resolve(REPO_ROOT, 'node_modules/.bin/tsx'), [resolve(REPO_ROOT, 'src/index.ts'), 'comments', '--help'], {
+        cwd: REPO_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      expect(stdout).toContain('--type <kind>');
+      expect(stdout).toContain('--status <status>');
+      expect(stdout).toContain('--check');
+    } catch (err) {
+      throw new Error(`comments --help failed: ${String(err)}`);
+    }
+  }, 20000);
 });

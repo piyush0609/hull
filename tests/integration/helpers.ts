@@ -25,35 +25,75 @@ class MockD1Statement {
   constructor(
     private query: string,
     private values: unknown[] = [],
-    private parentRows: Array<Record<string, unknown>> = []
+    private parent: MockD1
   ) {}
 
   bind(...values: unknown[]) {
-    return new MockD1Statement(this.query, values, this.parentRows);
+    return new MockD1Statement(this.query, values, this.parent);
   }
 
   async run() {
-    return { success: true };
+    return this.parent.run(this.query, this.values);
   }
 
   async all() {
-    return { results: this.parentRows };
+    return { results: this.parent.rows };
   }
 
   async first<T = Record<string, unknown>>(): Promise<T | null> {
-    return (this.parentRows[0] as T | null) ?? null;
+    return this.parent.first<T>(this.query, this.values);
   }
 }
 
 export class MockD1 {
-  private rows: Array<Record<string, unknown>> = [];
+  rows: Array<Record<string, unknown>> = [];
+  private artifacts = new Map<string, { currentVersionId: string | null }>();
 
   prepare(query: string) {
-    return new MockD1Statement(query, [], this.rows);
+    return new MockD1Statement(query, [], this);
+  }
+
+  async batch(statements: MockD1Statement[]) {
+    const results = [];
+    for (const statement of statements) results.push(await statement.run());
+    return results;
+  }
+
+  async run(query: string, values: unknown[]) {
+    if (query.includes('INSERT INTO artifacts')) {
+      this.artifacts.set(String(values[0]), { currentVersionId: null });
+    }
+    if (query.includes('UPDATE artifacts SET current_version_id = ?')) {
+      const artifact = this.artifacts.get(String(values[5]));
+      if (artifact) artifact.currentVersionId = String(values[0]);
+    }
+    if (query.includes('DELETE FROM artifacts WHERE id = ?')) {
+      this.artifacts.delete(String(values[0]));
+    }
+    return { success: true, meta: { changes: 1 } };
+  }
+
+  async first<T>(query: string, values: unknown[]): Promise<T | null> {
+    if (query.includes('SELECT a.current_version_id AS id, COALESCE(av.seq, 0) AS seq')) {
+      const artifact = this.artifacts.get(String(values[0]));
+      return (artifact ? { id: artifact.currentVersionId, seq: artifact.currentVersionId ? 1 : 0 } : null) as T | null;
+    }
+    if (query.includes('SELECT current_version_id AS vid FROM artifacts WHERE id = ?')) {
+      const artifact = this.artifacts.get(String(values[0]));
+      return (artifact ? { vid: artifact.currentVersionId } : null) as T | null;
+    }
+    return (this.rows[0] as T | null) ?? null;
   }
 
   setRows(rows: Array<Record<string, unknown>>) {
     this.rows = rows;
+    for (const row of rows) {
+      if (row.id) {
+        this.artifacts.set(String(row.id), {
+          currentVersionId: row.current_version_id ? String(row.current_version_id) : null,
+        });
+      }
+    }
   }
 }
 
