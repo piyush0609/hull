@@ -238,12 +238,17 @@ function htmlEscape(text: string): string {
 // either a valid comment grant (a distinct aud:"comment" token issued at serve
 // time — the plain viewer/legacy token has no aud and is rejected here) OR the
 // owner token (Bearer) for programmatic/cloud access. Returns true | Response.
-async function requireCommentAccess(request: Request, env: Env, artifactId: string): Promise<true | Response> {
+async function requireCommentAccess(
+  request: Request,
+  env: Env,
+  artifactId: string,
+  options: { requireEnabled?: boolean } = {},
+): Promise<true | Response> {
   const row = await env.TOSS_DB.prepare('SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ?')
     .bind(artifactId)
     .first<{ comments_enabled: number; expires_at: number; password_epoch: number | null }>();
   // A null row also covers a missing/revoked artifact.
-  if (!row || !row.comments_enabled) return new Response('Not found', { status: 404 });
+  if (!row || (options.requireEnabled !== false && !row.comments_enabled)) return new Response('Not found', { status: 404 });
   if (isArtifactExpired(row.expires_at)) return new Response('Link expired', { status: 410 });
 
   // Owner token is a first-class reader/writer (programmatic/cloud access).
@@ -317,6 +322,19 @@ function normalizeMessageInput(body: unknown): string | Response {
   return message;
 }
 
+const COMMENT_MESSAGE_KINDS = ['note', 'blocker', 'concern', 'question', 'action', 'nit', 'resolution'] as const;
+type CommentMessageKind = typeof COMMENT_MESSAGE_KINDS[number];
+const CLIENT_COMMENT_MESSAGE_KINDS = COMMENT_MESSAGE_KINDS.filter((kind) => kind !== 'resolution');
+
+function normalizeMessageKind(body: unknown): CommentMessageKind | Response {
+  const raw = body && typeof body === 'object' ? (body as { kind?: unknown }).kind : undefined;
+  const kind = raw === undefined ? 'note' : raw;
+  if (typeof kind !== 'string' || !CLIENT_COMMENT_MESSAGE_KINDS.includes(kind as Exclude<CommentMessageKind, 'resolution'>)) {
+    return new Response('Invalid comment kind', { status: 400 });
+  }
+  return kind as CommentMessageKind;
+}
+
 // The commenter's display name — a self-entered claim (not verified), stored
 // immutably as author_label and HTML-escaped on render. Identity needs no toss
 // token or password; the grant already proved page access.
@@ -334,6 +352,140 @@ function normalizeName(body: unknown): string | Response {
 // schema change.
 const NO_TOKEN = '';
 
+async function cleanupStagedVersion(env: Env, artifactId: string, versionId: string): Promise<void> {
+  // Cleanup does not need atomicity and deliberately avoids D1 batch() so it
+  // remains idempotent in older Worker-compatible bindings and test doubles.
+  await env.TOSS_DB.prepare(
+    'DELETE FROM comment_messages WHERE thread_id IN (SELECT id FROM comment_threads WHERE artifact_id = ? AND version_id = ?)'
+  ).bind(artifactId, versionId).run();
+  await env.TOSS_DB.prepare(
+    'DELETE FROM comment_threads WHERE artifact_id = ? AND version_id = ?'
+  ).bind(artifactId, versionId).run();
+  await env.TOSS_DB.prepare(
+    'DELETE FROM artifact_versions WHERE id = ? AND artifact_id = ? AND NOT EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND current_version_id = ?)'
+  ).bind(versionId, artifactId, artifactId, versionId).run();
+}
+
+// D1 has no interactive transaction API. Build the next snapshot under an
+// unpublished version id, then use one atomic batch to reserve its sequence and
+// compare-and-set the live pointer. Readers continue seeing the prior pointer
+// throughout staging; a failed or losing publisher removes its invisible rows.
+async function mintVersion(
+  env: Env,
+  artifactId: string,
+  versionId: string,
+  contentHash: string,
+  now: number,
+  metadata: { name: string; sizeBytes: number; expiresAt: number; passwordHash: string | null },
+): Promise<string | null> {
+  const previous = await env.TOSS_DB.prepare(
+    'SELECT a.current_version_id AS id, COALESCE(av.seq, 0) AS seq FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ?'
+  ).bind(artifactId).first<{ id: string | null; seq: number }>();
+  if (!previous) throw new Error('Artifact disappeared while publishing a version');
+  const previousVersionId = previous.id || null;
+  const seq = Number(previous.seq) + 1;
+  try {
+    if (previousVersionId) {
+      const previousThreads = await env.TOSS_DB.prepare(
+        'SELECT id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND version_id = ? AND deleted_at IS NULL'
+      ).bind(artifactId, previousVersionId).all<Record<string, unknown>>();
+      for (const thread of previousThreads.results || []) {
+        const newThreadId = generateId();
+        await env.TOSS_DB.prepare(
+          'INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_token_hash, resolved_by_label, resolved_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+          newThreadId, artifactId, versionId, thread.page_path, thread.created_by_token_hash,
+          thread.created_by_label, thread.scope_type, thread.anchor_json, thread.status,
+          thread.resolved_by_token_hash, thread.resolved_by_label, thread.resolved_at,
+          thread.created_at, thread.updated_at,
+        ).run();
+        const previousMessages = await env.TOSS_DB.prepare(
+          'SELECT author_token_hash, author_label, body, kind, created_at, updated_at FROM comment_messages WHERE thread_id = ? AND deleted_at IS NULL ORDER BY created_at ASC'
+        ).bind(thread.id).all<Record<string, unknown>>();
+        for (const message of previousMessages.results || []) {
+          await env.TOSS_DB.prepare(
+            'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+          ).bind(
+            generateId(), newThreadId, message.author_token_hash, message.author_label,
+            message.body, message.kind || 'note', message.created_at, message.updated_at,
+          ).run();
+        }
+      }
+    }
+  } catch (error) {
+    await cleanupStagedVersion(env, artifactId, versionId);
+    throw error;
+  }
+
+  const publishStatements = [
+    env.TOSS_DB.prepare(
+      'INSERT INTO artifact_versions (id, artifact_id, seq, content_hash, created_at) SELECT ?, a.id, ?, ?, ? FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ? AND ((a.current_version_id = ?) OR (a.current_version_id IS NULL AND ? IS NULL)) AND ? = COALESCE(av.seq, 0) + 1'
+    ).bind(versionId, seq, contentHash, now, artifactId, previousVersionId, previousVersionId, seq),
+  ];
+  if (!previousVersionId) {
+    publishStatements.push(env.TOSS_DB.prepare(
+      'UPDATE comment_threads SET version_id = ? WHERE artifact_id = ? AND version_id IS NULL AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ? AND artifact_id = ? AND seq = ?)'
+    ).bind(versionId, artifactId, versionId, artifactId, seq));
+  }
+  publishStatements.push(env.TOSS_DB.prepare(
+    'UPDATE artifacts SET current_version_id = ?, name = ?, size_bytes = ?, expires_at = ?, password_hash = ? WHERE id = ? AND ((current_version_id = ?) OR (current_version_id IS NULL AND ? IS NULL)) AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ? AND artifact_id = ? AND seq = ?)'
+  ).bind(
+    versionId, metadata.name, metadata.sizeBytes, metadata.expiresAt, metadata.passwordHash,
+    artifactId, previousVersionId, previousVersionId, versionId, artifactId, seq,
+  ));
+
+  try {
+    const results = await env.TOSS_DB.batch(publishStatements);
+    const inserted = results[0] as D1Result<unknown> | undefined;
+    const published = results[results.length - 1] as D1Result<unknown> | undefined;
+    if (!inserted?.meta?.changes || !published?.meta?.changes) {
+      await cleanupStagedVersion(env, artifactId, versionId);
+      return null;
+    }
+  } catch (error) {
+    await cleanupStagedVersion(env, artifactId, versionId);
+    throw error;
+  }
+  return versionId;
+}
+
+export function serializeInlineScriptValue(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function hydrateCommentThreads(
+  threadRows: Array<Record<string, unknown>>,
+  messageRows: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const grouped = new Map<string, Array<Record<string, unknown>>>();
+  for (const row of messageRows) {
+    const items = grouped.get(String(row.thread_id)) || [];
+    const out: Record<string, unknown> = {
+      ...row,
+      can_edit: !row.deleted_at && row.thread_status !== 'resolved',
+      can_delete: !row.deleted_at && !(row.kind === 'resolution' && row.thread_status === 'resolved'),
+    };
+    delete out.author_token_hash;
+    items.push(out);
+    grouped.set(String(row.thread_id), items);
+  }
+  return threadRows.map((thread) => {
+    const out: Record<string, unknown> = {
+      ...thread,
+      anchor: thread.anchor_json ? JSON.parse(String(thread.anchor_json)) : null,
+      can_delete: true,
+      can_resolve: true,
+      messages: grouped.get(String(thread.id)) || [],
+    };
+    delete out.anchor_json;
+    delete out.created_by_token_hash;
+    return out;
+  });
+}
+
 function injectCommentsUI(html: string, config: {
   artifactId: string;
   viewerToken: string;
@@ -341,13 +493,14 @@ function injectCommentsUI(html: string, config: {
   artifactBasePath: string;
   currentPagePath: string;
 }): string {
-  const payload = JSON.stringify(config);
+  const payload = serializeInlineScriptValue(config);
   const shell = `
 <div id="toss-comments-root"></div>
 <script>
 (() => {
   const cfg = ${payload};
   const storageKey = 'toss-comment-token:' + cfg.artifactId;
+  const nameStorageKey = 'toss-comment-name:' + cfg.artifactId;
   const state = {
     token: localStorage.getItem(storageKey) || '',
     threads: [],
@@ -355,17 +508,36 @@ function injectCommentsUI(html: string, config: {
     pendingScope: 'artifact',
     pendingAnchor: null,
     pendingRects: [],
-    currentLabel: '',
+    currentLabel: localStorage.getItem(nameStorageKey) || '',
     busy: false,
     loaded: false,
     loading: false,
+    threadLoadGeneration: 0,
+    mutationsInFlight: 0,
     unreadCount: 0,
     activityFeed: [],
     lastDigest: '',
     activityThreads: [],
     pollTimer: null,
     replyThreadId: '',
-    replyDraft: '',
+    replyOriginThreadId: '',
+    replyFocusAfterRender: '',
+    replyDrafts: Object.create(null),
+    selectedKind: 'note',
+    statusFilter: 'open',
+    typeFilter: 'all',
+    resolveThreadId: '',
+    resolveOriginThreadId: '',
+  };
+
+  const reviewTypes = {
+    note: { label: 'Note', helper: 'General context' },
+    blocker: { label: 'Blocker', helper: 'Must resolve before shipping' },
+    concern: { label: 'Concern', helper: 'Needs consideration' },
+    question: { label: 'Question', helper: 'Needs an answer' },
+    action: { label: 'Action', helper: 'Concrete follow-up' },
+    nit: { label: 'Nit', helper: 'Optional polish' },
+    resolution: { label: 'Resolution', helper: 'What changed to close the thread' },
   };
 
   const esc = (text) => String(text || '')
@@ -387,7 +559,7 @@ function injectCommentsUI(html: string, config: {
     '.toss-comments-badge{display:none;margin-left:8px;min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:#facc15;color:#111827;font-size:11px;font-weight:800;line-height:18px;text-align:center}' +
     '.toss-comments-notify-toggle .toss-comments-badge{position:absolute;top:-6px;right:-2px;margin-left:0}' +
     '.toss-comments-notify-toggle.has-unread .toss-comments-badge{display:inline-block}' +
-    '.toss-comments-panel{width:360px;max-width:calc(100vw - 24px);height:100vh;background:#fff;border-left:1px solid #e5e7eb;box-shadow:-12px 0 32px rgba(15,23,42,.12);display:none;flex-direction:column}' +
+    '.toss-comments-panel{width:360px;max-width:360px;height:100vh;background:#fff;border-left:1px solid #e5e7eb;box-shadow:-12px 0 32px rgba(15,23,42,.12);display:none;flex-direction:column}' +
     '.toss-comments-panel.open{display:flex}' +
     '.toss-notify-panel{position:fixed;top:58px;right:12px;width:320px;max-width:calc(100vw - 24px);max-height:320px;overflow:auto;background:#fff;border:1px solid #dbeafe;border-radius:16px;box-shadow:0 20px 40px rgba(15,23,42,.18);padding:10px;display:none;z-index:2147483647}' +
     '.toss-notify-panel.open{display:block}' +
@@ -442,6 +614,35 @@ function injectCommentsUI(html: string, config: {
     '.toss-comments-message.reply{margin-left:18px;padding-left:12px;border-left:3px solid #dbeafe}' +
     '.toss-comments-replying-to{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:999px;padding:4px 8px;margin-bottom:8px}' +
     '.toss-comments-empty{font-size:13px;color:#64748b}' +
+    '.toss-comments-composer{padding:12px;border:1px solid #e5e7eb;border-radius:12px;background:#fbfcfd;box-shadow:0 1px 2px rgba(15,23,42,.035)}' +
+    '.toss-comments-field-label{display:block;margin:0 0 6px;color:#475569;font-size:11px;font-weight:650}' +
+    '.toss-comments-kind-label{margin-top:10px}' +
+    '.toss-comments-kind-chips{display:flex;flex-wrap:wrap;gap:5px}' +
+    '.toss-comments-kind-chip{height:28px;display:inline-flex;align-items:center;gap:5px;border:1px solid #d6dbe2;border-radius:999px;background:#fff;color:#4b5563;padding:0 9px;font-size:11px;font-weight:650;cursor:pointer}' +
+    '.toss-comments-kind-chip:before,.toss-comments-type-badge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}' +
+    '.toss-comments-kind-chip[aria-pressed="true"]{border-color:#c96d57;background:#fff4f1;color:#8f321f;box-shadow:0 0 0 2px rgba(217,101,74,.10)}' +
+    '.toss-comments-kind-helper{min-height:16px;margin-top:6px;color:#667085;font-size:10.5px}' +
+    '.toss-comments-type-badge{display:inline-flex;align-items:center;gap:5px;height:20px;border:1px solid #cfd5dd;border-radius:999px;padding:0 7px;background:#fff;color:#52606f;font-size:9px;font-weight:750;letter-spacing:.055em;text-transform:uppercase;white-space:nowrap}' +
+    '.toss-comments-type-badge.blocker{color:#8f321f;border-color:#e7b9ae;background:#fff8f6}.toss-comments-type-badge.concern{color:#85500f;border-color:#dfc99c;background:#fffbf2}.toss-comments-type-badge.question{color:#24577f;border-color:#b9d3e7;background:#f7fbff}.toss-comments-type-badge.action{color:#48517f;border-color:#c7cbe3;background:#fafaff}.toss-comments-type-badge.nit{color:#596579}.toss-comments-type-badge.resolution{color:#12664e;border-color:#a9dac8;background:#f3fbf8}' +
+    '.toss-comments-message-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center}.toss-comments-message-author{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054;font-weight:650}.toss-comments-message-time{white-space:nowrap;font-size:10px}.toss-comments-message-badges{grid-column:1/-1;display:flex;align-items:center;gap:5px;min-width:0;margin-top:6px}' +
+    '.toss-comments-resolved-badge{display:inline-flex;align-items:center;height:20px;border:1px solid #a9dac8;border-radius:999px;padding:0 7px;background:#f3fbf8;color:#12664e;font-size:9px;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.toss-comments-thread-status{display:inline-flex;align-items:center;height:20px;border:1px solid #d6dbe2;border-radius:999px;padding:0 7px;background:#fff;color:#596579;font-size:9px;font-weight:750;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}.toss-comments-thread-status.resolved{border-color:#a9dac8;background:#f3fbf8;color:#12664e}' +
+    '.toss-comments-readiness-wrap{display:flex;flex-direction:column;gap:7px}.toss-comments-readiness-title{color:#344054;font-size:11px;font-weight:750}.toss-comments-readiness{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}' +
+    '.toss-comments-readiness-card{min-width:0;padding:9px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;box-shadow:0 1px 2px rgba(15,23,42,.035)}.toss-comments-readiness-card strong{display:block;color:#111827;font-size:15px}.toss-comments-readiness-card span{display:block;color:#667085;font-size:9px;text-transform:uppercase;letter-spacing:.04em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+    '.toss-comments-filters{display:grid;grid-template-columns:1fr 1fr;gap:7px}.toss-comments-filters select{min-width:0;height:32px;border:1px solid #d5dae1;border-radius:8px;background:#fff;color:#334155;padding:0 8px;font-size:11px}' +
+    '.toss-comments-dialog-backdrop{position:absolute;inset:0;z-index:4;display:grid;place-items:center;padding:16px;background:rgba(17,24,39,.52)}.toss-comments-dialog-backdrop[hidden]{display:none}' +
+    '.toss-comments-dialog{width:100%;max-width:328px;padding:18px;border:1px solid #e5e7eb;border-radius:14px;background:#fff;box-shadow:0 24px 64px rgba(15,23,42,.28)}.toss-comments-dialog-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.toss-comments-dialog h3{min-width:0;margin:0;color:#111827;font-size:15px}.toss-comments-dialog>p{margin:7px 0 11px;color:#667085;font-size:12px;line-height:1.5}.toss-comments-dialog .toss-comments-textarea{min-height:72px}.toss-comments-resolution-context{margin-bottom:12px;padding:8px 10px;border:1px solid #e5e7eb;border-radius:9px;background:#fbfcfd;color:#596579;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.toss-comments-attribution{display:flex;align-items:center;gap:9px;margin:11px 0;padding:9px;border:1px solid #e5e7eb;border-radius:10px;background:#fbfcfd}.toss-comments-avatar{width:28px;height:28px;flex:none;display:grid;place-items:center;border-radius:50%;background:#f6e4df;color:#8f321f;font-size:10px;font-weight:800}.toss-comments-attribution-copy{min-width:0;color:#596579;font-size:10.5px;line-height:1.35}.toss-comments-attribution-copy strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054;font-size:11px}' +
+    '.toss-comments-panel{position:relative;overflow:hidden}.toss-comments-body{min-width:0}.toss-comments-card,.toss-comments-message{min-width:0;overflow-wrap:anywhere}' +
+    '.toss-comments-header{height:56px;flex:none;padding:0 14px 0 16px;background:#fff;border-color:#eef0f2;align-items:center}.toss-comments-close{width:48px;height:32px;padding:0;border-radius:8px;background:transparent;color:#667085}.toss-comments-close:hover{background:#f6f7f9}' +
+    '.toss-comments-body{padding:12px;background:#fbfcfd;gap:10px;overflow-x:hidden}.toss-comments-status{background:#fff;border-style:solid;border-color:#e5e7eb;color:#596579}' +
+    '.toss-comments-card{box-shadow:0 1px 2px rgba(15,23,42,.035)}.toss-comments-card.focused{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.10)}' +
+    '.toss-comments-actions button.primary,.toss-comments-submit{border-color:#b94732;background:#b94732;color:#fff;box-shadow:0 1px 2px rgba(217,101,74,.18)}.toss-comments-actions button.primary:hover,.toss-comments-submit:hover{background:#a63d2b;box-shadow:0 3px 8px rgba(185,71,50,.20);transform:none}' +
+    '.toss-comments-actions button[data-action="resolve-thread"]{border-color:#b7e4d2;background:#f3fbf8;color:#14795c;box-shadow:none}.toss-comments-actions button[data-action="resolve-thread"]:hover{background:#e8f7f1;box-shadow:none}' +
+    '.toss-comments-composer .toss-comments-context{margin:10px 0}.toss-comments-composer .toss-comments-submit{margin-top:10px}.toss-comments-name{margin-bottom:0}' +
+    '.toss-comments-reply-composer{min-width:0;margin-top:14px;padding-top:13px;border-top:1px solid #eef0f2;overflow:hidden}.toss-comments-reply-composer[hidden]{display:none!important}.toss-comments-replying-to{max-width:100%;white-space:normal;overflow-wrap:anywhere}' +
+    '.toss-comments-reply-identity,.toss-comments-reply-field,.toss-comments-reply-types,.toss-comments-reply-actions{min-width:0}.toss-comments-reply-identity{margin-bottom:11px}.toss-comments-identity-summary{display:flex;align-items:center;gap:8px;min-width:0}.toss-comments-identity-avatar{width:26px;height:26px;flex:0 0 26px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px;font-weight:750}.toss-comments-identity-copy{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#667085;font-size:11px}.toss-comments-identity-copy strong{color:#374151}.toss-comments-identity-change{height:28px;border:0;border-radius:7px;background:transparent;color:#667085;font-size:10.5px;font-weight:650}.toss-comments-identity-editor{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:6px;min-width:0}.toss-comments-identity-editor[hidden]{display:none!important}.toss-comments-identity-editor label{min-width:0}.toss-comments-identity-actions{display:flex;gap:4px}.toss-comments-identity-actions button{height:34px;padding:0 9px}.toss-comments-reply-input{height:64px;min-height:64px;resize:none;margin:0;line-height:1.45}.toss-comments-reply-types{margin-top:10px}.toss-comments-reply-chips{display:flex;flex-wrap:wrap;gap:5px;min-width:0}.toss-comments-reply-chip{height:28px;display:inline-flex;align-items:center;gap:5px;padding:0 8px;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#596579;font-size:10.5px;font-weight:650}.toss-comments-reply-chip:before{content:"";width:5px;height:5px;flex:none;border-radius:50%;background:currentColor}.toss-comments-reply-chip[aria-pressed="true"]{border-color:#dc8d7b;background:#fff4f1;color:#9f3826;box-shadow:0 0 0 2px rgba(217,101,74,.08)}.toss-comments-reply-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px;margin-top:12px}.toss-comments-reply-actions button{height:34px}.toss-comments-reply-actions .primary{border-color:#b94732;background:#b94732;color:#fff}' +
+    '.toss-comments-input:focus,.toss-comments-textarea:focus,.toss-comments-filters select:focus,.toss-comments-kind-chip:focus-visible,.toss-comments-reply-chip:focus-visible,button:focus-visible{outline:none;border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.12)}' +
+    '@media(max-width:430px){.toss-comments-shell{margin-top:0}.toss-comments-panel{width:100vw;max-width:100vw;border:0;box-shadow:none}.toss-comments-body{padding:12px}.toss-comments-filters{grid-template-columns:1fr 1fr}.toss-comments-card{padding:12px}.toss-comments-reply-chip{padding:0 8px}}' +
     '</style>' +
     '<div class="toss-comments-shell">' +
       '<button class="toss-comments-notify-toggle" type="button" aria-label="Open notifications">🔔 <span class="toss-comments-badge">0</span></button>' +
@@ -455,16 +656,29 @@ function injectCommentsUI(html: string, config: {
             '<button class="toss-comments-save-token primary" type="button">Save Token</button>' +
             '<button class="toss-comments-clear-token" type="button">Clear</button>' +
           '</div>' +
-          '<div class="toss-comments-status"></div>' +
-          '<div class="toss-comments-section-title">Threads</div>' +
-          '<div class="toss-comments-context">' +
-            '<div><strong>Comment target</strong><span class="toss-comments-context-label">Whole page</span></div>' +
-            '<button class="toss-comments-context-clear" type="button">Use whole page</button>' +
+          '<div class="toss-comments-status" role="status" aria-live="polite"></div>' +
+          '<div class="toss-comments-composer">' +
+            '<label class="toss-comments-field-label" for="toss-comments-name">Your name</label>' +
+            '<input id="toss-comments-name" class="toss-comments-input toss-comments-name" maxlength="80" autocomplete="name" placeholder="Required for attribution" required />' +
+            '<div class="toss-comments-context">' +
+              '<div><strong>Comment target</strong><span class="toss-comments-context-label">Whole page</span></div>' +
+              '<button class="toss-comments-context-clear" type="button">Use whole page</button>' +
+            '</div>' +
+            '<label class="toss-comments-field-label" for="toss-comments-draft">Comment</label>' +
+            '<textarea id="toss-comments-draft" class="toss-comments-textarea" placeholder="Describe the issue or suggestion" required></textarea>' +
+            '<div class="toss-comments-field-label toss-comments-kind-label">Review type</div>' +
+            '<div class="toss-comments-kind-chips" role="group" aria-label="Review type">' +
+              Object.keys(reviewTypes).filter((kind) => kind !== 'resolution').map((kind) => '<button type="button" class="toss-comments-kind-chip" data-kind="' + kind + '" aria-pressed="' + (kind === 'note' ? 'true' : 'false') + '">' + reviewTypes[kind].label + '</button>').join('') +
+            '</div>' +
+            '<div class="toss-comments-kind-helper" aria-live="polite">General context</div>' +
+            '<button class="toss-comments-submit primary" type="button">Post comment</button>' +
           '</div>' +
-          '<textarea class="toss-comments-textarea" placeholder="Write a comment..."></textarea>' +
-          '<button class="toss-comments-submit primary" type="button">Post Comment →</button>' +
-          '<div class="toss-comments-thread-list"></div>' +
+          '<section class="toss-comments-readiness-wrap" aria-labelledby="toss-readiness-title"><div id="toss-readiness-title" class="toss-comments-readiness-title">Review readiness</div><div class="toss-comments-readiness"><div class="toss-comments-readiness-card"><strong data-ready-kind="blocker">0</strong><span>Blockers</span></div><div class="toss-comments-readiness-card"><strong data-ready-kind="question">0</strong><span>Questions</span></div><div class="toss-comments-readiness-card"><strong data-ready-kind="action">0</strong><span>Actions</span></div></div></section>' +
+          '<div class="toss-comments-filters"><select class="toss-comments-status-filter" aria-label="Filter by thread status"><option value="open">Open threads</option><option value="resolved">Resolved threads</option><option value="all">All threads</option></select><select class="toss-comments-type-filter" aria-label="Filter by review type"><option value="all">All types</option>' + Object.keys(reviewTypes).map((kind) => '<option value="' + kind + '">' + reviewTypes[kind].label + '</option>').join('') + '</select></div>' +
+          '<div class="toss-comments-section-title">Threads</div>' +
+          '<div class="toss-comments-thread-list" tabindex="-1"></div>' +
         '</div>' +
+        '<div class="toss-comments-dialog-backdrop" hidden><div class="toss-comments-dialog" role="dialog" aria-modal="true" aria-labelledby="toss-resolve-title"><div class="toss-comments-dialog-title-row"><h3 id="toss-resolve-title">Resolve thread</h3><span class="toss-comments-type-badge toss-comments-resolution-kind">Note</span></div><p>Add a required resolution note so reviewers can see what changed.</p><div class="toss-comments-resolution-context" aria-label="Thread context">General page comment</div><label class="toss-comments-field-label" for="toss-resolution-name">Your name</label><input id="toss-resolution-name" class="toss-comments-input toss-comments-resolution-name" maxlength="80" autocomplete="name" required /><label class="toss-comments-field-label" for="toss-resolution-body">Resolution note</label><textarea id="toss-resolution-body" class="toss-comments-textarea toss-comments-resolution-body" placeholder="What changed?" required></textarea><div class="toss-comments-attribution"><span class="toss-comments-avatar" aria-hidden="true">?</span><div class="toss-comments-attribution-copy"><strong>Resolution attribution</strong><span class="toss-comments-attribution-text">This resolution will be attributed to you.</span></div></div><div class="toss-comments-actions"><button type="button" data-action="cancel-resolve">Cancel</button><button type="button" class="primary" data-action="confirm-resolve">Resolve thread</button></div></div></div>' +
       '</aside>' +
     '</div>' +
     '</div>';
@@ -477,11 +691,13 @@ function injectCommentsUI(html: string, config: {
   const notifications = root.querySelector('.toss-notify-panel');
   const notificationList = root.querySelector('.toss-comments-notification-list');
   const tokenInput = root.querySelector('.toss-comments-token');
+  const nameInput = root.querySelector('.toss-comments-name');
   const textarea = root.querySelector('.toss-comments-textarea');
   const submitButton = root.querySelector('.toss-comments-submit');
   const list = root.querySelector('.toss-comments-thread-list');
   const contextLabel = root.querySelector('.toss-comments-context-label');
   tokenInput.value = state.token;
+  nameInput.value = state.currentLabel;
   const currentPagePath = cfg.currentPagePath || 'index.html';
   const currentPageLabel = () => {
     const tail = (currentPagePath.split('/').pop() || 'index.html').replace(/\.html?$/i, '');
@@ -601,6 +817,154 @@ function injectCommentsUI(html: string, config: {
   };
 
   const setStatus = (message) => { status.textContent = message; };
+  const typeBadge = (kind) => {
+    const normalized = reviewTypes[kind] ? kind : 'note';
+    return '<span class="toss-comments-type-badge ' + normalized + '">' + esc(reviewTypes[normalized].label) + '</span>';
+  };
+  const initialsFor = (name) => String(name || '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part.charAt(0).toUpperCase()).join('') || '?';
+  const threadDomKey = (threadId) => 'thread-' + Array.from(String(threadId || '')).map((char) => char.codePointAt(0).toString(16)).join('-');
+  const ensureReplyDraft = (threadId) => {
+    if (!state.replyDrafts[threadId]) {
+      const name = String(state.currentLabel || '').trim();
+      state.replyDrafts[threadId] = {
+        name,
+        body: '',
+        kind: 'note',
+        identityEditing: !name,
+        identityEditorValue: name,
+        priorIdentity: name,
+      };
+    }
+    return state.replyDrafts[threadId];
+  };
+  const commitGlobalIdentity = (oldName, newName) => {
+    const previous = String(oldName || '').trim();
+    const committed = String(newName || '').trim();
+    if (!committed) return false;
+    state.currentLabel = committed;
+    nameInput.value = committed;
+    localStorage.setItem(nameStorageKey, committed);
+    Object.values(state.replyDrafts).forEach((draft) => {
+      if (draft.name !== previous) return;
+      draft.name = committed;
+      draft.priorIdentity = committed;
+      if (!draft.identityEditing || draft.identityEditorValue === previous) draft.identityEditorValue = committed;
+    });
+    updateComposerReadiness();
+    return true;
+  };
+  const visibleThread = (thread) => {
+    if (state.statusFilter !== 'all' && thread.status !== state.statusFilter) return false;
+    return state.typeFilter === 'all' || (thread.messages || []).some((message) => !message.deleted_at && message.kind === state.typeFilter);
+  };
+  const reconcileReplyDrafts = (threads, confirmed = true) => {
+    if (!confirmed) return;
+    const byId = new Map((threads || []).map((thread) => [thread.id, thread]));
+    Object.keys(state.replyDrafts).forEach((threadId) => {
+      const thread = byId.get(threadId);
+      if (!thread || thread.deleted_at || thread.status !== 'open') delete state.replyDrafts[threadId];
+    });
+    if (state.replyThreadId) {
+      const expanded = byId.get(state.replyThreadId);
+      if (!expanded || expanded.deleted_at || expanded.status !== 'open' || !visibleThread(expanded)) {
+        state.replyOriginThreadId = state.replyThreadId;
+        state.replyFocusAfterRender = state.replyThreadId;
+        state.replyThreadId = '';
+      }
+    }
+  };
+  const findThreadAction = (threadId, action) => Array.from(root.querySelectorAll('[data-action="' + action + '"]')).find((node) => node.dataset.threadId === threadId) || null;
+  const focusReplyControl = (threadId, selector) => {
+    setTimeout(() => {
+      const composer = Array.from(root.querySelectorAll('.toss-comments-reply-composer')).find((node) => node.dataset.threadId === threadId);
+      const control = composer && composer.querySelector(selector);
+      if (control instanceof HTMLElement) control.focus();
+    }, 0);
+  };
+  const focusAfterReplyCollapse = (threadId) => {
+    setTimeout(() => {
+      const reply = findThreadAction(threadId, 'reply-thread');
+      const activeFilter = root.querySelector('.toss-comments-status-filter:focus,.toss-comments-type-filter:focus');
+      const survivingAction = root.querySelector('.toss-comments-card button:not([disabled])');
+      const fallback = reply || activeFilter || survivingAction || list;
+      if (fallback instanceof HTMLElement) fallback.focus();
+    }, 0);
+  };
+  const captureReplyFocus = () => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return null;
+    const composer = active.closest('.toss-comments-reply-composer');
+    if (!(composer instanceof HTMLElement) || composer.hidden) return null;
+    const control = active.closest('[data-reply-focus]');
+    if (!(control instanceof HTMLElement)) return null;
+    const snapshot = {
+      threadId: composer.dataset.threadId || '',
+      control: control.dataset.replyFocus || '',
+      selectionStart: null,
+      selectionEnd: null,
+      selectionDirection: null,
+    };
+    if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+      snapshot.selectionStart = control.selectionStart;
+      snapshot.selectionEnd = control.selectionEnd;
+      snapshot.selectionDirection = control.selectionDirection;
+    }
+    return snapshot;
+  };
+  const restoreReplyFocus = (snapshot) => {
+    if (!snapshot || !snapshot.threadId || !snapshot.control) return;
+    const composer = Array.from(root.querySelectorAll('.toss-comments-reply-composer')).find((node) => node.dataset.threadId === snapshot.threadId);
+    if (!(composer instanceof HTMLElement) || composer.hidden) return;
+    const control = Array.from(composer.querySelectorAll('[data-reply-focus]')).find((node) => node.dataset.replyFocus === snapshot.control);
+    if (!(control instanceof HTMLElement)) return;
+    control.focus({ preventScroll: true });
+    if ((control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) && snapshot.selectionStart !== null && snapshot.selectionEnd !== null) {
+      control.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd, snapshot.selectionDirection || 'none');
+    }
+  };
+  const focusAfterResolutionDialog = (threadId) => {
+    setTimeout(() => {
+      const resolve = findThreadAction(threadId, 'resolve-thread');
+      const threadAction = Array.from(root.querySelectorAll('.toss-comments-thread-actions button:not([disabled])')).find((node) => node.closest('[data-thread-id]')?.dataset.threadId === threadId);
+      const fallback = resolve || threadAction || root.querySelector('.toss-comments-thread-actions button:not([disabled])') || list;
+      if (fallback instanceof HTMLElement) fallback.focus();
+    }, 0);
+  };
+  const closeResolutionDialog = (message) => {
+    const threadId = state.resolveOriginThreadId || state.resolveThreadId;
+    const backdrop = root.querySelector('.toss-comments-dialog-backdrop');
+    if (backdrop) backdrop.hidden = true;
+    state.resolveThreadId = '';
+    state.resolveOriginThreadId = '';
+    if (message) setStatus(message);
+    focusAfterResolutionDialog(threadId);
+  };
+  const cancelIdentityEdit = (threadId, focus = true) => {
+    const draft = ensureReplyDraft(threadId);
+    const fallback = String(draft.name || state.currentLabel || '').trim();
+    draft.priorIdentity = fallback;
+    draft.identityEditorValue = fallback;
+    draft.identityEditing = !fallback;
+    render();
+    focusReplyControl(threadId, fallback && focus ? '.toss-comments-identity-change' : '.toss-comments-reply-name');
+  };
+  const collapseReply = (threadId, restoreFocus = true) => {
+    const draft = state.replyDrafts[threadId];
+    if (draft && draft.identityEditing) {
+      const fallback = String(draft.name || state.currentLabel || '').trim();
+      draft.priorIdentity = fallback;
+      draft.identityEditorValue = fallback;
+      draft.identityEditing = !fallback;
+    }
+    state.replyThreadId = '';
+    render();
+    if (restoreFocus) focusAfterReplyCollapse(threadId);
+  };
+  const updateComposerReadiness = () => {
+    const hasName = !!nameInput.value.trim();
+    submitButton.disabled = state.busy || !hasName;
+    submitButton.title = hasName ? '' : 'Enter your name before posting';
+  };
   const threadsDigest = (threads) => JSON.stringify((threads || []).map((thread) => ({
     id: thread.id,
     status: thread.status,
@@ -611,6 +975,7 @@ function injectCommentsUI(html: string, config: {
       id: message.id,
       author_label: message.author_label,
       body: message.body,
+      kind: message.kind || 'note',
       updated_at: message.updated_at,
       deleted_at: message.deleted_at || null,
     })),
@@ -789,12 +1154,42 @@ function injectCommentsUI(html: string, config: {
   const setBusy = (busy) => {
     state.busy = busy;
     tokenInput.disabled = busy;
+    nameInput.disabled = busy;
     textarea.disabled = busy;
     submitButton.disabled = busy;
     root.querySelectorAll('button').forEach((button) => {
       if (button.classList.contains('toss-comments-toggle') || button.classList.contains('toss-comments-notify-toggle')) return;
       button.disabled = busy;
     });
+    updateComposerReadiness();
+  };
+  const beginThreadLoad = () => {
+    const generation = ++state.threadLoadGeneration;
+    state.loading = true;
+    return generation;
+  };
+  const invalidateThreadLoads = () => {
+    state.threadLoadGeneration += 1;
+    state.loading = false;
+  };
+  const isCurrentThreadLoad = (generation) => generation === state.threadLoadGeneration;
+  const beginMutation = () => {
+    state.mutationsInFlight += 1;
+    invalidateThreadLoads();
+  };
+  const endMutation = () => {
+    state.mutationsInFlight = Math.max(0, state.mutationsInFlight - 1);
+    invalidateThreadLoads();
+  };
+  const runMutation = async (operation) => {
+    beginMutation();
+    try {
+      const result = await operation();
+      invalidateThreadLoads();
+      return result;
+    } finally {
+      endMutation();
+    }
   };
   const tempId = (prefix) => prefix + '-' + Math.random().toString(36).slice(2, 10);
   const scrollThreadIntoView = (threadId) => {
@@ -810,15 +1205,19 @@ function injectCommentsUI(html: string, config: {
   };
 
   const api = async (path, init = {}, needsAuth = false) => {
-    const res = await fetch(cfg.origin + path, {
-      ...init,
-      headers: { ...(init.headers || {}), ...authHeaders(needsAuth) },
-    });
-    if (res.status === 204) return null;
-    const text = await res.text();
-    let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text ? { error: text } : null; }
-    if (!res.ok) throw new Error((data && data.error) || text || ('Request failed: ' + res.status));
-    return data;
+    const method = String(init.method || 'GET').toUpperCase();
+    const request = async () => {
+      const res = await fetch(cfg.origin + path, {
+        ...init,
+        headers: { ...(init.headers || {}), ...authHeaders(needsAuth) },
+      });
+      if (res.status === 204) return null;
+      const text = await res.text();
+      let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text ? { error: text } : null; }
+      if (!res.ok) throw new Error((data && data.error) || text || ('Request failed: ' + res.status));
+      return data;
+    };
+    return method !== 'GET' && method !== 'HEAD' ? runMutation(request) : request();
   };
 
   const anchorLabel = (thread) => {
@@ -829,6 +1228,7 @@ function injectCommentsUI(html: string, config: {
   };
   const normalizeMessage = (message) => ({
     ...message,
+    kind: reviewTypes[message.kind] ? message.kind : 'note',
     can_edit: !!message.can_edit,
     can_delete: !!message.can_delete,
   });
@@ -881,16 +1281,30 @@ function injectCommentsUI(html: string, config: {
     });
   };
 
-  const render = () => {
+  const render = (options = {}) => {
+    const { replyFocus = null } = options;
+    reconcileReplyDrafts(state.threads, true);
     list.innerHTML = '';
-    if (!state.threads.length) {
+    const openMessages = state.threads.filter((thread) => thread.status === 'open').flatMap((thread) => thread.messages || []);
+    ['blocker', 'question', 'action'].forEach((kind) => {
+      const node = root.querySelector('[data-ready-kind="' + kind + '"]');
+      if (node) node.textContent = String(openMessages.filter((message) => !message.deleted_at && message.kind === kind).length);
+    });
+    const visibleThreads = state.threads.filter(visibleThread);
+    if (!visibleThreads.length) {
       list.innerHTML = '<div class="toss-comments-empty">No comments on ' + esc(currentPageLabel()) + ' yet.</div>';
       renderNotifications();
       renderPins();
+      if (state.replyFocusAfterRender) {
+        const focusThreadId = state.replyFocusAfterRender;
+        state.replyFocusAfterRender = '';
+        focusAfterReplyCollapse(focusThreadId);
+      }
+      restoreReplyFocus(replyFocus);
       return;
     }
 
-    state.threads.forEach((thread) => {
+    visibleThreads.forEach((thread) => {
       const article = document.createElement('article');
       article.className = 'toss-comments-card' + (thread.status === 'resolved' ? ' resolved' : '');
       if (thread.id === state.activeThreadId) article.className += ' focused';
@@ -898,7 +1312,7 @@ function injectCommentsUI(html: string, config: {
 
       const meta = document.createElement('div');
       meta.className = 'toss-comments-meta';
-      meta.innerHTML = '<span>' + esc(thread.created_by_label) + '</span><span>' + esc(thread.status) + '</span>';
+      meta.innerHTML = '<span>' + esc(thread.created_by_label) + '</span><span class="toss-comments-thread-status ' + esc(thread.status) + '">' + esc(thread.status) + '</span>';
       article.appendChild(meta);
 
       const anchor = document.createElement('div');
@@ -912,7 +1326,10 @@ function injectCommentsUI(html: string, config: {
         const replyTarget = messageIndex > 0 ? ((thread.messages || [])[messageIndex - 1]?.author_label || thread.created_by_label || '') : '';
         box.className = 'toss-comments-message ' + (messageIndex === 0 ? 'parent' : 'reply');
         const replyMeta = messageIndex > 0 ? '<div class="toss-comments-replying-to">Replying to ' + esc(replyTarget) + '</div>' : '';
-        box.innerHTML = '<div class="toss-comments-message-meta"><span>' + esc(message.author_label) + '</span><span>' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span></div>' +
+        const resolvedBadge = thread.status === 'resolved' && messageIndex === 0
+          ? '<span class="toss-comments-resolved-badge">Resolved by ' + esc(thread.resolved_by_label || 'reviewer') + '</span>'
+          : '';
+        box.innerHTML = '<div class="toss-comments-message-meta"><span class="toss-comments-message-author">' + esc(message.author_label) + '</span><span class="toss-comments-message-time">' + new Date(message.updated_at * 1000).toLocaleString() + (message.deleted_at ? ' · deleted' : (message.updated_at !== message.created_at ? ' · edited' : '')) + '</span><div class="toss-comments-message-badges">' + typeBadge(message.kind) + resolvedBadge + '</div></div>' +
           replyMeta +
           '<div>' + esc(message.deleted_at ? 'Message deleted' : message.body) + '</div>';
         if (!message.deleted_at && (message.can_edit || message.can_delete)) {
@@ -942,8 +1359,17 @@ function injectCommentsUI(html: string, config: {
       });
 
       const actions = document.createElement('div');
-      actions.className = 'toss-comments-actions';
-      actions.innerHTML = '<button type="button" data-action="reply-thread" data-thread-id="' + thread.id + '">Reply</button>';
+      actions.className = 'toss-comments-actions toss-comments-thread-actions';
+      const domKey = threadDomKey(thread.id);
+      const composerId = 'toss-reply-composer-' + domKey;
+      const nameId = 'toss-reply-name-' + domKey;
+      const replyId = 'toss-reply-body-' + domKey;
+      const typeLabelId = 'toss-reply-type-label-' + domKey;
+      const identityEditorId = 'toss-reply-identity-editor-' + domKey;
+      const expanded = state.replyThreadId === thread.id;
+      actions.innerHTML = thread.status === 'open'
+        ? '<button type="button" data-action="reply-thread" data-thread-id="' + esc(thread.id) + '" aria-expanded="' + String(expanded) + '" aria-controls="' + composerId + '">Reply</button>'
+        : '';
       if (thread.can_resolve && thread.status !== 'resolved') {
         actions.innerHTML += '<button type="button" class="primary" data-action="resolve-thread" data-thread-id="' + thread.id + '">Resolve</button>';
       }
@@ -954,22 +1380,31 @@ function injectCommentsUI(html: string, config: {
         actions.innerHTML += '<button type="button" class="warn" data-action="delete-thread" data-thread-id="' + thread.id + '">Delete Thread</button>';
       }
       article.appendChild(actions);
-      if (state.replyThreadId === thread.id) {
+      if (thread.status === 'open') {
+        const draft = ensureReplyDraft(thread.id);
         const replyTargetMessage = [...(thread.messages || [])].reverse().find((message) => !message.deleted_at) || null;
         const replyBox = document.createElement('div');
-        replyBox.className = 'toss-comments-card';
+        replyBox.id = composerId;
+        replyBox.className = 'toss-comments-reply-composer';
+        replyBox.dataset.threadId = thread.id;
+        replyBox.hidden = !expanded;
+        const editorVisible = draft.identityEditing || !draft.name;
+        const summary = draft.name
+          ? '<div class="toss-comments-identity-summary" aria-label="Reply identity"' + (editorVisible ? ' hidden' : '') + '><span class="toss-comments-identity-avatar" aria-hidden="true">' + esc(initialsFor(draft.name)) + '</span><span class="toss-comments-identity-copy">Replying as <strong>' + esc(draft.name) + '</strong></span><button type="button" class="toss-comments-identity-change" data-action="change-reply-identity" data-reply-focus="identity-change" data-thread-id="' + esc(thread.id) + '" aria-expanded="' + String(editorVisible) + '" aria-controls="' + identityEditorId + '">Change</button></div>'
+          : '';
         replyBox.innerHTML =
           '<div class="toss-comments-replying-to">Replying to ' + esc(replyTargetMessage?.author_label || thread.created_by_label || 'thread') + ': ' + esc(replySnippet(replyTargetMessage?.body || thread.messages?.[0]?.body || 'Comment')) + '</div>' +
-          '<textarea class="toss-comments-textarea toss-comments-reply-input" data-thread-id="' + thread.id + '" placeholder="Write a reply...">' + esc(state.replyDraft) + '</textarea>' +
-          '<div class="toss-comments-actions">' +
-            '<button type="button" class="primary" data-action="submit-reply" data-thread-id="' + thread.id + '">Post Reply</button>' +
-            '<button type="button" data-action="cancel-reply" data-thread-id="' + thread.id + '">Cancel</button>' +
-          '</div>';
+          '<div class="toss-comments-reply-identity">' + summary +
+            '<div id="' + identityEditorId + '" class="toss-comments-identity-editor"' + (editorVisible ? '' : ' hidden') + '><label for="' + nameId + '"><span class="toss-comments-field-label">Your name</span><input id="' + nameId + '" class="toss-comments-input toss-comments-reply-name" data-reply-focus="identity-name" data-thread-id="' + esc(thread.id) + '" maxlength="80" autocomplete="name" required value="' + esc(draft.identityEditorValue) + '" /></label><div class="toss-comments-identity-actions"><button type="button" data-action="cancel-reply-identity" data-reply-focus="identity-cancel" data-thread-id="' + esc(thread.id) + '">Cancel</button><button type="button" class="primary" data-action="save-reply-identity" data-reply-focus="identity-save" data-thread-id="' + esc(thread.id) + '">Save</button></div></div>' +
+          '</div>' +
+          '<div class="toss-comments-reply-field"><label class="toss-comments-field-label" for="' + replyId + '">Reply</label><textarea id="' + replyId + '" class="toss-comments-textarea toss-comments-reply-input" data-reply-focus="reply-body" data-thread-id="' + esc(thread.id) + '" placeholder="Write a reply..." required>' + esc(draft.body) + '</textarea></div>' +
+          '<div class="toss-comments-reply-types"><span id="' + typeLabelId + '" class="toss-comments-field-label">Reply type</span><div class="toss-comments-reply-chips" role="group" aria-labelledby="' + typeLabelId + '">' + Object.keys(reviewTypes).filter((kind) => kind !== 'resolution').map((kind) => '<button type="button" class="toss-comments-reply-chip" data-reply-focus="reply-kind-' + kind + '" data-reply-kind="' + kind + '" data-thread-id="' + esc(thread.id) + '" aria-pressed="' + String(kind === draft.kind) + '">' + reviewTypes[kind].label + '</button>').join('') + '</div></div>' +
+          '<div class="toss-comments-reply-actions"><button type="button" data-action="cancel-reply" data-reply-focus="composer-cancel" data-thread-id="' + esc(thread.id) + '">Cancel</button><button type="button" class="primary" data-action="submit-reply" data-reply-focus="composer-submit" data-thread-id="' + esc(thread.id) + '">Reply</button></div>';
         article.appendChild(replyBox);
       }
       article.addEventListener('click', (event) => {
         const target = event.target;
-        if (target instanceof HTMLElement && target.closest('button, textarea, input, label')) return;
+        if (target instanceof HTMLElement && target.closest('.toss-comments-reply-composer,.toss-comments-thread-actions,button,textarea,input,select,label,[role="group"]')) return;
         state.activeThreadId = thread.id;
         markThreadNotificationsRead(thread.id);
         render();
@@ -982,22 +1417,36 @@ function injectCommentsUI(html: string, config: {
     renderPins();
     renderFocusHighlight();
     renderUnread();
+    if (state.replyFocusAfterRender) {
+      const focusThreadId = state.replyFocusAfterRender;
+      state.replyFocusAfterRender = '';
+      focusAfterReplyCollapse(focusThreadId);
+    }
+    restoreReplyFocus(replyFocus);
   };
 
   const loadThreads = async (options = {}) => {
     const { silent = false, applyThreads = !silent } = options;
-    state.loading = true;
+    const generation = beginThreadLoad();
     try {
       const data = await api(buildCommentsPath(true));
+      if (!isCurrentThreadLoad(generation)) return;
       const nextThreads = (data.threads || []).map(normalizeThread);
       const nextActivityThreads = (data.activityThreads || data.threads || []).map(normalizeThread);
       const previousThreads = state.activityThreads;
       const previousDigest = state.lastDigest;
       const nextLabel = data.viewer && data.viewer.label ? data.viewer.label : '';
-      state.currentLabel = nextLabel;
+      if (nextLabel && !state.currentLabel) {
+        commitGlobalIdentity('', nextLabel);
+      }
+      reconcileReplyDrafts(nextThreads, true);
+      let threadsApplied = applyThreads;
       if (applyThreads) {
         state.threads = nextThreads;
         state.loaded = true;
+      } else if (state.loaded && threadsDigest(state.threads) !== threadsDigest(nextThreads)) {
+        state.threads = nextThreads;
+        threadsApplied = true;
       }
       const nextDigest = threadsDigest(nextActivityThreads);
       if (!previousDigest) {
@@ -1015,12 +1464,15 @@ function injectCommentsUI(html: string, config: {
       }
       state.activityThreads = nextActivityThreads;
       if (!silent && state.token) {
-        setStatus(state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Token saved. You can comment now.');
+        setStatus(state.currentLabel ? ('Commenting as ' + state.currentLabel) : 'Enter your name to comment.');
       } else if (!silent) {
         setStatus('Paste your toss token to create comments, reply, resolve, edit, or delete.');
       }
+      if (threadsApplied) {
+        const replyFocus = captureReplyFocus();
+        render({ replyFocus });
+      }
       if (applyThreads) {
-        render();
         const pendingTarget = consumePendingTarget();
         if (pendingTarget && pendingTarget.threadId) {
           markNotificationRead(pendingTarget.activityId || '');
@@ -1033,9 +1485,9 @@ function injectCommentsUI(html: string, config: {
         renderUnread();
       }
     } catch (error) {
-      if (!silent) setStatus(error.message || 'Failed to load comments.');
+      if (isCurrentThreadLoad(generation) && !silent) setStatus(error.message || 'Failed to load comments.');
     } finally {
-      state.loading = false;
+      if (isCurrentThreadLoad(generation)) state.loading = false;
     }
   };
   const ensureThreadsLoaded = async (force = false) => {
@@ -1046,12 +1498,12 @@ function injectCommentsUI(html: string, config: {
   const startPolling = () => {
     if (state.pollTimer) return;
     state.pollTimer = window.setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
+      if (document.visibilityState === 'hidden' || state.busy || state.loading || state.mutationsInFlight > 0) return;
       loadThreads({ silent: true, applyThreads: false });
     }, 2000);
   };
   const syncNotificationsNow = () => {
-    if (document.visibilityState === 'hidden') return;
+    if (document.visibilityState === 'hidden' || state.busy || state.loading || state.mutationsInFlight > 0) return;
     loadThreads({ silent: true, applyThreads: false });
   };
 
@@ -1129,6 +1581,25 @@ function injectCommentsUI(html: string, config: {
 
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    const resolveBackdrop = root.querySelector('.toss-comments-dialog-backdrop');
+    if (resolveBackdrop && !resolveBackdrop.hidden) {
+      event.preventDefault();
+      closeResolutionDialog('Resolution cancelled.');
+      return;
+    }
+    if (state.replyThreadId) {
+      const threadId = state.replyThreadId;
+      const draft = ensureReplyDraft(threadId);
+      event.preventDefault();
+      if (draft.identityEditing || !draft.name) {
+        cancelIdentityEdit(threadId, true);
+        setStatus(draft.name ? 'Identity change cancelled.' : 'Enter your name before replying.');
+      } else {
+        collapseReply(threadId, true);
+        setStatus('Reply closed.');
+      }
+      return;
+    }
     const selection = window.getSelection();
     if (selection) selection.removeAllRanges();
     if (state.pendingScope === 'selection' || state.pendingRects.length) {
@@ -1142,18 +1613,76 @@ function injectCommentsUI(html: string, config: {
   window.addEventListener('focus', syncNotificationsNow);
   root.addEventListener('input', (event) => {
     const target = event.target;
+    if (target === nameInput) {
+      updateComposerReadiness();
+      return;
+    }
+    if (target instanceof HTMLInputElement && target.classList.contains('toss-comments-reply-name')) {
+      ensureReplyDraft(target.dataset.threadId || '').identityEditorValue = target.value;
+      target.setCustomValidity('');
+      return;
+    }
+    if (target instanceof HTMLInputElement && target.classList.contains('toss-comments-resolution-name')) {
+      const attributionName = target.value.trim();
+      root.querySelector('.toss-comments-avatar').textContent = initialsFor(attributionName);
+      root.querySelector('.toss-comments-attribution-text').textContent = attributionName
+        ? 'This resolution will be attributed to ' + attributionName + '.'
+        : 'Enter your name for attribution.';
+      return;
+    }
     if (!(target instanceof HTMLTextAreaElement)) return;
     if (target.classList.contains('toss-comments-reply-input')) {
-      state.replyDraft = target.value;
+      ensureReplyDraft(target.dataset.threadId || '').body = target.value;
     }
+  });
+  root.addEventListener('change', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLSelectElement)) return;
+    if (target.classList.contains('toss-comments-status-filter')) {
+      state.statusFilter = target.value;
+      render();
+    }
+    if (target.classList.contains('toss-comments-type-filter')) {
+      state.typeFilter = target.value;
+      render();
+    }
+  });
+
+  root.addEventListener('keydown', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !target.classList.contains('toss-comments-reply-chip')) return;
+    if (event.key !== 'ArrowRight' && event.key !== 'ArrowDown' && event.key !== 'ArrowLeft' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const chips = Array.from(target.parentElement.querySelectorAll('.toss-comments-reply-chip'));
+    const current = chips.indexOf(target);
+    const delta = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1;
+    const next = chips[(current + delta + chips.length) % chips.length];
+    const draft = ensureReplyDraft(target.dataset.threadId || '');
+    draft.kind = next.dataset.replyKind || 'note';
+    chips.forEach((chip) => chip.setAttribute('aria-pressed', String(chip === next)));
+    next.focus();
   });
 
   root.addEventListener('click', async (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
     const action = target.dataset.action;
-    if (state.busy && !target.classList.contains('toss-comments-toggle')) return;
+    if ((state.busy || state.mutationsInFlight > 0) && !target.classList.contains('toss-comments-toggle')) return;
     const notificationItem = target.closest('.toss-comments-notification');
+
+    if (target.classList.contains('toss-comments-kind-chip')) {
+      state.selectedKind = target.dataset.kind || 'note';
+      root.querySelectorAll('.toss-comments-kind-chip').forEach((chip) => chip.setAttribute('aria-pressed', String(chip === target)));
+      const helper = root.querySelector('.toss-comments-kind-helper');
+      if (helper) helper.textContent = reviewTypes[state.selectedKind].helper;
+      return;
+    }
+    if (target.classList.contains('toss-comments-reply-chip')) {
+      const draft = ensureReplyDraft(target.dataset.threadId || '');
+      draft.kind = target.dataset.replyKind || 'note';
+      target.parentElement.querySelectorAll('.toss-comments-reply-chip').forEach((chip) => chip.setAttribute('aria-pressed', String(chip === target)));
+      return;
+    }
 
     if (target.classList.contains('toss-comments-notify-toggle')) {
       if (notifications.classList.contains('open')) notifications.classList.remove('open');
@@ -1230,11 +1759,18 @@ function injectCommentsUI(html: string, config: {
         setStatus('Paste your toss token first.');
         return;
       }
+      const name = nameInput.value.trim();
+      if (!name) {
+        setStatus('Enter your name before posting.');
+        nameInput.focus();
+        return;
+      }
       const body = textarea.value.trim();
       if (!body) {
         setStatus('Write a comment first.');
         return;
       }
+      commitGlobalIdentity(state.currentLabel, name);
       const draft = textarea.value;
       textarea.value = '';
       captureSelectionAnchor({ silent: true });
@@ -1244,7 +1780,7 @@ function injectCommentsUI(html: string, config: {
       upsertThread({
         id: optimisticThreadId,
         artifact_id: cfg.artifactId,
-        created_by_label: state.currentLabel || 'You',
+        created_by_label: name,
         scope_type: state.pendingScope,
         anchor: state.pendingScope === 'artifact' ? null : state.pendingAnchor,
         status: 'open',
@@ -1258,8 +1794,9 @@ function injectCommentsUI(html: string, config: {
         messages: [{
           id: optimisticMessageId,
           thread_id: optimisticThreadId,
-          author_label: state.currentLabel || 'You',
+          author_label: name,
           body,
+          kind: state.selectedKind,
           created_at: now,
           updated_at: now,
           deleted_at: null,
@@ -1274,6 +1811,8 @@ function injectCommentsUI(html: string, config: {
           method: 'POST',
           body: JSON.stringify({
             body,
+            name,
+            kind: state.selectedKind,
             pagePath: currentPagePath,
             scopeType: state.pendingScope,
             anchor: state.pendingScope === 'artifact' ? undefined : state.pendingAnchor,
@@ -1303,34 +1842,112 @@ function injectCommentsUI(html: string, config: {
 
     try {
       if (action === 'reply-thread') {
-        state.replyThreadId = target.dataset.threadId || '';
-        state.replyDraft = '';
+        const threadId = target.dataset.threadId || '';
+        const draft = ensureReplyDraft(threadId);
+        state.replyOriginThreadId = threadId;
+        state.replyThreadId = threadId;
         render();
         setStatus('Reply box opened.');
+        focusReplyControl(threadId, draft.name && !draft.identityEditing ? '.toss-comments-reply-input' : '.toss-comments-reply-name');
         return;
       } else if (action === 'cancel-reply') {
-        state.replyThreadId = '';
-        state.replyDraft = '';
-        render();
+        const threadId = target.dataset.threadId || state.replyThreadId;
+        collapseReply(threadId, true);
         setStatus('Reply cancelled.');
         return;
-      } else if (action === 'submit-reply') {
-        const body = state.replyDraft.trim();
-        if (!body) {
-          setStatus('Write a reply first.');
+      } else if (action === 'change-reply-identity') {
+        const threadId = target.dataset.threadId || '';
+        const draft = ensureReplyDraft(threadId);
+        draft.priorIdentity = draft.name;
+        draft.identityEditorValue = draft.name;
+        draft.identityEditing = true;
+        render();
+        focusReplyControl(threadId, '.toss-comments-reply-name');
+        return;
+      } else if (action === 'cancel-reply-identity') {
+        const threadId = target.dataset.threadId || '';
+        const draft = ensureReplyDraft(threadId);
+        cancelIdentityEdit(threadId, true);
+        setStatus(draft.name ? 'Identity change cancelled.' : 'Enter your name before replying.');
+        return;
+      } else if (action === 'save-reply-identity') {
+        const threadId = target.dataset.threadId || '';
+        const draft = ensureReplyDraft(threadId);
+        const input = Array.from(root.querySelectorAll('.toss-comments-reply-name')).find((node) => node.dataset.threadId === threadId);
+        const name = String(draft.identityEditorValue || '').trim();
+        if (!name) {
+          setStatus('Enter your name before replying.');
+          if (input instanceof HTMLInputElement) {
+            input.setCustomValidity('Enter your name to continue.');
+            input.reportValidity();
+            input.focus();
+          }
           return;
         }
-        const threadId = target.dataset.threadId;
+        commitGlobalIdentity(draft.name, name);
+        const committedDraft = ensureReplyDraft(threadId);
+        committedDraft.name = name;
+        committedDraft.priorIdentity = name;
+        committedDraft.identityEditorValue = name;
+        committedDraft.identityEditing = false;
+        render();
+        focusReplyControl(threadId, '.toss-comments-identity-change');
+        setStatus('Reply identity saved.');
+        return;
+      } else if (action === 'submit-reply') {
+        const threadId = target.dataset.threadId || '';
+        let draft = ensureReplyDraft(threadId);
+        let name = draft.name;
+        if (draft.identityEditing || !name) {
+          name = String(draft.identityEditorValue || '').trim();
+          const input = Array.from(root.querySelectorAll('.toss-comments-reply-name')).find((node) => node.dataset.threadId === threadId);
+          if (!name) {
+            setStatus('Enter your name before replying.');
+            if (input instanceof HTMLInputElement) {
+              input.setCustomValidity('Enter your name to continue.');
+              input.reportValidity();
+              input.focus();
+            }
+            return;
+          }
+          commitGlobalIdentity(draft.name, name);
+          draft = ensureReplyDraft(threadId);
+          draft.name = name;
+          draft.priorIdentity = name;
+          draft.identityEditorValue = name;
+          draft.identityEditing = false;
+        }
+        if (!name) {
+          setStatus('Enter your name before replying.');
+          focusReplyControl(threadId, '.toss-comments-reply-name');
+          return;
+        }
+        const body = draft.body.trim();
+        if (!body) {
+          setStatus('Write a reply first.');
+          focusReplyControl(threadId, '.toss-comments-reply-input');
+          return;
+        }
+        const snapshot = {
+          name: draft.name,
+          body: draft.body,
+          kind: draft.kind,
+          identityEditing: draft.identityEditing,
+          identityEditorValue: draft.identityEditorValue,
+          priorIdentity: draft.priorIdentity,
+        };
         const optimisticMessageId = tempId('reply');
         const now = Math.floor(Date.now() / 1000);
+        const previousThreadUpdatedAt = state.threads.find((thread) => thread.id === threadId)?.updated_at;
         updateThread(threadId, (thread) => ({
           ...thread,
           updated_at: now,
           messages: [...(thread.messages || []), normalizeMessage({
             id: optimisticMessageId,
             thread_id: threadId,
-            author_label: state.currentLabel || 'You',
+            author_label: name,
             body,
+            kind: snapshot.kind,
             created_at: now,
             updated_at: now,
             deleted_at: null,
@@ -1339,48 +1956,112 @@ function injectCommentsUI(html: string, config: {
           })],
         }));
         state.replyThreadId = '';
-        state.replyDraft = '';
         render();
+        setBusy(true);
         scrollThreadIntoView(threadId);
-        const data = await api('/comment-threads/' + target.dataset.threadId + '/messages', {
-          method: 'POST',
-          body: JSON.stringify({ body }),
-        }, true);
-        if (data && data.message) {
+        try {
+          const data = await api('/comment-threads/' + threadId + '/messages', {
+            method: 'POST',
+            body: JSON.stringify({ name, body, kind: snapshot.kind }),
+          }, true);
+          if (data && data.message) {
+            updateThread(threadId, (thread) => ({
+              ...thread,
+              updated_at: data.threadUpdatedAt || thread.updated_at,
+              messages: (thread.messages || []).map((message) =>
+                message.id === optimisticMessageId ? normalizeMessage(data.message) : message),
+            }));
+          }
+          delete state.replyDrafts[threadId];
+          setBusy(false);
+          setStatus('Reply posted.');
+        } catch (error) {
           updateThread(threadId, (thread) => ({
             ...thread,
-            updated_at: data.threadUpdatedAt || thread.updated_at,
-            messages: (thread.messages || []).map((message) =>
-              message.id === optimisticMessageId ? normalizeMessage(data.message) : message),
+            updated_at: previousThreadUpdatedAt || thread.updated_at,
+            messages: (thread.messages || []).filter((message) => message.id !== optimisticMessageId),
           }));
+          state.replyDrafts[threadId] = { ...snapshot };
+          state.replyThreadId = threadId;
+          state.replyOriginThreadId = threadId;
+          render();
+          setBusy(false);
+          setStatus(error.message || 'Failed to post reply.');
+          focusReplyControl(threadId, snapshot.name ? '.toss-comments-reply-input' : '.toss-comments-reply-name');
+          return;
         }
       } else if (action === 'resolve-thread') {
-        updateThread(target.dataset.threadId, (thread) => ({
-          ...thread,
-          status: 'resolved',
-          resolved_by_label: state.currentLabel || 'You',
-          resolved_at: Math.floor(Date.now() / 1000),
-          messages: (thread.messages || []).map((message) => ({ ...message, can_edit: false })),
-        }));
-        render();
-        const data = await api('/comment-threads/' + target.dataset.threadId + '/resolve', { method: 'POST' }, true);
-        updateThread(target.dataset.threadId, (thread) => ({
+        const name = nameInput.value.trim();
+        if (!name) {
+          setStatus('Enter your name before resolving.');
+          nameInput.focus();
+          return;
+        }
+        state.resolveThreadId = target.dataset.threadId || '';
+        state.resolveOriginThreadId = state.resolveThreadId;
+        const backdrop = root.querySelector('.toss-comments-dialog-backdrop');
+        const resolutionName = root.querySelector('.toss-comments-resolution-name');
+        const resolutionBody = root.querySelector('.toss-comments-resolution-body');
+        const thread = state.threads.find((item) => item.id === state.resolveThreadId);
+        const primaryMessage = (thread?.messages || []).find((message) => !message.deleted_at && message.kind !== 'resolution');
+        const kind = reviewTypes[primaryMessage?.kind] ? primaryMessage.kind : 'note';
+        root.querySelector('#toss-resolve-title').textContent = 'Resolve ' + reviewTypes[kind].label.toLowerCase();
+        const kindBadge = root.querySelector('.toss-comments-resolution-kind');
+        kindBadge.className = 'toss-comments-type-badge toss-comments-resolution-kind ' + kind;
+        kindBadge.textContent = reviewTypes[kind].label;
+        root.querySelector('.toss-comments-resolution-context').textContent = thread ? anchorLabel(thread) : 'General page comment';
+        root.querySelector('.toss-comments-avatar').textContent = initialsFor(name);
+        root.querySelector('.toss-comments-attribution-text').textContent = 'This resolution will be attributed to ' + name + '.';
+        resolutionName.value = name;
+        resolutionBody.value = '';
+        backdrop.hidden = false;
+        setTimeout(() => resolutionBody.focus(), 0);
+        return;
+      } else if (action === 'cancel-resolve') {
+        closeResolutionDialog('Resolution cancelled.');
+        return;
+      } else if (action === 'confirm-resolve') {
+        const resolutionName = root.querySelector('.toss-comments-resolution-name');
+        const resolutionBody = root.querySelector('.toss-comments-resolution-body');
+        const name = resolutionName.value.trim();
+        const body = resolutionBody.value.trim();
+        if (!name) {
+          setStatus('Enter your name before resolving.');
+          resolutionName.focus();
+          return;
+        }
+        if (!body) {
+          setStatus('Add a resolution note before resolving.');
+          resolutionBody.focus();
+          return;
+        }
+        const threadId = state.resolveThreadId;
+        const data = await api('/comment-threads/' + threadId + '/resolve', { method: 'POST', body: JSON.stringify({ name, body }) }, true);
+        updateThread(threadId, (thread) => ({
           ...thread,
           status: data.status,
           resolved_by_label: data.resolvedByLabel,
           resolved_at: data.resolvedAt,
           updated_at: data.updatedAt || thread.updated_at,
+          messages: [...(thread.messages || []).map((message) => ({ ...message, can_edit: false })), normalizeMessage(data.message)],
         }));
+        closeResolutionDialog('Thread resolved with a resolution note.');
       } else if (action === 'reopen-thread') {
+        const name = nameInput.value.trim();
+        if (!name) {
+          setStatus('Enter your name before reopening.');
+          nameInput.focus();
+          return;
+        }
         updateThread(target.dataset.threadId, (thread) => ({
           ...thread,
           status: 'open',
           resolved_by_label: null,
           resolved_at: null,
-          messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === (state.currentLabel || 'You') })),
+          messages: (thread.messages || []).map((message) => ({ ...message, can_edit: !message.deleted_at && message.author_label === state.currentLabel })),
         }));
         render();
-        const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST' }, true);
+        const data = await api('/comment-threads/' + target.dataset.threadId + '/reopen', { method: 'POST', body: JSON.stringify({ name }) }, true);
         updateThread(target.dataset.threadId, (thread) => ({
           ...thread,
           status: data.status,
@@ -1443,6 +2124,7 @@ function injectCommentsUI(html: string, config: {
   });
 
   updateContext();
+  updateComposerReadiness();
   startPolling();
   const bootTarget = readPendingTarget();
   if (bootTarget && bootTarget.pagePath === currentPagePath) {
@@ -1500,6 +2182,7 @@ function mimeType(path: string): string {
 interface ArtifactMeta {
   id: string;
   expires_at: number;
+  current_version_id?: string | null;
 }
 
 async function serveArtifact(
@@ -1513,7 +2196,22 @@ async function serveArtifact(
     return new Response('Link expired', { status: 410 });
   }
 
-  const obj = await env.TOSS_KV.get(`artifacts/${meta.id}/files/${filePath}`, 'arrayBuffer');
+  let currentVersionId = meta.current_version_id || null;
+  if (filePath === 'index.html' && !currentVersionId) {
+    const current = await env.TOSS_DB.prepare('SELECT current_version_id AS vid FROM artifacts WHERE id = ?')
+      .bind(meta.id).first<{ vid: string | null }>();
+    currentVersionId = current?.vid || null;
+  }
+  const versionedKey = currentVersionId && filePath === 'index.html'
+    ? `artifacts/${meta.id}/versions/${currentVersionId}/files/${filePath}`
+    : null;
+  // D1 is the publication pointer for the entry page. index.html is staged
+  // under an immutable version key before that pointer advances, so a losing
+  // publisher never mutates the bytes readers see. Additional folder files,
+  // including HTML pages, continue using their stable upload keys.
+  const obj = versionedKey
+    ? await env.TOSS_KV.get(versionedKey, 'arrayBuffer')
+    : await env.TOSS_KV.get(`artifacts/${meta.id}/files/${filePath}`, 'arrayBuffer');
   if (!obj) {
     if (!filePath.endsWith('.html')) {
       const indexObj = await env.TOSS_KV.get(`artifacts/${meta.id}/files/${filePath}/index.html`, 'arrayBuffer');
@@ -1707,14 +2405,49 @@ export default {
               return new Response('Slug already taken by another tenant', { status: 409 });
             }
             const existingId = existing.id;
+            const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true';
+            const newHash = await sha256(html);
+            const currentVersion = await env.TOSS_DB.prepare(
+              'SELECT av.content_hash AS chash FROM artifacts a LEFT JOIN artifact_versions av ON av.id = a.current_version_id WHERE a.id = ?'
+            ).bind(existingId).first<{ chash: string | null }>();
+            const contentChanged = !currentVersion?.chash || currentVersion.chash !== newHash;
+            if (!contentChanged && !force) {
+              const commentCount = await env.TOSS_DB.prepare(
+                'SELECT COUNT(*) AS n FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL'
+              ).bind(existingId).first<{ n: number }>();
+              if (Number(commentCount?.n || 0) > 0) {
+                return jsonResponse({
+                  error: 'comments_present_no_change',
+                  comment_count: Number(commentCount?.n || 0),
+                  hint: '--force',
+                }, { status: 409 });
+              }
+            }
             // Password salt is the artifact id, which is preserved on update.
             const passwordParam = url.searchParams.get('password');
             const newPasswordHash = passwordParam ? await sha256(passwordParam + existingId) : null;
             const newExpiresAt = expiresSeconds === 0 ? 0 : (now + expiresSeconds);
-            await env.TOSS_KV.put(`artifacts/${existingId}/files/index.html`, html);
-            await env.TOSS_DB.prepare(
-              'UPDATE artifacts SET name = ?, size_bytes = ?, expires_at = ?, password_hash = ? WHERE id = ?'
-            ).bind(name, sizeBytes, newExpiresAt, newPasswordHash, existingId).run();
+            const candidateVersionId = generateId();
+            const candidateKey = `artifacts/${existingId}/versions/${candidateVersionId}/files/index.html`;
+            await env.TOSS_KV.put(candidateKey, html);
+            try {
+              const publishedVersion = await mintVersion(env, existingId, candidateVersionId, newHash, now, {
+                name,
+                sizeBytes,
+                expiresAt: newExpiresAt,
+                passwordHash: newPasswordHash,
+              });
+              if (!publishedVersion) {
+                await env.TOSS_KV.delete(candidateKey);
+                return jsonResponse({
+                  error: 'version_publish_conflict',
+                  hint: 'The share changed during publication. Retry the re-share against the latest version.',
+                }, { status: 409 });
+              }
+            } catch (error) {
+              await env.TOSS_KV.delete(candidateKey);
+              throw error;
+            }
             const shortUrl = `${url.origin}/s/${requestedId}`;
             return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
               headers: { 'Content-Type': 'application/json' },
@@ -1745,14 +2478,28 @@ export default {
         const commentsParam = url.searchParams.get('comments');
         const commentsEnabled = commentsParam === '1' || commentsParam === 'true' ? 1 : 0;
 
-        await env.TOSS_KV.put(`artifacts/${id}/files/index.html`, html);
-
         const expiresAt = expiresSeconds === 0 ? PERMANENT : (now + expiresSeconds);
         await env.TOSS_DB.prepare(
           'INSERT INTO artifacts (id, slug, name, size_bytes, created_at, expires_at, token_hash, password_hash, comments_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
         )
           .bind(id, slug, name, sizeBytes, now, expiresAt, auth.tokenHash, passwordHash, commentsEnabled)
           .run();
+        const initialVersionId = generateId();
+        const initialVersionKey = `artifacts/${id}/versions/${initialVersionId}/files/index.html`;
+        await env.TOSS_KV.put(initialVersionKey, html);
+        try {
+          const initialVersion = await mintVersion(env, id, initialVersionId, await sha256(html), now, {
+            name,
+            sizeBytes,
+            expiresAt,
+            passwordHash,
+          });
+          if (!initialVersion) throw new Error('Initial artifact version publication conflicted');
+        } catch (error) {
+          await env.TOSS_KV.delete(initialVersionKey);
+          await env.TOSS_DB.prepare('DELETE FROM artifacts WHERE id = ? AND current_version_id IS NULL').bind(id).run();
+          throw error;
+        }
 
         // Legacy /a/:id?t=jwt URL. issueArtifactJWT handles the permanent vs
         // time-bound distinction so the verifier can normalize correctly.
@@ -1901,6 +2648,26 @@ export default {
         });
       }
 
+      const versionsMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/versions$/);
+      if (versionsMatch && request.method === 'GET') {
+        const artifactId = versionsMatch[1];
+        const access = await requireCommentAccess(request, env, artifactId, { requireEnabled: false });
+        if (access instanceof Response) return access;
+        const rows = await env.TOSS_DB.prepare(
+          'SELECT av.seq, av.content_hash, av.created_at, (SELECT COUNT(*) FROM comment_threads ct WHERE ct.version_id = av.id AND ct.deleted_at IS NULL) AS comment_count, (av.id = a.current_version_id) AS is_current FROM artifact_versions av JOIN artifacts a ON a.id = av.artifact_id WHERE av.artifact_id = ? ORDER BY av.seq DESC'
+        ).bind(artifactId).all<Record<string, unknown>>();
+        return jsonResponse({
+          artifactId,
+          versions: (rows.results || []).map((row) => ({
+            seq: Number(row.seq),
+            content_hash: row.content_hash,
+            created_at: Number(row.created_at),
+            comment_count: Number(row.comment_count),
+            is_current: row.is_current === true || row.is_current === 1,
+          })),
+        });
+      }
+
       // ===== COMMENT THREADS =====
       const commentListMatch = url.pathname.match(/^\/artifacts\/([a-f0-9-]+)\/comment-threads$/);
       if (commentListMatch && request.method === 'GET') {
@@ -1911,21 +2678,57 @@ export default {
         if (pagePath instanceof Response) return pagePath;
         const includeActivity = url.searchParams.get('includeActivity') === '1';
 
+        const versionParam = url.searchParams.get('version');
+        if (versionParam !== null) {
+          const seq = Number(versionParam);
+          if (!Number.isInteger(seq) || seq < 1) return new Response('version must be a positive integer', { status: 400 });
+          const version = await env.TOSS_DB.prepare(
+            'SELECT id FROM artifact_versions WHERE artifact_id = ? AND seq = ?'
+          ).bind(artifactId, seq).first<{ id: string }>();
+          if (!version) {
+            const maxRow = await env.TOSS_DB.prepare(
+              'SELECT MAX(seq) AS max FROM artifact_versions WHERE artifact_id = ?'
+            ).bind(artifactId).first<{ max: number | null }>();
+            const max = Number(maxRow?.max || 0);
+            return jsonResponse({
+              error: 'version_not_found',
+              seq,
+              hint: max ? `this share has versions 1-${max}` : 'this share has no versions yet',
+            }, { status: 404 });
+          }
+          const versionThreads = await env.TOSS_DB.prepare(
+            'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND version_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
+          ).bind(artifactId, version.id).all();
+          const versionMessages = await env.TOSS_DB.prepare(
+            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.version_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+          ).bind(artifactId, version.id).all();
+          const hydrated = hydrateCommentThreads(
+            (versionThreads.results || []) as Array<Record<string, unknown>>,
+            (versionMessages.results || []) as Array<Record<string, unknown>>,
+          );
+          return jsonResponse({ version: seq, versionId: version.id, viewer: { authenticated: true, label: null }, threads: hydrated, activityThreads: hydrated });
+        }
+
+        const currentVersion = await env.TOSS_DB.prepare(
+          'SELECT current_version_id AS vid FROM artifacts WHERE id = ?'
+        ).bind(artifactId).first<{ vid: string | null }>();
+        const currentVersionId = currentVersion?.vid || null;
+
         const threadQuery = await env.TOSS_DB.prepare(
-          'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND deleted_at IS NULL ORDER BY created_at DESC'
-        ).bind(artifactId, pagePath).all();
+          'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND page_path = ? AND (? IS NULL OR version_id = ?) AND deleted_at IS NULL ORDER BY created_at DESC'
+        ).bind(artifactId, pagePath, currentVersionId, currentVersionId).all();
         const messageQuery = await env.TOSS_DB.prepare(
-          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
-        ).bind(artifactId, pagePath).all();
+          'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.page_path = ? AND (? IS NULL OR t.version_id = ?) AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+        ).bind(artifactId, pagePath, currentVersionId, currentVersionId).all();
         let activityThreadQuery: { results?: unknown[] } | null = null;
         let activityMessageQuery: { results?: unknown[] } | null = null;
         if (includeActivity) {
           activityThreadQuery = await env.TOSS_DB.prepare(
-            'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND deleted_at IS NULL ORDER BY created_at DESC'
-          ).bind(artifactId).all();
+            'SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ? AND (? IS NULL OR version_id = ?) AND deleted_at IS NULL ORDER BY created_at DESC'
+          ).bind(artifactId, currentVersionId, currentVersionId).all();
           activityMessageQuery = await env.TOSS_DB.prepare(
-            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
-          ).bind(artifactId).all();
+            'SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ? AND (? IS NULL OR t.version_id = ?) AND t.deleted_at IS NULL ORDER BY m.created_at ASC'
+          ).bind(artifactId, currentVersionId, currentVersionId).all();
         }
 
         const hydrateThreads = (
@@ -1947,7 +2750,7 @@ export default {
             const out: Record<string, unknown> = {
               ...row,
               can_edit: !row.deleted_at && row.thread_status !== 'resolved',
-              can_delete: !row.deleted_at,
+              can_delete: !row.deleted_at && !(row.kind === 'resolution' && row.thread_status === 'resolved'),
             };
             delete out.author_token_hash; // never expose the legacy author token hash
             items.push(out);
@@ -1991,16 +2794,22 @@ export default {
         if (name instanceof Response) return name;
         const normalized = normalizeThreadInput(body);
         if (normalized instanceof Response) return normalized;
+        const kind = normalizeMessageKind(body);
+        if (kind instanceof Response) return kind;
 
         const now = Math.floor(Date.now() / 1000);
         const threadId = generateId();
         const messageId = generateId();
+        const currentVersion = await env.TOSS_DB.prepare(
+          'SELECT current_version_id AS vid FROM artifacts WHERE id = ?'
+        ).bind(artifactId).first<{ vid: string | null }>();
 
         await env.TOSS_DB.prepare(
-          'INSERT INTO comment_threads (id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
           threadId,
           artifactId,
+          currentVersion?.vid || null,
           normalized.pagePath,
           NO_TOKEN,
           name,
@@ -2012,8 +2821,8 @@ export default {
         ).run();
 
         await env.TOSS_DB.prepare(
-          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).bind(messageId, threadId, NO_TOKEN, name, normalized.body, now, now).run();
+          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(messageId, threadId, NO_TOKEN, name, normalized.body, kind, now, now).run();
 
         return jsonResponse({
           id: threadId,
@@ -2038,6 +2847,7 @@ export default {
               thread_id: threadId,
               author_label: name,
               body: normalized.body,
+              kind,
               created_at: now,
               updated_at: now,
               deleted_at: null,
@@ -2065,12 +2875,14 @@ export default {
         if (name instanceof Response) return name;
         const message = normalizeMessageInput(body);
         if (message instanceof Response) return message;
+        const kind = normalizeMessageKind(body);
+        if (kind instanceof Response) return kind;
 
         const now = Math.floor(Date.now() / 1000);
         const messageId = generateId();
         await env.TOSS_DB.prepare(
-          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).bind(messageId, threadId, NO_TOKEN, name, message, now, now).run();
+          'INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(messageId, threadId, NO_TOKEN, name, message, kind, now, now).run();
         await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, threadId).run();
 
         return jsonResponse({
@@ -2082,6 +2894,7 @@ export default {
             thread_id: threadId,
             author_label: name,
             body: message,
+            kind,
             created_at: now,
             updated_at: now,
             deleted_at: null,
@@ -2097,22 +2910,51 @@ export default {
         const action = threadResolveMatch[2];
 
         const threadRow = await env.TOSS_DB.prepare(
-          'SELECT artifact_id, deleted_at FROM comment_threads WHERE id = ?'
-        ).bind(threadId).first<{ artifact_id: string; deleted_at: number | null }>();
+          'SELECT artifact_id, status, deleted_at FROM comment_threads WHERE id = ?'
+        ).bind(threadId).first<{ artifact_id: string; status: string; deleted_at: number | null }>();
         if (!threadRow || threadRow.deleted_at) return new Response('Not found', { status: 404 });
 
         const access = await requireCommentAccess(request, env, threadRow.artifact_id);
         if (access instanceof Response) return access;
 
         const rb = await request.json().catch(() => null);
-        const resolverName = rb && typeof rb === 'object' && typeof (rb as { name?: unknown }).name === 'string'
-          ? (rb as { name: string }).name.trim().slice(0, 80) : '';
+        const resolverName = normalizeName(rb);
+        if (resolverName instanceof Response) return resolverName;
 
         const now = Math.floor(Date.now() / 1000);
         if (action === 'resolve') {
-          await env.TOSS_DB.prepare(
-            'UPDATE comment_threads SET status = ?, resolved_by_token_hash = ?, resolved_by_label = ?, resolved_at = ?, updated_at = ? WHERE id = ?'
-          ).bind('resolved', NO_TOKEN, resolverName, now, now, threadId).run();
+          const resolutionBody = normalizeMessageInput(rb);
+          if (resolutionBody instanceof Response) return resolutionBody;
+          const resolutionMessageId = generateId();
+          const results = await env.TOSS_DB.batch([
+            env.TOSS_DB.prepare(
+              "INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) SELECT ?, id, ?, ?, ?, 'resolution', ?, ? FROM comment_threads WHERE id = ? AND status = 'open' AND deleted_at IS NULL"
+            ).bind(resolutionMessageId, NO_TOKEN, resolverName, resolutionBody, now, now, threadId),
+            env.TOSS_DB.prepare(
+              "UPDATE comment_threads SET status = 'resolved', resolved_by_token_hash = ?, resolved_by_label = ?, resolved_at = ?, updated_at = ? WHERE id = ? AND status = 'open' AND deleted_at IS NULL"
+            ).bind(NO_TOKEN, resolverName, now, now, threadId),
+          ]);
+          const updateResult = results[1] as D1Result<unknown> | undefined;
+          if (!updateResult?.meta?.changes) return new Response('Thread is already resolved', { status: 409 });
+          return jsonResponse({
+            id: threadId,
+            status: 'resolved',
+            resolvedByLabel: resolverName,
+            resolvedAt: now,
+            updatedAt: now,
+            message: {
+              id: resolutionMessageId,
+              thread_id: threadId,
+              author_label: resolverName,
+              body: resolutionBody,
+              kind: 'resolution',
+              created_at: now,
+              updated_at: now,
+              deleted_at: null,
+              can_edit: false,
+              can_delete: false,
+            },
+          });
         } else {
           await env.TOSS_DB.prepare(
             'UPDATE comment_threads SET status = ?, resolved_by_token_hash = NULL, resolved_by_label = NULL, resolved_at = NULL, updated_at = ? WHERE id = ?'
@@ -2120,9 +2962,9 @@ export default {
         }
         return jsonResponse({
           id: threadId,
-          status: action === 'resolve' ? 'resolved' : 'open',
-          resolvedByLabel: action === 'resolve' ? (resolverName || null) : null,
-          resolvedAt: action === 'resolve' ? now : null,
+          status: 'open',
+          resolvedByLabel: null,
+          resolvedAt: null,
           updatedAt: now,
         });
       }
@@ -2151,8 +2993,8 @@ export default {
         const messageId = messageMatch[1];
 
         const row = await env.TOSS_DB.prepare(
-          'SELECT m.thread_id, m.author_token_hash, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
-        ).bind(messageId).first<{ thread_id: string; author_token_hash: string; deleted_at: number | null; artifact_id: string; thread_status: string }>();
+          'SELECT m.thread_id, m.author_token_hash, m.kind, m.deleted_at, t.artifact_id, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE m.id = ? AND t.deleted_at IS NULL'
+        ).bind(messageId).first<{ thread_id: string; author_token_hash: string; kind: CommentMessageKind; deleted_at: number | null; artifact_id: string; thread_status: string }>();
         if (!row || row.deleted_at) return new Response('Not found', { status: 404 });
 
         const access = await requireCommentAccess(request, env, row.artifact_id);
@@ -2167,9 +3009,12 @@ export default {
             .bind(message, now, messageId)
             .run();
           await env.TOSS_DB.prepare('UPDATE comment_threads SET updated_at = ? WHERE id = ?').bind(now, row.thread_id).run();
-          return jsonResponse({ id: messageId, body: message, updatedAt: now, threadUpdatedAt: now });
+          return jsonResponse({ id: messageId, body: message, kind: row.kind, updatedAt: now, threadUpdatedAt: now });
         }
 
+        if (row.kind === 'resolution' && row.thread_status === 'resolved') {
+          return new Response('Resolution messages cannot be deleted while the thread is resolved', { status: 409 });
+        }
         await env.TOSS_DB.prepare('UPDATE comment_messages SET deleted_at = ?, deleted_by_token_hash = ?, updated_at = ? WHERE id = ?')
           .bind(now, NO_TOKEN, now, messageId)
           .run();
@@ -2235,8 +3080,8 @@ export default {
           return Response.redirect(`${url.origin}${url.pathname}/`, 302);
         }
         const row = await env.TOSS_DB.prepare(
-          'SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ?'
-        ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null }>();
+          'SELECT id, expires_at, password_hash, current_version_id FROM artifacts WHERE slug = ?'
+        ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null; current_version_id: string | null }>();
 
         if (!row) return new Response('Not found', { status: 404 });
 

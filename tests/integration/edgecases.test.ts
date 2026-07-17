@@ -65,7 +65,9 @@ describe('Worker Edge Cases', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
 
-      const stored = await kv.get(`artifacts/${body.id}/files/index.html`);
+      const versionKeys = await kv.list({ prefix: `artifacts/${body.id}/versions/` });
+      expect(versionKeys.keys).toHaveLength(1);
+      const stored = await kv.get(versionKeys.keys[0].name);
       expect(stored).toBe(html);
     });
 
@@ -170,6 +172,23 @@ describe('Worker Edge Cases', () => {
       expect(res.status).toBe(200);
       expect(res.headers.get('Cache-Control')).toBe('public, max-age=0, must-revalidate');
       expect(res.headers.get('Cache-Control')).not.toContain('immutable');
+    });
+
+    it('should keep serving stable non-HTML assets when an artifact has a current version', async () => {
+      const statefulDb = new MockD1();
+      const artifactId = 'abc12345-1234-1234-1234-123456789abc';
+      statefulDb.setRows([{ id: artifactId, current_version_id: 'version-1' }]);
+      await kv.put(`artifacts/${artifactId}/files/app.js`, 'console.log("stable asset")');
+
+      const now = Math.floor(Date.now() / 1000);
+      const token = await signJWT({ sub: artifactId, iat: now, exp: now + 3600 }, SECRET);
+      const res = await worker.fetch(
+        new Request(`http://localhost/a/${artifactId}/app.js?t=${token}`),
+        createEnv(kv, statefulDb),
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('console.log("stable asset")');
     });
   });
 
