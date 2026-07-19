@@ -301,7 +301,7 @@ describe('versions + comments --version', () => {
   });
 });
 
-describe('comments feedback kinds, filters, and checks', () => {
+describe('dynamic comment labels and filters', () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
 
@@ -310,19 +310,15 @@ describe('comments feedback kinds, filters, and checks', () => {
   const threads = [
     {
       id: 'open-thread', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
-        { id: 'blocker', kind: 'blocker', author_label: 'Alice', body: 'Must fix', created_at: 1700000000 },
-        { id: 'note', kind: 'note', author_label: 'Bob', body: 'For context', created_at: 1700000001 },
-        { id: 'legacy', body: 'Old comment', created_at: 1700000002 },
-        { id: 'concern', kind: 'concern', author_label: 'Cara', body: 'Risky', created_at: 1700000003 },
-        { id: 'question', kind: 'question', author_label: 'Dan', body: 'Why?', created_at: 1700000004 },
-        { id: 'action', kind: 'action', author_label: 'Eli', body: 'Follow up', created_at: 1700000005 },
-        { id: 'nit', kind: 'nit', author_label: 'Fran', body: 'Small polish', created_at: 1700000006 },
+        { id: 'risk', kind: 'release-risk', author_label: 'Alice', body: 'Must fix', created_at: 1700000000 },
+        { id: 'unlabeled', kind: null, author_label: 'Bob', body: 'For context', created_at: 1700000001 },
+        { id: 'omitted', author_label: 'Cara', body: 'Old comment', created_at: 1700000002 },
       ],
     },
     {
       id: 'resolved-thread', status: 'resolved', scope_type: 'artifact', page_path: 'index.html', messages: [
         { id: 'resolution', kind: 'resolution', author_label: '', body: 'Fixed', created_at: 1700000003 },
-        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
+        { id: 'deleted-risk', kind: 'release-risk', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
       ],
     },
   ];
@@ -337,7 +333,16 @@ describe('comments feedback kinds, filters, and checks', () => {
     vi.spyOn(config, 'loadConfig').mockResolvedValue(ownerCfg);
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ threads, activityThreads: threads }),
+      json: async () => ({
+        artifactId: HEXID,
+        viewer: { role: 'owner' },
+        pagePath: 'index.html',
+        commentLabelRevision: 7,
+        commentLabels: [{ key: 'release-risk', label: 'Release risk', description: '', color: '#D97706', enabled: false, position: 1 }],
+        threads,
+        activityThreads: threads,
+        futureField: 'preserved',
+      }),
     } as Response);
   });
 
@@ -346,95 +351,65 @@ describe('comments feedback kinds, filters, and checks', () => {
     vi.restoreAllMocks();
   });
 
-  it('labels attributed kinds, omits NOTE, and never prints anon for legacy authors', async () => {
+  it('uses configured human labels, leaves unlabeled comments unbadged, and preserves resolution', async () => {
     await commentsCommand(HEXID, undefined);
     const out = consoleLogSpy.mock.calls.map((call) => String(call[0])).join('\n');
-    expect(out).toContain('[BLOCKER] Alice');
-    expect(out).toContain('[CONCERN] Cara');
-    expect(out).toContain('[QUESTION] Dan');
-    expect(out).toContain('[ACTION] Eli');
-    expect(out).toContain('[NIT] Fran');
-    expect(out).toContain('[RESOLUTION] <unknown author>');
-    expect(out).not.toContain('[NOTE]');
+    expect(out).toContain('[Release risk] Alice');
+    expect(out).toContain('Bob');
+    expect(out).not.toContain('[null]');
+    expect(out).toContain('[Resolution] <unknown author>');
     expect(out).not.toContain('anon');
   });
 
-  it('applies type and status filters to JSON without changing retained messages', async () => {
-    await commentsCommand(HEXID, undefined, { type: 'resolution', status: 'resolved', json: true });
+  it('filters both thread arrays while preserving the complete JSON envelope and raw nullable kinds', async () => {
+    await commentsCommand(HEXID, undefined, { label: 'release-risk', status: 'open', json: true });
     const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.futureField).toBe('preserved');
+    expect(parsed.viewer).toEqual({ role: 'owner' });
+    expect(parsed.commentLabelRevision).toBe(7);
+    expect(parsed.commentLabels[0].enabled).toBe(false);
     expect(parsed.threads).toHaveLength(1);
-    expect(parsed.threads[0].id).toBe('resolved-thread');
-    expect(parsed.threads[0].messages).toEqual([threads[1].messages[0]]);
+    expect(parsed.activityThreads).toHaveLength(1);
+    expect(parsed.threads[0].messages).toEqual([threads[0].messages[0]]);
   });
 
-  it('treats legacy messages without a kind as notes when filtering', async () => {
-    await commentsCommand(HEXID, undefined, { type: 'note', json: true });
+  it('filters explicit null and omitted kinds with --unlabeled', async () => {
+    await commentsCommand(HEXID, undefined, { unlabeled: true, json: true });
     const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
-    expect(parsed.threads[0].messages.map((message: any) => message.id)).toEqual(['note', 'legacy']);
+    expect(parsed.threads[0].messages.map((message: any) => message.id)).toEqual(['unlabeled', 'omitted']);
+    expect(parsed.threads[0].messages[0].kind).toBeNull();
   });
 
-  it('excludes a thread whose only matching blocker message is deleted', async () => {
+  it('excludes deleted matches', async () => {
     const deletedOnlyThreads = [{
       id: 'deleted-only', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
-        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
+        { id: 'deleted-risk', kind: 'release-risk', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
       ],
     }];
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ threads: deletedOnlyThreads, activityThreads: deletedOnlyThreads }),
+      json: async () => ({ commentLabels: [{ key: 'release-risk', label: 'Risk' }], threads: deletedOnlyThreads, activityThreads: deletedOnlyThreads }),
     } as Response);
 
-    await commentsCommand(HEXID, undefined, { type: 'blocker', json: true });
+    await commentsCommand(HEXID, undefined, { label: 'release-risk', json: true });
     const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
     expect(parsed.threads).toEqual([]);
   });
 
-  it('rejects invalid type and status values with accepted values in the error', async () => {
-    await expect(commentsCommand(HEXID, undefined, { type: 'urgent' })).rejects.toThrow('process.exit(1)');
-    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('note, blocker, concern, question, action, nit, resolution'));
+  it('validates labels dynamically and rejects incompatible filters', async () => {
+    await expect(commentsCommand(HEXID, undefined, { label: 'urgent' })).rejects.toThrow('process.exit(1)');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('release-risk, resolution'));
 
     await expect(commentsCommand(HEXID, undefined, { status: 'closed' })).rejects.toThrow('process.exit(1)');
     expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('open, resolved'));
-    expect(global.fetch).not.toHaveBeenCalled();
+    await expect(commentsCommand(HEXID, undefined, { label: 'release-risk', unlabeled: true })).rejects.toThrow('process.exit(1)');
   });
 
-  it('checks all unfiltered threads and sets exitCode for an unresolved blocker', async () => {
-    await commentsCommand(HEXID, undefined, { type: 'resolution', status: 'resolved', check: true, json: true });
-    expect(process.exitCode).toBe(1);
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Check failed: 1 unresolved blocker thread(s).');
+  it('supports metadata-absent Cloudflare envelopes using exact raw keys', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ threads, activityThreads: threads, cloudflareField: true }) } as Response);
+    await commentsCommand(HEXID, undefined, { label: 'release-risk', json: true });
     const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(parsed.cloudflareField).toBe(true);
     expect(parsed.threads).toHaveLength(1);
-    expect(parsed.threads[0].id).toBe('resolved-thread');
-  });
-
-  it('passes check when blockers are resolved or deleted', async () => {
-    const safeThreads = [
-      { ...threads[0], messages: threads[0].messages.filter((message) => message.kind !== 'blocker') },
-      threads[1],
-    ];
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ threads: safeThreads, activityThreads: safeThreads }),
-    } as Response);
-
-    await commentsCommand(HEXID, undefined, { check: true });
-    expect(process.exitCode).toBeUndefined();
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Check passed: no unresolved blocker threads.');
-  });
-
-  it('passes check when an open thread\'s only blocker is deleted', async () => {
-    const deletedOnlyThreads = [{
-      id: 'deleted-only', status: 'open', scope_type: 'artifact', page_path: 'index.html', messages: [
-        { id: 'deleted-blocker', kind: 'blocker', author_label: 'Eve', body: 'Gone', created_at: 1700000004, deleted_at: 1700000005 },
-      ],
-    }];
-    global.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ threads: deletedOnlyThreads, activityThreads: deletedOnlyThreads }),
-    } as Response);
-
-    await commentsCommand(HEXID, undefined, { check: true });
-    expect(process.exitCode).toBeUndefined();
-    expect(consoleErrorSpy).toHaveBeenCalledWith('Check passed: no unresolved blocker threads.');
   });
 });

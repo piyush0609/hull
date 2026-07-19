@@ -200,6 +200,38 @@ Infers backend, subdomain, and mode from the saved profile; **reuses** the exist
 
 `toss deploy` applies migrations automatically (Vercel: `migrate.js` against the production DB, with cold-start retry; Cloudflare: `wrangler d1 migrations apply`). To change the schema, add a numbered file under `src/templates/<backend>/migrations/` and deploy. Do **not** run migrations directly against the database.
 
+For the Vercel comment-label contract, the generated template uses the committed
+lockfile with `npm ci` and pins migration-only `pg` 8.22.0. Deployment order is
+expansion → compatible deploy → promotion → contract → probe. Never run the contract
+before promotion. `--skip-migrate` may skip only expansion after the exact schema
+probe succeeds; it never skips the post-promotion contract/probe. If a manual recovery
+is unavoidable, preserve that order and retry the contract until the probe reports
+ready—never expose database URLs or tokens in commands or logs.
+
+Migration TLS keeps verification enabled for `require`, `verify-ca`, and
+`verify-full`; only explicit `no-verify` disables certificate verification, and
+`disable` disables TLS. `allow`/`prefer` remain pinned-`pg` connection-string
+semantics rather than being replaced by a boolean SSL option; the current parser's
+secure alias behavior applies unless libpq compatibility is explicitly requested in
+the URL.
+
+The gated PostgreSQL migration/concurrency suite requires a dedicated database and
+all three exact designations; it never reads general application DB variables:
+
+```bash
+export TOSS_TEST_DATABASE_URL='postgresql://.../toss_migration_test?sslmode=verify-full'
+export TOSS_TEST_DATABASE_HOST='the-exact-host-from-the-url'
+export TOSS_TEST_DATABASE_NAME='toss_migration_test'
+npm run test:postgres:comment-labels
+```
+
+That script runs `tests/integration/vercel-comment-labels-postgres.test.ts` with
+forks, one worker, and no file parallelism. The harness rejects production-like
+host/database names, fingerprints `public` before DDL, creates and later drops only a
+unique isolated schema, uses transaction-local search paths, and verifies `public`
+and the original search path after cleanup. Never use `DATABASE_URL`/`POSTGRES_URL`
+as a fallback and never run it against a deployed application database.
+
 ### Safety rules (these prevent real, previously-hit footguns)
 
 1. **Repo-linked CLI → `npm run build` first.** If `toss` is symlinked to a repo's `dist/` (check with `readlink -f "$(command -v toss)"`), it runs the built output, not `src/`; unbuilt changes won't ship.
@@ -288,7 +320,63 @@ toss comments <id-or-slug>            # human-readable list (latest version)
 toss comments <id-or-slug> --json     # structured JSON: { artifactId, threads[] }
 toss versions <id-or-slug>            # list versions: seq, date, comment count, current
 toss comments <id-or-slug> --seq 2    # comments on a previous version (seq from `toss versions`)
+toss comments <id-or-slug> --label release-risk  # configured label key
+toss comments <id-or-slug> --unlabeled            # null/omitted kind
 ```
+
+### Comment labels (Vercel owners)
+
+Use user-facing **comment label** terminology. Labels are optional and dynamic; do
+not assume built-in keys, blocker/check behavior, or a default label. Discover the
+current registry before choosing a key:
+
+```bash
+toss admin comment-labels list --profile <vercel-owner-profile> --json
+```
+
+Owners can manage labels interactively or with complete flags:
+
+```bash
+toss admin comment-labels create --profile <profile>
+toss admin comment-labels edit <key> --profile <profile>
+toss admin comment-labels enable <key> --profile <profile>
+toss admin comment-labels disable <key> --profile <profile>
+toss admin comment-labels delete <unused-key> --profile <profile> --yes
+toss admin comment-labels reorder <every-key-in-order...> --profile <profile>
+```
+
+All mutations are revision-bound. A stale conflict means re-read/re-preview and ask
+the user to review the new state; never retry blindly. An in-use label must be
+disabled, not deleted or reassigned. Colors are normalized to uppercase `#RRGGBB`.
+
+For files and automation, the only schema is `toss/comment-labels@v1` with top-level
+`commentLabels`. Templates are intentionally empty, export is complete, and apply is
+merge-only (omitted keys remain untouched):
+
+```bash
+toss admin comment-labels template toss.comment-labels.json
+toss admin comment-labels export current-labels.json --profile <profile>
+toss admin comment-labels apply toss.comment-labels.json --dry-run --profile <profile>
+toss admin comment-labels apply toss.comment-labels.json --yes --profile <profile>
+cat toss.comment-labels.json | toss admin comment-labels apply - --json --dry-run --profile <profile>
+toss admin comment-labels clear --dry-run --profile <profile>
+toss admin comment-labels clear --yes --profile <profile>
+```
+
+There is no reset, replace, key rename, reassignment, or readiness/check mode.
+`clear` deletes unused labels and disables in-use labels without changing history.
+For JSON automation, use `--json --dry-run` or `--json --yes`; bare `--json` is a
+usage error so prompts can never contaminate stdout.
+
+For CRUD JSON output, always provide non-interactive inputs: all required create
+fields, at least one explicit edit change, every key for reorder, and `--yes` for
+delete. `--json` never opens readline and stdout contains exactly one JSON value;
+human diagnostics and previews are written to stderr.
+
+`toss comments --json` preserves the full response envelope, including
+`commentLabels`, `commentLabelRevision`, nullable raw message `kind`, and future
+top-level fields. Filters only replace the `threads` and `activityThreads` arrays.
+Cloudflare/older metadata-absent envelopes remain compatible via exact raw keys.
 
 ### Reading comments as an agent (credentials)
 

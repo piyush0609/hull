@@ -16,6 +16,9 @@
     "cli": "./toss",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
+    "test:browser:install": "playwright install chromium",
+    "test:browser": "playwright test",
+    "test:postgres:comment-labels": "vitest run tests/integration/vercel-comment-labels-postgres.test.ts --pool=forks --maxWorkers=1 --no-file-parallelism",
     "prepublishOnly": "npm run build",
     "release": "npx --yes commit-and-tag-version",
     "release:patch": "npx --yes commit-and-tag-version --release-as patch",
@@ -26,6 +29,7 @@
     "commander": "^12.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.58.0",
     "@types/node": "^20.0.0",
     "tsx": "^4.0.0",
     "typescript": "^5.4.0",
