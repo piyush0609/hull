@@ -2,10 +2,8 @@ import { readFileSync } from 'node:fs';
 import { loadConfig } from '../lib/config.js';
 import { TossAPI } from '../lib/api.js';
 
-const COMMENT_KINDS = ['note', 'blocker', 'concern', 'question', 'action', 'nit', 'resolution'] as const;
 const COMMENT_STATUSES = ['open', 'resolved'] as const;
 
-type CommentKind = typeof COMMENT_KINDS[number];
 type CommentStatus = typeof COMMENT_STATUSES[number];
 
 export type CommentsCommandOptions = {
@@ -13,34 +11,24 @@ export type CommentsCommandOptions = {
   json?: boolean;
   passwordEnv?: string;
   seq?: string;
-  type?: string;
+  label?: string;
+  unlabeled?: boolean;
   status?: string;
-  check?: boolean;
 };
 
-function messageKind(message: any): CommentKind {
-  // Messages created before attributed feedback kinds existed are ordinary notes.
-  return message.kind || 'note';
-}
-
-function filterThreads(threads: any[], kind?: CommentKind, status?: CommentStatus): any[] {
+function filterThreads(threads: any[], label?: string, unlabeled = false, status?: CommentStatus): any[] {
   return threads
     .filter((thread) => !status || (status === 'resolved' ? thread.status === 'resolved' : thread.status !== 'resolved'))
     .map((thread) => {
-      if (!kind) return thread;
+      if (!label && !unlabeled) return thread;
       return {
         ...thread,
-        messages: (thread.messages || []).filter((message: any) => !message.deleted_at && messageKind(message) === kind),
+        messages: (thread.messages || []).filter((message: any) =>
+          !message.deleted_at && (unlabeled ? message.kind == null : message.kind === label)
+        ),
       };
     })
-    .filter((thread) => !kind || thread.messages.length > 0);
-}
-
-function unresolvedBlockerThreadCount(threads: any[]): number {
-  return threads.filter((thread) =>
-    thread.status !== 'resolved' &&
-    (thread.messages || []).some((message: any) => !message.deleted_at && messageKind(message) === 'blocker')
-  ).length;
+    .filter((thread) => (!label && !unlabeled) || thread.messages.length > 0);
 }
 
 // Resolve a secret from an env var NAME, falling back to ./.env — so the agent
@@ -68,9 +56,8 @@ export async function commentsCommand(
   state: string | undefined,
   options: CommentsCommandOptions = {}
 ) {
-  const kind = options.type as CommentKind | undefined;
-  if (kind && !COMMENT_KINDS.includes(kind)) {
-    console.error(`Error: --type must be one of: ${COMMENT_KINDS.join(', ')}.`);
+  if (options.label && options.unlabeled) {
+    console.error('Error: --label and --unlabeled are mutually exclusive.');
     process.exit(1);
   }
   const status = options.status as CommentStatus | undefined;
@@ -129,27 +116,30 @@ export async function commentsCommand(
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
-    const allThreads: any[] = (data && (data.activityThreads || data.threads)) || [];
-    const threads = filterThreads(allThreads, kind, status);
-    if (options.check) {
-      const blockerThreads = unresolvedBlockerThreadCount(allThreads);
-      if (blockerThreads > 0) {
-        console.error(`Check failed: ${blockerThreads} unresolved blocker thread(s).`);
-        process.exitCode = 1;
-      } else {
-        console.error('Check passed: no unresolved blocker threads.');
+    const metadata: any[] | undefined = Array.isArray(data?.commentLabels) ? data.commentLabels : undefined;
+    if (options.label && metadata) {
+      const accepted = [...metadata.map((label) => label.key), 'resolution'];
+      if (!accepted.includes(options.label)) {
+        console.error(`Error: Unknown comment label "${options.label}". Available keys: ${accepted.join(', ') || '(none)'}.`);
+        process.exit(1);
       }
     }
+    const sourceThreads: any[] = Array.isArray(data?.threads) ? data.threads : [];
+    const sourceActivityThreads: any[] = Array.isArray(data?.activityThreads) ? data.activityThreads : sourceThreads;
+    const threads = filterThreads(sourceThreads, options.label, options.unlabeled, status);
+    const activityThreads = filterThreads(sourceActivityThreads, options.label, options.unlabeled, status);
     if (options.json) {
-      console.log(JSON.stringify({ artifactId: id, version, threads }, null, 2));
+      console.log(JSON.stringify({ ...data, threads, activityThreads }, null, 2));
       return;
     }
-    if (!threads.length) {
+    const displayThreads = activityThreads;
+    if (!displayThreads.length) {
       console.log(`No comments on ${idOrSlug}${version != null ? ` version ${version}` : ''}.`);
       return;
     }
-    console.log(`${threads.length} comment thread(s) on ${idOrSlug} (${version != null ? `version ${version}` : 'latest version'}):\n`);
-    for (const t of threads) {
+    const labels = new Map((metadata || []).map((label) => [label.key, label.label]));
+    console.log(`${displayThreads.length} comment thread(s) on ${idOrSlug} (${version != null ? `version ${version}` : 'latest version'}):\n`);
+    for (const t of displayThreads) {
       const scope = t.scope_type === 'artifact' ? 'page' : t.scope_type;
       const anchorText =
         (t.anchor && t.anchor.state && t.anchor.state.text) ||
@@ -163,8 +153,8 @@ export async function commentsCommand(
       );
       for (const m of (t.messages || [])) {
         const when = new Date((m.created_at || 0) * 1000).toISOString().slice(0, 16).replace('T', ' ');
-        const kindLabel = messageKind(m) === 'note' ? '' : `[${messageKind(m).toUpperCase()}] `;
-        console.log(`    ${kindLabel}${m.author_label || '<unknown author>'} · ${when}${m.deleted_at ? ' (deleted)' : ''}`);
+        const label = m.kind == null ? '' : (m.kind === 'resolution' ? 'Resolution' : labels.get(m.kind) || m.kind);
+        console.log(`    ${label ? `[${label}] ` : ''}${m.author_label || '<unknown author>'} · ${when}${m.deleted_at ? ' (deleted)' : ''}`);
         if (!m.deleted_at) console.log(`      ${String(m.body || '').replace(/\s+/g, ' ').trim()}`);
       }
       console.log('');

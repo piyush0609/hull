@@ -1,4 +1,5 @@
 import type { TossConfig } from './config.js';
+import type { CommentLabel, CommentLabelDocumentV1, CommentLabelRegistry } from './comment-labels.js';
 
 async function safeFetch(url: string, init: RequestInit): Promise<Response> {
   try {
@@ -6,6 +7,34 @@ async function safeFetch(url: string, init: RequestInit): Promise<Response> {
   } catch {
     throw new Error(`Could not reach ${url}. Is your toss deployed and reachable?`);
   }
+}
+
+export class TossAPIError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public details: Record<string, unknown> = {}
+  ) {
+    super(message);
+    this.name = 'TossAPIError';
+  }
+}
+
+async function apiJson<T>(res: Response, operation: string): Promise<T> {
+  const text = typeof res.text === 'function' ? await res.text() : '';
+  let body: any = {};
+  if (text) {
+    try { body = JSON.parse(text); }
+    catch {
+      if (res.ok) throw new TossAPIError(`${operation} returned invalid JSON.`, res.status);
+      body = { message: text };
+    }
+  } else if (typeof res.json === 'function') body = await res.json();
+  if (!res.ok) {
+    const message = body.message || body.error || `${operation} failed`;
+    throw new TossAPIError(`${operation} failed: ${res.status} ${message}`, res.status, body);
+  }
+  return body as T;
 }
 
 export class TossAPI {
@@ -47,7 +76,7 @@ export class TossAPI {
   // Programmatic retrieval. Owner/admin or artifact-owner via the token; for a doc
   // you don't own, pass the document password (sent as X-Toss-Password, never logged
   // in args — the CLI sources it from an env key).
-  async getComments(id: string, opts: { password?: string; version?: number } = {}): Promise<{ pagePath?: string; version?: number; versionId?: string; threads: unknown[]; activityThreads: unknown[] }> {
+  async getComments(id: string, opts: { password?: string; version?: number } = {}): Promise<Record<string, any> & { threads: unknown[]; activityThreads: unknown[]; commentLabels?: CommentLabel[]; commentLabelRevision?: number }> {
     const url = new URL(`/artifacts/${id}/comment-threads`, this.config.endpoint);
     url.searchParams.set('pagePath', 'index.html');
     url.searchParams.set('includeActivity', '1');
@@ -122,5 +151,74 @@ export class TossAPI {
       const text = await res.text();
       throw new Error(`Failed to ${enabled ? 'enable' : 'disable'} comments: ${res.status} ${text}`);
     }
+  }
+
+  private async commentLabelsRequest<T>(path = '', init: RequestInit = {}): Promise<T> {
+    const url = new URL(`/comment-labels${path}`, this.config.endpoint);
+    const headers: Record<string, string> = {
+      ...(init.headers as Record<string, string> | undefined),
+      Authorization: this.authHeader(),
+    };
+    if (init.body != null) headers['Content-Type'] = 'application/json';
+    const res = await safeFetch(url.href, { ...init, headers });
+    return apiJson<T>(res, 'Comment labels request');
+  }
+
+  async getCommentLabels(): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>();
+    return {
+      revision: body.commentLabelRevision ?? body.revision,
+      labels: body.commentLabels ?? body.labels ?? [],
+    };
+  }
+
+  async createCommentLabel(expectedRevision: number, label: Omit<CommentLabel, 'position'> & { position?: number }): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>('', {
+      method: 'POST', body: JSON.stringify({ expectedRevision, commentLabel: label }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
+  }
+
+  async updateCommentLabel(key: string, expectedRevision: number, changes: Partial<Omit<CommentLabel, 'key'>>): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>(`/${encodeURIComponent(key)}`, {
+      method: 'PATCH', body: JSON.stringify({ expectedRevision, changes }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
+  }
+
+  async deleteCommentLabel(key: string, expectedRevision: number): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>(`/${encodeURIComponent(key)}`, {
+      method: 'DELETE', body: JSON.stringify({ expectedRevision }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
+  }
+
+  async reorderCommentLabels(expectedRevision: number, keys: string[]): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>('/order', {
+      method: 'PUT', body: JSON.stringify({ expectedRevision, keys }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
+  }
+
+  async previewCommentLabelApply(document: CommentLabelDocumentV1): Promise<Record<string, any>> {
+    return this.commentLabelsRequest('/apply?dryRun=1', { method: 'POST', body: JSON.stringify({ document }) });
+  }
+
+  async applyCommentLabels(expectedRevision: number, document: CommentLabelDocumentV1): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>('/apply', {
+      method: 'POST', body: JSON.stringify({ expectedRevision, document }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
+  }
+
+  async previewCommentLabelClear(): Promise<Record<string, any>> {
+    return this.commentLabelsRequest('/clear?dryRun=1', { method: 'POST' });
+  }
+
+  async clearCommentLabels(expectedRevision: number): Promise<CommentLabelRegistry> {
+    const body = await this.commentLabelsRequest<any>('/clear', {
+      method: 'POST', body: JSON.stringify({ expectedRevision }),
+    });
+    return { revision: body.commentLabelRevision ?? body.revision, labels: body.commentLabels ?? body.labels ?? [] };
   }
 }

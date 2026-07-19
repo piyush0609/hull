@@ -50,6 +50,30 @@ export function isAlreadyCurrentProduction(errText: string | undefined | null): 
   return /already the current production deployment/i.test(errText) || /\(409\)/.test(errText);
 }
 
+// Vercel CLI output is not stable across releases: depending on version and TTY
+// detection, a successful deploy may emit a JSON object, a `Production:` line,
+// or only the deployment URL (and progress output may contain ANSI escapes).
+// Keep this parser pure and accept all successful CLI 56.x shapes without ever
+// mistaking a vercel.com dashboard/inspect URL for the deployment host.
+export function extractVercelDeploymentUrl(output: string): string | null {
+  const plain = output.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+  const lines = plain.trim().split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const parsed = JSON.parse(line);
+      const candidate = parsed?.deployment?.url || parsed?.url;
+      if (typeof candidate === 'string') {
+        const normalized = candidate.startsWith('http') ? candidate : `https://${candidate}`;
+        if (new URL(normalized).hostname.endsWith('.vercel.app')) return normalized;
+      }
+    } catch {}
+  }
+  const matches = [...plain.matchAll(/https:\/\/[^\s\]]+\.vercel\.app(?:\/[^\s\]]*)?/g)];
+  return matches.length ? matches.at(-1)![0].replace(/[),.;]+$/, '') : null;
+}
+
 async function copyDir(src: string, dest: string): Promise<void> {
   await mkdir(dest, { recursive: true });
   const entries = await readdir(src, { withFileTypes: true });
@@ -155,6 +179,26 @@ export async function retryAsync<T>(
     }
   }
   throw lastErr;
+}
+
+export function vercelMigrationSteps(skipPre: boolean): string[] {
+  return [
+    'npm ci --silent',
+    skipPre ? 'node migrate.js --phase probe' : 'node migrate.js --phase pre',
+    'vercel deploy --prod --yes --non-interactive --force',
+    'vercel promote <deployment-url>',
+    'node migrate.js --phase post',
+    'node migrate.js --phase probe',
+  ];
+}
+
+export function requireVercelDatabaseUrl(databaseUrl: string, skipMigrate: boolean): string {
+  const value = databaseUrl.trim();
+  if (!value) {
+    const mode = skipMigrate ? ' --skip-migrate still requires an exact schema probe.' : '';
+    throw new Error(`A production DATABASE_URL or POSTGRES_URL is required for this cutover.${mode}`);
+  }
+  return value;
 }
 
 function extractDatabaseUrl(envContent: string): string | null {
@@ -398,6 +442,16 @@ export async function deployVercelCommand(options: {
     await setVercelEnv(deployDir, 'DATABASE_URL', databaseUrl);
   }
 
+  const skipMigrate = options.skipMigrate || process.env.TOSS_SKIP_MIGRATE === '1';
+  try {
+    databaseUrl = requireVercelDatabaseUrl(databaseUrl, skipMigrate);
+  } catch (err: any) {
+    console.error(`❌ ${err.message}`);
+    console.error('   Deploy aborted before Vercel deployment or promotion. Resolve the production database URL and retry.');
+    process.exit(1);
+    return;
+  }
+
   // Auto-provision Vercel Blob store if not provided
   let blobToken = options.blobToken || process.env.BLOB_READ_WRITE_TOKEN || '';
   let blobStoreUrl = '';
@@ -440,35 +494,25 @@ export async function deployVercelCommand(options: {
     await setVercelEnv(deployDir, 'BLOB_READ_WRITE_TOKEN', blobToken);
   }
 
-  // Migrate BEFORE promoting code. The new code can require new columns, so a failed
-  // (or skipped) migration must block the deploy — otherwise we promote code that 500s
-  // against an un-migrated schema. Migrations are additive + idempotent, so applying
-  // them while the previous deploy is still live is safe.
-  const skipMigrate = options.skipMigrate || process.env.TOSS_SKIP_MIGRATE === '1';
-  if (databaseUrl && !skipMigrate) {
-    console.log('Running database migrations (before deploy)...');
-    try {
-      await execAsync('npm install --no-package-lock --silent', { cwd: deployDir });
-      // Idempotent + retried: the first attempt wakes a cold (auto-suspended) Neon
-      // compute so a later attempt connects.
+  // Install the committed template lock exactly, then expand before promotion.
+  // --skip-migrate skips only pre after a successful exact schema probe; contract
+  // always runs after the compatible deployment is promoted.
+  try {
+      await execAsync('npm ci --silent', { cwd: deployDir });
+      console.log(skipMigrate ? 'Verifying expanded database schema...' : 'Running database expansion migrations...');
       await retryAsync(
-        () => execAsync('node migrate.js', {
+        () => execAsync(skipMigrate ? 'node migrate.js --phase probe' : 'node migrate.js --phase pre', {
           cwd: deployDir,
           env: { ...process.env, DATABASE_URL: databaseUrl },
         }),
         { attempts: 4, delayMs: 2500 }
       );
-      console.log('✅ Migrations applied.');
-    } catch (err: any) {
-      console.error('❌ Migration failed:', err.stderr || err.message);
+      console.log(skipMigrate ? '✅ Schema probe passed; pre migration may be skipped safely.' : '✅ Database expansion applied.');
+  } catch (err: any) {
+      console.error(skipMigrate ? '❌ Cannot skip migration:' : '❌ Migration failed:', err.stderr || err.message);
       console.error('   Deploy aborted — new code was NOT promoted, so production is unchanged.');
-      console.error('   Fix the migration (or apply it manually), then re-deploy.');
-      console.error('   If the schema is already applied (or this machine cannot reach the DB),');
-      console.error('   re-run with --skip-migrate (or TOSS_SKIP_MIGRATE=1).');
-      process.exit(1);
-    }
-  } else if (databaseUrl && skipMigrate) {
-    console.warn('⚠️  Skipping migrations (--skip-migrate / TOSS_SKIP_MIGRATE). Ensure the schema is already applied, or the new code may fail.');
+      console.error('   Run a normal deploy to apply the comment label expansion, or repair the inconsistent schema before retrying.');
+    process.exit(1);
   }
 
   // Deploy
@@ -481,23 +525,7 @@ export async function deployVercelCommand(options: {
     process.exit(1);
   }
 
-  // Parse deployment URL from JSON output (last line)
-  let projectUrl: string | null = null;
-  const lines = deployOutput.trim().split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (line.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(line);
-        projectUrl = parsed.deployment?.url || null;
-      } catch {}
-      if (projectUrl) break;
-    }
-  }
-  if (!projectUrl) {
-    const match = deployOutput.match(/Production:\s*(https:\/\/[^\s]+)/);
-    if (match) projectUrl = match[1];
-  }
+  const projectUrl = extractVercelDeploymentUrl(deployOutput);
 
   if (!projectUrl) {
     console.error('Deploy succeeded but could not extract URL.');
@@ -518,10 +546,8 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // Promote the just-deployed production deployment to "current" so the project's
-  // production domains — including a pinned custom domain that does NOT auto-follow
-  // `vercel deploy --prod` — actually serve this build. Non-fatal: the deploy already
-  // succeeded, so a promote hiccup must not abort; surface the manual command instead.
+  // Promote before contract. A promotion failure must stop here: post-contract is
+  // intentionally never run while old code may still be serving production.
   console.log('Promoting to current production...');
   try {
     await vercelExec(`vercel promote ${projectUrl}`, deployDir);
@@ -531,9 +557,26 @@ export async function deployVercelCommand(options: {
     if (isAlreadyCurrentProduction(msg)) {
       console.log('✅ Already the current production deployment — production domains already serve this build.');
     } else {
-      console.warn('⚠️  Could not auto-promote to current production:', msg);
-      console.warn(`   Run manually (linked to the project): vercel promote ${projectUrl}`);
+      console.error('❌ Could not promote the compatible deployment:', msg);
+      console.error(`   Run manually (linked to the project): vercel promote ${projectUrl}`);
+      console.error('   Then re-run deployment so the post-contract migration can complete.');
+      process.exit(1);
     }
+  }
+
+  console.log('Running database contract migration...');
+  try {
+      await retryAsync(
+        () => execAsync('node migrate.js --phase post', { cwd: deployDir, env: { ...process.env, DATABASE_URL: databaseUrl } }),
+        { attempts: 4, delayMs: 2500 }
+      );
+      await execAsync('node migrate.js --phase probe', { cwd: deployDir, env: { ...process.env, DATABASE_URL: databaseUrl } });
+      console.log('✅ Comment label contract is ready.');
+  } catch (err: any) {
+      console.error('❌ Post-deploy database contract failed:', err.stderr || err.message);
+      console.error('   Compatible code is live, but non-null comment labels remain disabled.');
+      console.error('   Retry `node migrate.js --phase post` from the linked deployment directory until it succeeds.');
+    process.exit(1);
   }
 
   // Check storage status
@@ -564,8 +607,7 @@ export async function deployVercelCommand(options: {
     }
   }
 
-  // (Migrations already ran before the deploy above — fail-loud, so reaching this
-  // point means the schema is applied.)
+  // Expansion ran before promotion and contract verification ran after promotion.
 
   // Save config. Preserve an existing custom-domain endpoint (e.g. share.example.com)
   // — a redeploy must not overwrite it with the throwaway per-deploy *.vercel.app URL.

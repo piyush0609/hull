@@ -12,7 +12,7 @@ describe('Vercel comment widget script', () => {
     const source = await readFile('src/templates/vercel/api/index.ts', 'utf8');
     const shell = source.match(/const shell = `([\s\S]*?)\n`;/)?.[1];
     return shell
-      ?.replace('${payload}', JSON.stringify({ artifactId: 'test', viewerToken: 'token', origin: 'https://example.test', artifactBasePath: '/a/test/', currentPagePath: 'index.html' }))
+      ?.replace('${payload}', JSON.stringify({ artifactId: 'test', viewerToken: 'token', origin: 'https://example.test', artifactBasePath: '/a/test/', currentPagePath: 'index.html', instanceScope: 'vercel-project-test' }))
       .match(/<script>([\s\S]*)<\/script>/)?.[1];
   }
 
@@ -25,9 +25,9 @@ describe('Vercel comment widget script', () => {
 
   async function reviewHelpers() {
     const widget = await widgetSource();
-    const declarations = widget.match(/  const visibleMessages = .*\n  const readinessCount = .*\n  const threadMatchesKind = .*$/m)?.[0];
+    const declarations = widget.match(/  const visibleMessages = .*\n  const labelCount = .*\n  const threadMatchesKind = .*$/m)?.[0];
     expect(declarations).toBeTruthy();
-    return new Function(`${declarations}; return { visibleMessages, readinessCount, threadMatchesKind };`)();
+    return new Function(`${declarations}; return { visibleMessages, labelCount, threadMatchesKind };`)();
   }
 
   async function mintVersionFunction(getSQL: () => unknown, generateId: () => string) {
@@ -98,6 +98,18 @@ describe('Vercel comment widget script', () => {
     expect(() => new Function(script!)).not.toThrow();
   });
 
+  it('exports the production injector and uses instance-scoped failure-safe preference storage', async () => {
+    const source = await readFile('src/templates/vercel/api/index.ts', 'utf8');
+    const widget = await widgetSource();
+
+    expect(source).toContain('export interface VercelCommentWidgetConfig');
+    expect(source).toContain('export function injectCommentsUI');
+    expect(source).toContain('instanceScope: process.env.VERCEL_PROJECT_ID || new URL(request.url).hostname');
+    expect(widget).toContain("'toss:comment-widget:' + cfg.instanceScope + ':open-feedback-expanded'");
+    expect(widget).toContain('try { return localStorage.getItem(key); } catch (e) { return null; }');
+    expect(widget).toContain('try { localStorage.setItem(key, value); } catch (e) {}');
+  });
+
   it('escapes config values that could terminate the inline script', async () => {
     const source = await readFile('src/templates/vercel/api/index.ts', 'utf8');
     const declaration = source.match(/function serializeInlineScriptValue\([\s\S]*?\n}/)?.[0];
@@ -114,19 +126,16 @@ describe('Vercel comment widget script', () => {
     expect(JSON.parse(serialized).currentPagePath).toBe(pagePath);
   });
 
-  it('includes attributed review-type and resolution controls', async () => {
+  it('includes registry-driven comment-label and resolution controls', async () => {
     const widget = await widgetSource();
 
-    for (const kind of ['note', 'blocker', 'concern', 'question', 'action', 'nit']) {
-      expect(widget).toContain(`data-kind="${kind}"`);
-    }
-    expect(widget).toContain('Choose the signal that best describes');
-    expect(widget).toContain('class="replyKindChips" role="group" aria-labelledby="');
+    expect(widget).toContain('commentLabelRevision');
+    expect(widget).toContain('commentLabels');
+    expect(widget).toContain('Add label');
+    expect(widget).toContain('Search comment labels');
     expect(widget).toContain('Filter by thread status');
-    expect(widget).toContain('Filter by review type');
-    expect(widget).toContain('Review readiness');
-    expect(widget).toContain('class="readyStat"');
-    expect(widget).toContain('grid-template-columns:repeat(3,minmax(0,1fr))');
+    expect(widget).toContain('Filter by comment label');
+    expect(widget).toContain('All comment label counts');
     expect(widget).toContain('Resolution note');
     expect(widget).toContain('id="resolveContext"');
     expect(widget).toContain('id="resolveAvatar"');
@@ -135,12 +144,12 @@ describe('Vercel comment widget script', () => {
     expect(widget).toContain("updateResolveAttribution();");
     expect(widget).toContain("resolved ? ' resolvedHead' : ''");
     expect(widget).toContain('class="messageBadges"');
-    expect(widget).toContain('.messageHead .meta .agox{flex:0 0 auto;white-space:nowrap}');
+    expect(widget).toContain('.meta .agox{color:#9ca3af;font-weight:400;font-size:11px;margin-left:6px;flex:0 0 auto}');
     expect(widget).toContain('@media(max-width:430px)');
     expect(widget).toContain('.panel{left:0;right:auto;max-width:100vw;width:100vw;border:0;box-shadow:none}');
     expect(widget).toContain("kindBadge(r.kind)");
-    expect(widget).toContain('body: body, kind: state.kind');
-    expect(widget).toContain('kind: snapshot.kind');
+    expect(widget).toContain('withOptionalKind({ name: name, body: body, pagePath: PAGE');
+    expect(widget).toContain('withOptionalKind({ name: snapshot.name, body: snapshot.body }, snapshot.kind)');
     expect(widget).toContain("body: JSON.stringify({ name: name, body: body })");
     expect(widget).not.toContain('Anonymous');
   });
@@ -149,8 +158,8 @@ describe('Vercel comment widget script', () => {
     const widget = await widgetSource();
 
     expect(widget).toContain("expandedThreadId: null, replyOriginThreadId: null");
-    expect(widget).toContain("state.replyDrafts[threadId] = { name: committed, body: '', kind: 'note', identityEditing: !committed, identityEditorValue: committed, priorIdentity: committed }");
-    expect(widget).toContain("const composerId = 'reply-composer-' + key, editorId = 'reply-identity-editor-' + key, nameId = 'reply-name-' + key, replyId = 'reply-body-' + key, kindsId = 'reply-kinds-' + key");
+    expect(widget).toContain("state.replyDrafts[threadId] = { name: committed, body: '', kind: null, labelPickerOpen: false");
+    expect(widget).toContain("const composerId = 'reply-composer-' + key, editorId = 'reply-identity-editor-' + key, nameId = 'reply-name-' + key, replyId = 'reply-body-' + key");
     expect(widget).toContain('aria-controls="' + "' + composerId + '");
     expect(widget).toContain('class="identityAvatar" aria-hidden="true"');
     expect(widget).toContain('Replying as <strong>');
@@ -161,16 +170,16 @@ describe('Vercel comment widget script', () => {
     expect(widget).toContain("focusReplyControl(threadId, fallback ? '.identityChange' : '.replyName')");
   });
 
-  it('uses six pressed reply chips with wrapping arrow-key selection and native multiline Enter', async () => {
+  it('uses optional enabled-only label pickers and searchable comboboxes for large registries', async () => {
     const widget = await widgetSource();
 
-    expect(widget).toContain("['note','blocker','concern','question','action','nit'].map");
-    expect(widget).toContain('class="replyKindChip" data-kind="');
-    expect(widget).toContain("event.key !== 'ArrowRight' && event.key !== 'ArrowDown' && event.key !== 'ArrowLeft' && event.key !== 'ArrowUp'");
-    expect(widget).toContain('event.preventDefault(); const chips = Array.prototype.slice.call');
-    expect(widget).toContain('next.click(); next.focus();');
+    expect(widget).toContain("label.enabled && label.key !== 'resolution'");
+    expect(widget).toContain('enabledLabels().length > 6');
+    expect(widget).toContain('role="combobox"');
+    expect(widget).toContain('aria-activedescendant="');
+    expect(widget).toContain("label.key + ' ' + label.label + ' ' + (label.description || '')");
+    expect(widget).toContain("if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectActive(); return true; }");
     expect(widget).not.toContain("if (e.key === 'Enter' && !e.shiftKey)");
-    expect(widget).not.toContain('class="replyKind"');
     expect(widget).toContain('<textarea id="' + "' + replyId + '");
   });
 
@@ -185,7 +194,7 @@ describe('Vercel comment widget script', () => {
     };
     const cName = { value: '' };
     const storage = new Map<string, string>();
-    const commit = await embeddedFunction('commitGlobalIdentity', ['state', 'cName', 'localStorage', 'NAME_KEY'], [state, cName, { setItem: (key: string, value: string) => storage.set(key, value) }, 'toss-comment-name']);
+    const commit = await embeddedFunction('commitGlobalIdentity', ['state', 'cName', 'safeStorageSet', 'NAME_KEY'], [state, cName, (key: string, value: string) => storage.set(key, value), 'toss-comment-name']);
 
     commit('Old Name', 'New Name');
 
@@ -205,7 +214,7 @@ describe('Vercel comment widget script', () => {
         b: { name: '', body: 'b', kind: 'action', identityEditing: true, identityEditorValue: '', priorIdentity: '' },
       },
     };
-    const commit = await embeddedFunction('commitGlobalIdentity', ['state', 'cName', 'localStorage', 'NAME_KEY'], [state, { value: '' }, { setItem: () => undefined }, 'toss-comment-name']);
+    const commit = await embeddedFunction('commitGlobalIdentity', ['state', 'cName', 'safeStorageSet', 'NAME_KEY'], [state, { value: '' }, () => undefined, 'toss-comment-name']);
 
     commit('', 'Saved Reviewer');
 
@@ -313,7 +322,7 @@ describe('Vercel comment widget script', () => {
   it('retains the complete post-propagation reply snapshot on failure and clears only success', async () => {
     const widget = await widgetSource();
 
-    expect(widget).toContain('const snapshot = { threadId: threadId, name: draft.name, body: draft.body, kind: draft.kind, identityEditing: draft.identityEditing, identityEditorValue: draft.identityEditorValue, priorIdentity: draft.priorIdentity }');
+    expect(widget).toContain('const snapshot = { threadId: threadId, name: draft.name, body: draft.body, kind: draft.kind, labelPickerOpen: draft.labelPickerOpen');
     expect(widget).toContain('state.replyDrafts[threadId] = snapshot;');
     expect(widget).toContain('state.expandedThreadId = threadId;');
     expect(widget).toContain("focusReplyControl(threadId, snapshot.name ? '.replyInput' : '.replyName')");
@@ -347,10 +356,10 @@ describe('Vercel comment widget script', () => {
     expect(widget).toContain('.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:360px');
     expect(widget).toContain('@media(max-width:430px)');
     expect(widget).toContain('.panel{left:0;right:auto;max-width:100vw;width:100vw;border:0;box-shadow:none}');
-    expect(widget).toContain('.filters{grid-template-columns:1fr 1fr}');
-    expect(widget).toContain('.replyForm,.replyField,.replyKinds,.replyActions{max-width:100%;overflow-wrap:anywhere}');
-    expect(widget).toContain('.replyKindChips{display:flex;gap:5px;flex-wrap:wrap;min-width:0}');
-    expect(widget).toContain('.replyInput{width:100%;height:64px;min-height:64px;resize:none');
+    expect(widget).toContain('.filters{position:relative;z-index:2;display:grid;grid-template-columns:1fr 1fr;gap:6px;');
+    expect(widget).toContain('.filters.single{grid-template-columns:1fr}');
+    expect(widget).toContain('.typePickerList{max-height:128px;overflow-y:auto;overflow-x:hidden}');
+    expect(widget).toContain('.replyInput{height:64px;min-height:64px;resize:none');
   });
 
   it('stages immutable version content and publishes artifact metadata with the pointer', async () => {
@@ -365,13 +374,13 @@ describe('Vercel comment widget script', () => {
   });
 
   it('counts blocker replies from all non-deleted messages in open threads', async () => {
-    const { readinessCount } = await reviewHelpers();
+    const { labelCount } = await reviewHelpers();
     const threads = [
       { status: 'open', messages: [{ kind: 'note' }, { kind: 'blocker' }, { kind: 'blocker', deleted_at: 123 }] },
       { status: 'resolved', messages: [{ kind: 'blocker' }] },
     ];
 
-    expect(readinessCount(threads, 'blocker')).toBe(1);
+    expect(labelCount(threads, 'blocker')).toBe(1);
   });
 
   it('does not match a type filter when only a deleted message has that type', async () => {

@@ -107,13 +107,16 @@ function readArtifactJWT(payload: Record<string, unknown>, now = nowSeconds()): 
 
 // --- Config from env ---
 const JWT_SECRET = process.env.JWT_SECRET || '';
-const OWNER_TOKEN = process.env.OWNER_TOKEN || '';
+const OWNER_TOKEN = (process.env.OWNER_TOKEN || '').trim();
 const MULTI_TENANT = process.env.MULTI_TENANT === 'true';
 const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
 const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN || '';
 
 // --- Neon client ---
+let sqlOverride: any = null;
+export function setVercelSqlForTests(sql: any): void { sqlOverride = sql; }
 function getSQL() {
+  if (sqlOverride) return sqlOverride;
   if (!DATABASE_URL) throw new Error('DATABASE_URL not configured');
   return neon(DATABASE_URL);
 }
@@ -214,12 +217,15 @@ function authJson(data: unknown, init: ResponseInit = {}): Response {
 async function resolveUser(request: Request): Promise<AuthUser | null> {
   const auth = request.headers.get('Authorization') || '';
   if (!auth.startsWith('Bearer ')) return null;
-  const token = auth.slice(7);
+  const token = auth.slice(7).trim();
+  if (!token) return null;
   const tokenHash = await sha256(token);
 
-  const adminHash = await sha256(OWNER_TOKEN);
-  if (constantTimeEqual(tokenHash, adminHash)) {
-    return { tokenHash, isAdmin: true, label: 'admin' };
+  if (OWNER_TOKEN) {
+    const adminHash = await sha256(OWNER_TOKEN);
+    if (constantTimeEqual(tokenHash, adminHash)) {
+      return { tokenHash, isAdmin: true, label: 'admin' };
+    }
   }
 
   if (MULTI_TENANT) {
@@ -238,8 +244,8 @@ function requireUser(request: Request): Promise<AuthUser | Response> {
 
 function requireAdmin(request: Request): Promise<AuthUser | Response> {
   return resolveUser(request).then((u) => {
-    if (!u) return new Response('Unauthorized', { status: 401 });
-    if (!u.isAdmin) return new Response('Forbidden', { status: 403 });
+    if (!u) return authJson({ error: 'unauthorized', message: 'Owner authentication is required.' }, { status: 401 });
+    if (!u.isAdmin) return authJson({ error: 'forbidden', message: 'Owner access is required.' }, { status: 403 });
     return u;
   });
 }
@@ -248,7 +254,7 @@ function requireAdmin(request: Request): Promise<AuthUser | Response> {
 // Caller-supplied --id values matching any of these are rejected so they
 // can't shadow built-in routes.
 const RESERVED_SLUGS = new Set([
-  's', 'a', 'tokens', 'artifacts', 'health', 'api', 'status',
+  's', 'a', 'tokens', 'artifacts', 'comment-labels', 'health', 'api', 'status',
 ]);
 
 // --- ID / Slug generation ---
@@ -447,8 +453,85 @@ function hydrateCommentThreads(threadRows: any[], messageRows: any[]) {
 }
 
 type CommentScope = 'artifact' | 'element' | 'selection';
-type CommentMessageKind = 'note' | 'blocker' | 'concern' | 'question' | 'action' | 'nit' | 'resolution';
-const COMMENT_MESSAGE_KINDS = new Set<CommentMessageKind>(['note', 'blocker', 'concern', 'question', 'action', 'nit', 'resolution']);
+type CommentMessageKind = string | null;
+
+interface CommentLabel {
+  key: string;
+  label: string;
+  description: string;
+  color: string;
+  enabled: boolean;
+  position: number;
+}
+
+function commentLabelError(status: number, error: string, message: string, extra: Record<string, unknown> = {}): Response {
+  return authJson({ error, message, ...extra }, { status });
+}
+
+export function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+function normalizeCommentLabel(value: unknown, path = 'commentLabel'): CommentLabel | Response {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return commentLabelError(400, 'comment_label_invalid', 'Comment label must be an object.', { field: path });
+  const input = value as Record<string, unknown>;
+  const allowed = new Set(['key', 'label', 'description', 'color', 'enabled', 'position']);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown) return commentLabelError(400, 'comment_label_invalid', 'Unknown comment label field.', { field: `${path}.${unknown}` });
+  const key = typeof input.key === 'string' ? input.key : '';
+  if (key === 'resolution') return commentLabelError(400, 'reserved_comment_label', 'The resolution key is reserved.', { key });
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(key)) return commentLabelError(400, 'comment_label_invalid', 'Invalid comment label key.', { field: `${path}.key` });
+  const label = typeof input.label === 'string' ? input.label.trim() : '';
+  if (!label || codePointLength(label) > 80) return commentLabelError(400, 'comment_label_invalid', 'Label must contain 1 to 80 characters.', { field: `${path}.label` });
+  if (typeof input.description !== 'string') return commentLabelError(400, 'comment_label_invalid', 'Description must be a string.', { field: `${path}.description` });
+  const description = input.description.trim();
+  if (codePointLength(description) > 240) return commentLabelError(400, 'comment_label_invalid', 'Description may contain at most 240 characters.', { field: `${path}.description` });
+  const color = typeof input.color === 'string' ? input.color.toUpperCase() : '';
+  if (!/^#[0-9A-F]{6}$/.test(color)) return commentLabelError(400, 'comment_label_invalid', 'Color must be a six-digit hexadecimal color.', { field: `${path}.color` });
+  if (typeof input.enabled !== 'boolean') return commentLabelError(400, 'comment_label_invalid', 'Enabled must be boolean.', { field: `${path}.enabled` });
+  const position = input.position === undefined ? 0 : Number(input.position);
+  if (!Number.isInteger(position) || position < 0) return commentLabelError(400, 'comment_label_invalid', 'Position must be a positive integer.', { field: `${path}.position` });
+  return { key, label, description, color, enabled: input.enabled, position };
+}
+
+function expectedCommentLabelRevision(body: unknown): number | Response {
+  const revision = body && typeof body === 'object' ? (body as { expectedRevision?: unknown }).expectedRevision : undefined;
+  if (!Number.isSafeInteger(revision) || Number(revision) < 0) return commentLabelError(400, 'expected_revision_required', 'expectedRevision is required and must be a non-negative integer.');
+  return Number(revision);
+}
+
+function normalizeCommentLabelChanges(value: unknown): Record<string, unknown> | Response {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return commentLabelError(400, 'comment_label_invalid', 'changes must be an object.', { field: 'changes' });
+  const changes = value as Record<string, unknown>;
+  const fields = Object.keys(changes);
+  if (!fields.length) return commentLabelError(400, 'comment_label_invalid', 'changes must contain at least one mutable field.', { field: 'changes' });
+  if (fields.some((field) => !['label', 'description', 'color', 'enabled', 'position'].includes(field))) return commentLabelError(400, 'comment_label_invalid', 'Changes contain an immutable or unknown field.', { field: 'changes' });
+  const normalized: Record<string, unknown> = {};
+  if ('label' in changes) {
+    const label = typeof changes.label === 'string' ? changes.label.trim() : '';
+    if (!label || codePointLength(label) > 80) return commentLabelError(400, 'comment_label_invalid', 'Label must contain 1 to 80 characters.', { field: 'changes.label' });
+    normalized.label = label;
+  }
+  if ('description' in changes) {
+    const description = typeof changes.description === 'string' ? changes.description.trim() : '';
+    if (typeof changes.description !== 'string' || codePointLength(description) > 240) return commentLabelError(400, 'comment_label_invalid', 'Description must be a string of at most 240 characters.', { field: 'changes.description' });
+    normalized.description = description;
+  }
+  if ('color' in changes) {
+    const color = typeof changes.color === 'string' ? changes.color.toUpperCase() : '';
+    if (!/^#[0-9A-F]{6}$/.test(color)) return commentLabelError(400, 'comment_label_invalid', 'Color must be a six-digit hexadecimal color.', { field: 'changes.color' });
+    normalized.color = color;
+  }
+  if ('enabled' in changes) {
+    if (typeof changes.enabled !== 'boolean') return commentLabelError(400, 'comment_label_invalid', 'Enabled must be boolean.', { field: 'changes.enabled' });
+    normalized.enabled = changes.enabled;
+  }
+  if ('position' in changes) {
+    if (!Number.isInteger(changes.position) || Number(changes.position) < 1) return commentLabelError(400, 'comment_label_invalid', 'Position must be a positive integer.', { field: 'changes.position' });
+    normalized.position = Number(changes.position);
+  }
+  return normalized;
+}
 
 function normalizePagePath(value: unknown): string | Response {
   if (typeof value !== 'string') return new Response('Page path is required', { status: 400 });
@@ -478,11 +561,12 @@ function normalizeName(body: unknown): string | Response {
 function normalizeMessageKind(body: unknown): CommentMessageKind | Response {
   const raw = body && typeof body === 'object' && (body as { kind?: unknown }).kind !== undefined
     ? (body as { kind?: unknown }).kind
-    : 'note';
-  if (typeof raw !== 'string' || !COMMENT_MESSAGE_KINDS.has(raw as CommentMessageKind) || raw === 'resolution') {
+    : null;
+  if (raw === null) return null;
+  if (typeof raw !== 'string' || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(raw) || raw === 'resolution') {
     return new Response('Invalid comment kind', { status: 400 });
   }
-  return raw as CommentMessageKind;
+  return raw;
 }
 
 // Legacy token columns are NOT NULL but identity is now author_label; write a
@@ -610,13 +694,16 @@ function serializeInlineScriptValue(value: unknown): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
-function injectCommentsUI(html: string, config: {
+export interface VercelCommentWidgetConfig {
   artifactId: string;
   viewerToken: string;
   origin: string;
   artifactBasePath: string;
   currentPagePath: string;
-}): string {
+  instanceScope: string;
+}
+
+export function injectCommentsUI(html: string, config: VercelCommentWidgetConfig): string {
   const payload = serializeInlineScriptValue(config);
   const shell = `
 <div id="toss-comments-root"></div>
@@ -624,8 +711,11 @@ function injectCommentsUI(html: string, config: {
 (() => {
   const cfg = ${payload};
   const NAME_KEY = 'toss-comment-name';
+  const LABEL_SUMMARY_KEY = 'toss:comment-widget:' + cfg.instanceScope + ':open-feedback-expanded';
+  const safeStorageGet = (key) => { try { return localStorage.getItem(key); } catch (e) { return null; } };
+  const safeStorageSet = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
   const PAGE = cfg.currentPagePath || 'index.html';
-  const state = { mode: 'browse', threads: [], name: localStorage.getItem(NAME_KEY) || '', kind: 'note', statusFilter: 'open', kindFilter: 'all', pending: null, resolving: null, hoverEl: null, loaded: false, replyDrafts: {}, expandedThreadId: null, replyOriginThreadId: null, replyFocusAfterRender: null, replySubmitting: null, threadLoadGeneration: 0 };
+  const state = { mode: 'browse', threads: [], commentLabels: [], commentLabelRevision: 0, name: safeStorageGet(NAME_KEY) || '', kind: null, rootLabelPickerOpen: false, rootLabelSearch: '', rootLabelActive: 0, rootLabelFocusAfterRender: false, labelSummaryExpanded: safeStorageGet(LABEL_SUMMARY_KEY) === 'true', labelSummaryFocusAfterRender: false, statusFilter: 'open', kindFilter: 'all', pending: null, resolving: null, hoverEl: null, loaded: false, replyDrafts: {}, expandedThreadId: null, replyOriginThreadId: null, replyFocusAfterRender: null, replySubmitting: null, threadLoadGeneration: 0 };
 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
   const txt = (el) => (el && (el.innerText || el.textContent) || '').trim();
@@ -633,13 +723,13 @@ function injectCommentsUI(html: string, config: {
 
   const host = document.getElementById('toss-comments-root');
   const sr = host.attachShadow({ mode: 'open' });
-  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}[hidden]{display:none!important}.launcher,.panelBtn{position:fixed;z-index:2147483640;height:40px;border:0;cursor:pointer;border-radius:999px;font-size:13px;font-weight:650;color:#fff;background:#b94732;box-shadow:0 5px 14px rgba(185,71,50,.24);padding:0 17px}.launcher{right:20px;bottom:20px}.launcher:hover,.replyBtn:hover,.btn.primary:hover{background:#a63d2b}.launcher.active{background:#111827;box-shadow:0 5px 14px rgba(15,23,42,.22)}.panelBtn{right:20px;bottom:72px;height:38px;background:#fff;color:#374151;padding:0 12px 0 14px;font-weight:600;border:1px solid #e5e7eb;box-shadow:0 4px 12px rgba(15,23,42,.08)}#count{display:inline-grid;place-items:center;min-width:19px;height:19px;padding:0 5px;margin-left:6px;background:#b94732;color:#fff;border-radius:999px;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px;box-shadow:0 6px 20px rgba(15,23,42,.22)}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:360px;height:100vh;background:#fff;border-left:1px solid #e6e9ed;box-shadow:-12px 0 32px rgba(15,23,42,.1);display:flex;flex-direction:column}.panel header{height:56px;flex:0 0 56px;display:flex;align-items:center;justify-content:space-between;padding:0 14px 0 16px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.012em;color:#111827}.panel header button{width:32px;height:32px;border:0;border-radius:8px;background:transparent;font-size:20px;line-height:1;cursor:pointer;color:#8b95a5}.panel header button:hover{background:#f6f7f9;color:#4b5563}#status{padding:0 16px;font-size:12px;color:#9a3412}#list{min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:#c5cbd4 transparent;padding:12px;display:flex;flex-direction:column;gap:10px;background:#fbfcfd}#list::-webkit-scrollbar{width:8px}#list::-webkit-scrollbar-track{background:transparent}#list::-webkit-scrollbar-thumb{background:#c5cbd4;border:2px solid #fbfcfd;border-radius:999px}#list::-webkit-scrollbar-thumb:hover{background:#9ca3af}.empty{color:#8b95a5;text-align:center;padding:44px 18px;font-size:13px;line-height:1.65}.item{min-width:0;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:12px;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.035);transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}.item:hover{border-color:#d7dce3;box-shadow:0 4px 12px rgba(15,23,42,.07);transform:translateY(-1px)}.ctxline{font-size:11px;line-height:1.4;color:#667085;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ctxline:before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;border:1.5px solid #a8b0bc;border-radius:50% 50% 50% 3px;background:radial-gradient(circle at 54% 46%,#a8b0bc 0 1.5px,transparent 1.6px);transform:rotate(-45deg);vertical-align:-1px}.ctxline .sel{color:#be4b2f;font-weight:600}.meta{display:flex;flex-wrap:wrap;align-items:center;min-width:0;font-size:12px;line-height:18px;color:#1f2937;font-weight:650}.meta b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta .agox{color:#9ca3af;font-weight:400;font-size:11px;margin-left:6px;font-variant-numeric:tabular-nums}.body{font-size:13px;color:#374151;line-height:1.48;margin-top:3px}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412;line-height:1.5}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.52);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border:1px solid rgba(255,255,255,.55);border-radius:14px;box-shadow:0 24px 64px rgba(15,23,42,.28),0 2px 8px rgba(15,23,42,.12);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 14px;font-size:15px;font-weight:650;letter-spacing:-.01em;color:#111827}#ctx{background:#f8fafc;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;margin-bottom:14px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.65;color:#293548}#ctx .cr span{color:#9ca3af;min-width:76px}#ctx code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px}input,textarea{width:100%;border:1px solid #d5dae1;border-radius:9px;background:#fff;padding:10px 11px;font-size:13px;color:#111827;outline:0;box-shadow:0 1px 1px rgba(15,23,42,.02);transition:border-color .15s ease,box-shadow .15s ease}input::placeholder,textarea::placeholder{color:#9da5b0}input:focus,textarea:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1)}textarea{min-height:92px;resize:vertical;line-height:1.45}.actions{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}.btn{height:36px;border:1px solid transparent;border-radius:8px;padding:0 14px;font-size:13px;font-weight:650;cursor:pointer}.btn.ghost{border-color:#dfe3e8;background:#fff;color:#475569;box-shadow:0 1px 2px rgba(15,23,42,.03)}.btn.ghost:hover{background:#f8fafc}.btn.primary{border-color:#b94732;background:#b94732;color:#fff;box-shadow:0 1px 2px rgba(217,101,74,.18)}.reply{padding:8px 0 0 12px;border-left:2px solid #eceff3;margin-top:8px}.reply .meta{font-size:11px}.reply .body{font-size:12px;color:#596579;line-height:1.45;margin-top:2px}.replyForm{margin-top:10px;padding-top:10px;border-top:1px solid #eef0f2;min-width:0}.replyIdentity,.identitySummary,.identityEditor,.replyField,.replyKinds,.replyActions{min-width:0}.identitySummary{display:flex;align-items:center;gap:7px;color:#667085;font-size:11px}.identitySummary strong{color:#374151;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identityAvatar{width:24px;height:24px;flex:0 0 24px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px;font-weight:750}.identityChange{margin-left:auto;border:0;background:transparent;color:#b94732;padding:3px;font-size:10.5px;font-weight:650}.identityEditor label,.replyField label,.replyKindsLabel{display:block;margin:0 0 5px;color:#475569;font-size:10.5px;font-weight:650}.identityEditor input{width:100%;height:32px;padding:0 8px;font-size:11px}.identityActions,.replyActions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin-top:6px}.replyField{margin-top:8px}.replyInput{width:100%;height:64px;min-height:64px;resize:none;padding:8px;font-size:11px}.replyKinds{margin-top:8px}.replyKindChips{display:flex;gap:5px;flex-wrap:wrap;min-width:0}.replyKindChip{height:27px;display:inline-flex;align-items:center;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#596579;padding:0 8px;font-size:10px;font-weight:650}.replyKindChip[aria-pressed=true]{border-color:#dc8d7b;background:#fff4f1;color:#9f3826;box-shadow:0 0 0 2px rgba(217,101,74,.08)}.replyActions .replyBtn{height:30px}.identityActions .btn,.replyActions .btn{height:30px;padding:0 10px;font-size:11px}.replyName,.replyInput{width:auto;height:30px;border:1px solid #d9dde3;border-radius:7px;padding:0 8px;font-size:11px;color:#111827;min-width:0}.replyBtn{height:30px;border:0;border-radius:7px;padding:0 10px;font-size:11px;font-weight:650;cursor:pointer;background:#b94732;color:#fff;white-space:nowrap}.btn.small{height:28px;padding:0 10px;font-size:11px;border-radius:7px}.btn.resolve{border-color:#b7e4d2;background:#f3fbf8;color:#14795c}.btn.resolve:hover{background:#e8f7f1}.btn.reopen{border-color:#dfe3e8;background:#fff;color:#475569}.btn.reopen:hover{background:#f8fafc}.btn:disabled{opacity:.6;cursor:default}.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:1px solid;border-radius:999px;font-size:10px;font-weight:650;line-height:16px;margin-left:auto;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge:before{content:"";width:5px;height:5px;flex:0 0 5px;border-radius:50%;background:currentColor}.badgeText{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.badge.open{background:#f0f9ff;border-color:#bae6fd;color:#0369a1}.badge.resolved{background:#f0fdf4;border-color:#bbf7d0;color:#15803d}.threadActions{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;min-width:0}.threadActionGroup{display:flex;gap:8px;flex-wrap:wrap;min-width:0}.replyToggle{border:0;background:transparent;color:#b94732;padding:0 2px;font-size:11px;font-weight:650;cursor:pointer}.typeLabel{display:block;margin:2px 0 6px;color:#475569;font-size:11px;font-weight:650}.kindHelp{margin:6px 0 0;color:#7c8797;font-size:10.5px;line-height:1.4}.kindChips{display:flex;gap:5px;flex-wrap:wrap}.kindChip{height:28px;display:inline-flex;align-items:center;gap:5px;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#596579;padding:0 8px;font-size:10.5px;font-weight:650;cursor:pointer}.kindChip:before,.kindBadge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}.kindChip[aria-pressed=true]{border-color:#dc8d7b;background:#fff4f1;color:#9f3826;box-shadow:0 0 0 2px rgba(217,101,74,.08)}.kindBadge{display:inline-flex;align-items:center;gap:5px;height:20px;border:1px solid #d8dde4;border-radius:999px;padding:0 7px;background:#f8fafc;color:#52606f;font-size:9px;font-weight:750;letter-spacing:.045em;text-transform:uppercase;white-space:nowrap}.kindBadge.blocker{color:#9f3826;border-color:#efc3b8;background:#fff8f6}.kindBadge.concern{color:#9a5b13;border-color:#ead4aa;background:#fffbf2}.kindBadge.question{color:#285e8e;border-color:#bfdaee;background:#f7fbff}.kindBadge.action{color:#4d568c;border-color:#ccd0eb;background:#fafaff}.kindBadge.nit{color:#667085}.kindBadge.resolution{color:#14795c;border-color:#b7e4d2;background:#f3fbf8}.messageHead{display:flex;align-items:center;gap:6px;min-width:0}.messageHead .meta{flex:1}.readiness{padding:9px 12px;border-bottom:1px solid #eef0f2;background:#fbfcfd}.readiness strong{display:block;color:#111827;font-size:11px;margin-bottom:6px}.readyStats{display:flex;flex-wrap:wrap;gap:5px;color:#596579;font-size:10.5px}.readyStats span{border:1px solid #e5e7eb;border-radius:999px;background:#fff;padding:3px 7px}.filters{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px 12px;border-bottom:1px solid #eef0f2;background:#fff}.filters select{height:30px;min-width:0;border:1px solid #d9dde3;border-radius:7px;background:#fff;color:#475569;padding:0 7px;font-size:11px;outline:0}.filters select:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1)}.replyForm,.replyField,.replyKinds,.replyActions{max-width:100%;overflow-wrap:anywhere}.replyInput{width:100%;height:64px;min-height:64px;resize:none;padding:8px}.reply .kindBadge{height:18px;font-size:8px;padding:0 6px}.resolveCard{width:440px}.resolveCard p{margin:0 0 12px;color:#667085;font-size:12px;line-height:1.5}.resolveCard textarea{min-height:76px}.required{color:#9f3826}.srOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:430px){.composer{padding:12px}.card{max-height:calc(100vh - 24px);overflow:auto}.launcher,.panelBtn{right:12px}.panel{left:0;right:auto;max-width:100vw;width:100vw;border:0;box-shadow:none}.filters{grid-template-columns:1fr 1fr}}.messageHead{align-items:flex-start;flex-wrap:wrap}.messageHead .meta{display:flex;flex:1 1 92px;flex-wrap:nowrap;overflow:hidden;white-space:nowrap}.messageHead .meta b{flex:0 1 auto;max-width:100%}.messageHead .meta .agox{flex:0 0 auto;white-space:nowrap}.messageBadges{display:flex;flex:0 1 auto;align-items:center;justify-content:flex-end;gap:5px;min-width:0;max-width:100%}.messageHead.resolvedHead .messageBadges{flex:1 0 100%;width:100%}.readiness{padding:10px 12px 12px}.readiness strong{margin-bottom:8px}.readyStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.readyStat{min-width:0;border:1px solid #e5e7eb;border-radius:9px;background:#fff;padding:8px 7px}.readyStat span{display:block;border:0;border-radius:0;background:transparent;padding:0;font-size:8px;font-weight:750;letter-spacing:.07em;text-transform:uppercase;color:#8b95a5;overflow:hidden;text-overflow:ellipsis}.readyStat b{display:block;margin-top:2px;color:#111827;font-size:16px;line-height:1.1;font-weight:670;font-variant-numeric:tabular-nums}.resolveHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:7px}.resolveHead h3{margin:0}.resolveContext{flex:0 0 auto}.attribution{display:flex;align-items:center;gap:8px;margin:10px 0 2px;color:#667085;font-size:10.5px;line-height:1.4}.avatar{width:22px;height:22px;flex:0 0 22px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px;font-weight:750}.attribution strong{color:#374151}.resolveCard .actions{margin-top:12px}@media(max-width:430px){.readyStats{gap:5px}.readyStat{padding:7px 5px}.resolveCard{width:100%}.resolveHead{align-items:flex-start}.messageHead.resolvedHead .messageBadges{justify-content:flex-start}.badge.resolved{max-width:220px}}</style>';
-  const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose" aria-label="Close comments">&times;</button></header><div id="status" role="status" aria-live="polite"></div><div class="readiness"><strong>Review readiness</strong><div id="readyStats" class="readyStats"></div></div><div class="filters"><label><span class="srOnly">Thread status</span><select id="statusFilter" aria-label="Filter by thread status"><option value="open">Open threads</option><option value="resolved">Resolved threads</option><option value="all">All threads</option></select></label><label><span class="srOnly">Review type</span><select id="kindFilter" aria-label="Filter by review type"><option value="all">All review types</option><option value="note">Note</option><option value="blocker">Blocker</option><option value="concern">Concern</option><option value="question">Question</option><option value="action">Action</option><option value="nit">Nit</option><option value="resolution">Resolution</option></select></label></div><div id="list" tabindex="-1" aria-label="Comment threads"></div></aside><div id="composer" class="composer" hidden><div class="card" role="dialog" aria-modal="true" aria-labelledby="composerTitle"><div class="pad"><h3 id="composerTitle">Add a comment</h3><div id="ctx"></div><div class="row"><label class="typeLabel" for="cName">Your name</label><input id="cName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label class="typeLabel" for="cText">Comment</label><textarea id="cText" placeholder="Describe the issue or suggestion" required></textarea></div><div class="row"><span class="typeLabel">Review type</span><div id="kindChips" class="kindChips" role="group" aria-label="Review type"><button class="kindChip" data-kind="note" aria-pressed="true">Note</button><button class="kindChip" data-kind="blocker" aria-pressed="false">Blocker</button><button class="kindChip" data-kind="concern" aria-pressed="false">Concern</button><button class="kindChip" data-kind="question" aria-pressed="false">Question</button><button class="kindChip" data-kind="action" aria-pressed="false">Action</button><button class="kindChip" data-kind="nit" aria-pressed="false">Nit</button></div><p class="kindHelp">Choose the signal that best describes what reviewers need next.</p></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div><div id="resolveDialog" class="composer" hidden><div class="card resolveCard" role="dialog" aria-modal="true" aria-labelledby="resolveTitle"><div class="pad"><div class="resolveHead"><h3 id="resolveTitle">Resolve thread</h3><span id="resolveContext" class="kindBadge resolveContext note">NOTE</span></div><p>Add a required resolution note so reviewers can see what changed.</p><div class="row"><label class="typeLabel" for="resolveName">Your name <span class="required">*</span></label><input id="resolveName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label class="typeLabel" for="resolveText">Resolution note <span class="required">*</span></label><textarea id="resolveText" required></textarea></div><div class="attribution" aria-live="polite"><span id="resolveAvatar" class="avatar" aria-hidden="true">?</span><span>This resolution will be attributed to <strong id="resolveAttribution">the named reviewer</strong>.</span></div><div class="actions"><button id="resolveCancel" class="btn ghost">Cancel</button><button id="resolveConfirm" class="btn primary">Resolve thread</button></div></div></div></div>';
+  const STYLE = '<style>:host{all:initial}*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}[hidden]{display:none!important}button,input,textarea,select{font:inherit}.launcher,.panelBtn{position:fixed;z-index:2147483640;height:40px;border:0;cursor:pointer;border-radius:999px;font-size:13px;font-weight:650;color:#fff;background:#b94732;box-shadow:0 5px 14px rgba(185,71,50,.24);padding:0 17px}.launcher{right:20px;bottom:20px}.launcher:hover,.replyBtn:hover,.btn.primary:hover{background:#a63d2b}.launcher.active{background:#111827}.panelBtn{right:20px;bottom:72px;height:38px;background:#fff;color:#374151;padding:0 12px 0 14px;border:1px solid #e5e7eb;box-shadow:0 4px 12px rgba(15,23,42,.08)}#count{display:inline-grid;place-items:center;min-width:19px;height:19px;padding:0 5px;margin-left:6px;background:#b94732;color:#fff;border-radius:999px;font-size:10px;font-weight:700}.hint{position:fixed;z-index:2147483641;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:999px;font-size:13px}#hl{position:fixed;z-index:2147483630;pointer-events:none;border-radius:6px}#hl.hover{outline:2px solid #d9654a;outline-offset:1px;background:rgba(217,101,74,.08)}#hl.flash{outline:2px solid #d9654a;background:rgba(217,101,74,.14);animation:tcp .5s ease-in-out 0s 3}@keyframes tcp{0%,100%{background:rgba(217,101,74,.05)}50%{background:rgba(217,101,74,.22)}}.panel{position:fixed;z-index:2147483645;top:0;right:0;width:360px;max-width:360px;height:100vh;background:#fff;border-left:1px solid #e6e9ed;box-shadow:-12px 0 32px rgba(15,23,42,.1);display:flex;flex-direction:column;overflow:hidden}.panel header{height:56px;flex:0 0 56px;display:flex;align-items:center;justify-content:space-between;padding:0 14px 0 16px;border-bottom:1px solid #eef0f2}.panel header h3{margin:0;font-size:15px;font-weight:650;color:#111827}.panel header button{width:32px;height:32px;border:0;border-radius:8px;background:transparent;font-size:20px;color:#8b95a5}#status{padding:0 16px;font-size:12px;color:#9a3412}.labelSummary{position:relative;z-index:4;flex:0 0 34px;height:34px;border-bottom:1px solid #eef0f2;background:#fbfcfd}.summaryToggle{width:100%;height:33px;display:flex;align-items:center;gap:6px;border:0;background:transparent;padding:0 12px;color:#52606f;text-align:left;outline:0;overflow:hidden}.summaryToggle:focus-visible{box-shadow:inset 0 0 0 2px #d9654a}.summaryLead{display:flex;align-items:center;gap:5px;flex:0 0 auto;font-size:11px;font-weight:650;color:#111827}.summaryTotal{display:inline-grid;place-items:center;min-width:19px;height:19px;padding:0 5px;border:1px solid #d8dde4;border-radius:999px;background:#fff;color:#52606f;font-size:10px;font-weight:700}.summaryDivider{width:1px;height:14px;flex:0 0 1px;background:#dfe3e8}.summaryPreview{min-width:0;display:flex;align-items:center;gap:8px;overflow:hidden;white-space:nowrap;color:#667085;font-size:10.5px}.previewItem{display:inline-flex;align-items:center;gap:4px;min-width:0}.previewItem .name{max-width:62px;overflow:hidden;text-overflow:ellipsis}.previewItem b,.countRow b{color:#374151;font-weight:700;font-variant-numeric:tabular-nums}.summaryMore{flex:0 0 auto;color:#8b95a5;font-size:10px;white-space:nowrap}.chevron{position:relative;width:18px;height:18px;flex:0 0 18px;margin-left:auto;color:#8b95a5}.chevron:before{content:"";position:absolute;left:6px;top:5px;width:5px;height:5px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg)}.summaryToggle[aria-expanded=true] .chevron:before{top:8px;transform:rotate(225deg)}.summaryPopover{position:absolute;left:10px;right:10px;top:38px;z-index:12;border:1px solid #e5e7eb;border-radius:10px;background:#fff;box-shadow:0 10px 28px rgba(15,23,42,.13);overflow:hidden}.popoverHead{height:36px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 12px;border-bottom:1px solid #eef0f2}.popoverHead strong{font-size:11px;color:#111827}.popoverHead span{font-size:10px;color:#8b95a5}.allCounts{max-height:190px;overflow-y:auto;overflow-x:hidden;padding:4px}.countRow{height:30px;display:flex;align-items:center;gap:8px;padding:0 8px;border-radius:7px;color:#475569;font-size:11px}.countRow .labelName{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.scrim{position:absolute;z-index:3;inset:90px 0 0;background:rgba(17,24,39,.045);pointer-events:none}.filters{position:relative;z-index:2;display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px 12px;border-bottom:1px solid #eef0f2;background:#fff}.filters.single{grid-template-columns:1fr}.filters select{width:100%;height:30px;min-width:0;border:1px solid #d9dde3;border-radius:7px;background:#fff;color:#475569;padding:0 7px;font-size:11px}.filters select:focus,input:focus,textarea:focus{border-color:#d9654a;box-shadow:0 0 0 3px rgba(217,101,74,.1);outline:0}#list{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;padding:12px;display:flex;flex-direction:column;gap:10px;background:#fbfcfd}.empty{color:#8b95a5;text-align:center;padding:44px 18px;font-size:13px}.item{min-width:0;border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:12px;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.035)}.ctxline{font-size:11px;color:#667085;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ctxline .sel{color:#be4b2f;font-weight:600}.meta{display:flex;align-items:center;min-width:0;font-size:12px;line-height:18px;color:#1f2937;font-weight:650}.meta b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.meta .agox{color:#9ca3af;font-weight:400;font-size:11px;margin-left:6px;flex:0 0 auto}.body{font-size:13px;color:#374151;line-height:1.48;margin-top:3px;overflow-wrap:anywhere}.orphan{margin-top:8px;padding:8px 10px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;font-size:12px;color:#9a3412}.composer{position:fixed;inset:0;z-index:2147483647;background:rgba(17,24,39,.52);display:flex;align-items:center;justify-content:center;padding:24px}.card{background:#fff;border-radius:14px;box-shadow:0 24px 64px rgba(15,23,42,.28);width:520px;max-width:100%}.pad{padding:18px}.pad h3{margin:0 0 14px;font-size:15px;color:#111827}#ctx{background:#f8fafc;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;margin-bottom:14px}#ctx .cr{display:flex;gap:8px;font-size:12px;line-height:1.65;color:#293548}#ctx .cr span{color:#9ca3af;min-width:76px}#ctx code{font-family:monospace;font-size:11px;color:#be4b2f;word-break:break-all}.row{margin-bottom:10px;min-width:0}input,textarea{width:100%;border:1px solid #d5dae1;border-radius:9px;background:#fff;padding:10px 11px;font-size:13px;color:#111827}textarea{min-height:92px;resize:vertical;line-height:1.45}.actions{display:flex;justify-content:flex-end;gap:8px}.btn{height:36px;border:1px solid transparent;border-radius:8px;padding:0 14px;font-size:13px;font-weight:650}.btn.ghost{border-color:#dfe3e8;background:#fff;color:#475569}.btn.primary,.replyBtn{background:#b94732;color:#fff}.reply{padding:8px 0 0 12px;border-left:2px solid #eceff3;margin-top:8px}.reply .meta{font-size:11px}.reply .body{font-size:12px;color:#596579}.replyForm{margin-top:10px;padding-top:10px;border-top:1px solid #eef0f2;min-width:0}.identitySummary{display:flex;align-items:center;gap:7px;color:#667085;font-size:11px;min-width:0}.identitySummary strong{color:#374151;overflow:hidden;text-overflow:ellipsis}.identityAvatar{width:24px;height:24px;flex:0 0 24px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5;color:#475569;font-size:9px}.identityChange{margin-left:auto;border:0;background:transparent;color:#b94732;font-size:10.5px}.identityEditor label,.replyField label{display:block;margin:0 0 5px;color:#475569;font-size:10.5px;font-weight:650}.identityEditor input{height:32px;padding:0 8px;font-size:11px}.identityActions,.replyActions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin-top:6px}.replyField{margin-top:8px}.replyInput{height:64px;min-height:64px;resize:none;padding:8px;font-size:11px}.replyActions .btn,.replyBtn{height:30px;padding:0 10px;font-size:11px;border-radius:7px}.replyBtn{border:0;font-weight:650}.btn.small{height:28px;padding:0 10px;font-size:11px}.btn.resolve{border-color:#b7e4d2;background:#f3fbf8;color:#14795c}.btn.reopen{border-color:#dfe3e8;background:#fff;color:#475569}.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:1px solid;border-radius:999px;font-size:10px;font-weight:650;line-height:16px;white-space:nowrap}.badge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}.badge.open{background:#f0f9ff;border-color:#bae6fd;color:#0369a1}.badge.resolved{background:#f0fdf4;border-color:#bbf7d0;color:#15803d}.threadActions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px}.threadActionGroup{display:flex;gap:8px}.replyToggle{border:0;background:transparent;color:#b94732;padding:0 2px;font-size:11px;font-weight:650}.messageHead{display:flex;align-items:flex-start;gap:6px;min-width:0;flex-wrap:wrap}.messageHead .meta{flex:1 1 92px;overflow:hidden;white-space:nowrap}.messageBadges{display:flex;flex:0 1 auto;align-items:center;justify-content:flex-end;gap:5px;min-width:0;max-width:100%}.kindBadge{display:inline-flex;align-items:center;gap:5px;height:20px;border:1px solid #d8dde4;border-radius:999px;padding:0 7px;background:#f8fafc;color:#52606f;font-size:9px;font-weight:750;letter-spacing:.045em;text-transform:uppercase;white-space:nowrap;max-width:100%}.kindBadge .bl{min-width:0;overflow:hidden;text-overflow:ellipsis}.tdot{width:5px;height:5px;flex:0 0 5px;border-radius:50%;box-shadow:0 0 0 1px rgba(15,23,42,.14)}.typeZone{margin-top:8px;min-width:0}.typeAdd{height:26px;display:inline-flex;align-items:center;gap:5px;border:1px solid #dfe3e8;border-radius:999px;background:#fff;color:#667085;padding:0 10px;font-size:10.5px;font-weight:650}.typeAdd.large{height:28px}.typePicker{margin-top:6px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;box-shadow:0 4px 12px rgba(15,23,42,.07);padding:4px;max-width:100%}.typePickerList{max-height:128px;overflow-y:auto;overflow-x:hidden}.typePickerList.many{max-height:158px}.typeOption{display:flex;align-items:center;gap:8px;width:100%;height:30px;padding:0 8px;border:0;border-radius:7px;background:transparent;color:#374151;font-size:11.5px;font-weight:600;text-align:left;white-space:nowrap;overflow:hidden}.typeOption.active{background:#f8fafc;box-shadow:inset 0 0 0 1.5px #d9654a}.typeOption .tlabel{min-width:0;overflow:hidden;text-overflow:ellipsis}.typeSearch{height:30px;border:0;border-bottom:1px solid #eef0f2;border-radius:8px 8px 0 0;padding:0 9px;margin:0 0 4px;font-size:11.5px}.typeEmpty{padding:12px 9px;color:#8b95a5;font-size:11px;text-align:center}.typeChip{max-width:100%;height:27px;display:inline-flex;align-items:center;gap:5px;border:1px solid #d8dde4;border-radius:999px;background:#f8fafc;color:#52606f;padding:0 5px 0 9px;font-size:10px;font-weight:650}.typeChip.large{height:28px;font-size:10.5px}.typeChipLabel{border:0;background:transparent;color:inherit;font:inherit;padding:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.typeChipRemove{width:16px;height:16px;border:0;border-radius:50%;background:transparent;color:inherit;padding:0}.resolveCard{width:440px}.resolveCard textarea{min-height:76px}.attribution{display:flex;align-items:center;gap:8px;margin:10px 0 2px;color:#667085;font-size:10.5px}.avatar{width:22px;height:22px;display:grid;place-items:center;border-radius:50%;background:#f0f2f5}.required{color:#9f3826}.srOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:430px){.composer{padding:12px}.card{max-height:calc(100vh - 24px);overflow:auto}.launcher,.panelBtn{right:12px}.panel{left:0;right:auto;max-width:100vw;width:100vw;border:0;box-shadow:none}.typePickerList{max-height:104px}}</style>';
+  const MARKUP = '<button id="launcher" class="launcher">Comment</button><button id="panelBtn" class="panelBtn">Comments <span id="count">0</span></button><div id="hint" class="hint" hidden>Comment mode &middot; click a component or select text &middot; Esc to exit</div><div id="hl" hidden></div><aside id="panel" class="panel" hidden><header><h3>Comments</h3><button id="panelClose" aria-label="Close comments">&times;</button></header><div id="status" role="status" aria-live="polite"></div><div id="labelSummary"></div><div id="labelScrim" class="scrim" hidden aria-hidden="true"></div><div id="filters" class="filters"><label><span class="srOnly">Thread status</span><select id="statusFilter" aria-label="Filter by thread status"><option value="open">Open threads</option><option value="resolved">Resolved threads</option><option value="all">All threads</option></select></label><label id="labelFilterWrap"><span class="srOnly">Comment label</span><select id="kindFilter" aria-label="Filter by comment label"></select></label></div><div id="list" tabindex="-1" aria-label="Comment threads"></div></aside><div id="composer" class="composer" hidden><div class="card" role="dialog" aria-modal="true" aria-labelledby="composerTitle"><div class="pad"><h3 id="composerTitle">Add a comment</h3><div id="ctx"></div><div class="row"><label for="cName">Your name</label><input id="cName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label for="cText">Comment</label><textarea id="cText" placeholder="Describe the issue or suggestion" required></textarea></div><div id="rootLabelZone" class="row typeZone"></div><div class="actions"><button id="cCancel" class="btn ghost">Cancel</button><button id="cAdd" class="btn primary">Add comment</button></div></div></div></div><div id="resolveDialog" class="composer" hidden><div class="card resolveCard" role="dialog" aria-modal="true" aria-labelledby="resolveTitle"><div class="pad"><h3 id="resolveTitle">Resolve thread</h3><span id="resolveContext" class="kindBadge"></span><p>Add a required resolution note so reviewers can see what changed.</p><div class="row"><label for="resolveName">Your name <span class="required">*</span></label><input id="resolveName" type="text" autocomplete="name" maxlength="80" required></div><div class="row"><label for="resolveText">Resolution note <span class="required">*</span></label><textarea id="resolveText" required></textarea></div><div class="attribution"><span id="resolveAvatar" class="avatar" aria-hidden="true">?</span><span>This resolution will be attributed to <strong id="resolveAttribution">the named reviewer</strong>.</span></div><div class="actions"><button id="resolveCancel" class="btn ghost">Cancel</button><button id="resolveConfirm" class="btn primary">Resolve thread</button></div></div></div></div>';
   sr.innerHTML = STYLE + MARKUP;
   const $ = (s) => sr.querySelector(s);
   const launcher = $('#launcher'), panelBtn = $('#panelBtn'), countEl = $('#count'), hint = $('#hint'), hl = $('#hl');
   const panel = $('#panel'), list = $('#list'), composer = $('#composer'), ctx = $('#ctx'), cName = $('#cName'), cText = $('#cText'), statusEl = $('#status');
-  const resolveDialog = $('#resolveDialog'), resolveName = $('#resolveName'), resolveText = $('#resolveText'), resolveContext = $('#resolveContext'), resolveAvatar = $('#resolveAvatar'), resolveAttribution = $('#resolveAttribution'), statusFilter = $('#statusFilter'), kindFilter = $('#kindFilter');
+  const resolveDialog = $('#resolveDialog'), resolveName = $('#resolveName'), resolveText = $('#resolveText'), resolveContext = $('#resolveContext'), resolveAvatar = $('#resolveAvatar'), resolveAttribution = $('#resolveAttribution'), statusFilter = $('#statusFilter'), kindFilter = $('#kindFilter'), filters = $('#filters'), labelFilterWrap = $('#labelFilterWrap'), labelSummary = $('#labelSummary'), labelScrim = $('#labelScrim'), rootLabelZone = $('#rootLabelZone');
 
   launcher.addEventListener('click', () => setMode(state.mode === 'comment' ? 'browse' : 'comment'));
   panelBtn.addEventListener('click', () => { if (panel.hidden) openPanel(); else panel.hidden = true; });
@@ -651,7 +741,6 @@ function injectCommentsUI(html: string, config: {
   resolveName.addEventListener('input', updateResolveAttribution);
   statusFilter.addEventListener('change', () => { state.statusFilter = statusFilter.value; render(true); });
   kindFilter.addEventListener('change', () => { state.kindFilter = kindFilter.value; render(true); });
-  Array.prototype.forEach.call(sr.querySelectorAll('.kindChip'), (chip) => chip.addEventListener('click', () => { state.kind = chip.getAttribute('data-kind'); Array.prototype.forEach.call(sr.querySelectorAll('.kindChip'), (c) => c.setAttribute('aria-pressed', String(c === chip))); }));
 
   function setStatus(t) { statusEl.textContent = t || ''; }
 
@@ -749,10 +838,11 @@ function injectCommentsUI(html: string, config: {
     ctx.innerHTML = '<div class="cr"><span>Screen</span><b>' + esc(target.view.navLabel || target.view.heading || 'Page') + '</b></div>' +
       '<div class="cr"><span>' + (target.kind === 'selection' ? 'Selected' : 'Component') + '</span><b>' + esc(label.slice(0, 70)) + (label.length > 70 ? '…' : '') + '</b></div>' +
       '<div class="cr"><span>Anchor</span><code>' + esc(target.locator.selector) + '</code></div>';
-    cName.value = state.name || ''; cText.value = ''; composer.hidden = false;
+    state.kind = null; state.rootLabelPickerOpen = false; state.rootLabelSearch = ''; state.rootLabelActive = 0;
+    cName.value = state.name || ''; cText.value = ''; renderRootLabelZone(); composer.hidden = false;
     setTimeout(() => { (cName.value ? cText : cName).focus(); }, 30);
   }
-  function closeComposer() { composer.hidden = true; state.pending = null; }
+  function closeComposer() { composer.hidden = true; state.pending = null; state.rootLabelPickerOpen = false; }
 
   const api = async (path, init) => {
     init = init || {};
@@ -763,6 +853,7 @@ function injectCommentsUI(html: string, config: {
     if (!res.ok) throw new Error((data && data.error) || ('Request failed: ' + res.status));
     return data;
   };
+  function withOptionalKind(payload, kind) { if (kind != null) payload.kind = kind; return payload; }
   function scopeOf(kind) { return kind === 'selection' ? 'selection' : (kind === 'page' ? 'artifact' : 'element'); }
 
   async function addComment() {
@@ -776,7 +867,7 @@ function injectCommentsUI(html: string, config: {
     const anchor = { kind: t.kind, locator: t.locator, state: t.state, view: t.view }; if (t.quote) anchor.quote = t.quote;
     closeComposer(); setStatus('Posting…');
     try {
-      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify({ name: name, body: body, kind: state.kind, pagePath: PAGE, scopeType: scopeType, anchor: scopeType === 'artifact' ? undefined : anchor }) });
+      const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads', { method: 'POST', body: JSON.stringify(withOptionalKind({ name: name, body: body, pagePath: PAGE, scopeType: scopeType, anchor: scopeType === 'artifact' ? undefined : anchor }, state.kind)) });
       if (data && data.thread) { state.threads.unshift(data.thread); }
       setStatus(''); openPanel();
     } catch (e) { setStatus(e.message || 'Failed to post.'); panel.hidden = false; }
@@ -785,7 +876,7 @@ function injectCommentsUI(html: string, config: {
   function replyDraft(threadId) {
     if (!state.replyDrafts[threadId]) {
       const committed = (state.name || '').trim();
-      state.replyDrafts[threadId] = { name: committed, body: '', kind: 'note', identityEditing: !committed, identityEditorValue: committed, priorIdentity: committed };
+      state.replyDrafts[threadId] = { name: committed, body: '', kind: null, labelPickerOpen: false, labelSearch: '', labelActive: 0, identityEditing: !committed, identityEditorValue: committed, priorIdentity: committed };
     }
     return state.replyDrafts[threadId];
   }
@@ -794,7 +885,7 @@ function injectCommentsUI(html: string, config: {
     const committed = (newName || '').trim();
     state.name = committed;
     cName.value = committed;
-    localStorage.setItem(NAME_KEY, committed);
+    safeStorageSet(NAME_KEY, committed);
     Object.keys(state.replyDrafts).forEach((threadId) => {
       const draft = state.replyDrafts[threadId];
       if (draft.name !== previous) return;
@@ -836,7 +927,10 @@ function injectCommentsUI(html: string, config: {
     else if (active.classList.contains('identityCancel')) selector = '.identityCancel';
     else if (active.classList.contains('replyCancel')) selector = '.replyCancel';
     else if (active.classList.contains('replyBtn')) selector = '.replyBtn';
-    else if (active.classList.contains('replyKindChip')) selector = '.replyKindChip[data-kind="' + active.getAttribute('data-kind') + '"]';
+    else if (active.classList.contains('typeAdd')) selector = '.typeAdd';
+    else if (active.classList.contains('typeChipLabel')) selector = '.typeChipLabel';
+    else if (active.classList.contains('typeChipRemove')) selector = '.typeChipRemove';
+    else if (active.classList.contains('typeSearch')) selector = '.typeSearch';
     if (!selector) return null;
     const hasSelection = typeof active.selectionStart === 'number' && typeof active.selectionEnd === 'number';
     return { threadId: state.expandedThreadId, selector: selector, selectionStart: hasSelection ? active.selectionStart : null, selectionEnd: hasSelection ? active.selectionEnd : null };
@@ -846,7 +940,9 @@ function injectCommentsUI(html: string, config: {
     if (intent.fallback) { focusAfterReplyCollapse(intent.threadId); return; }
     setTimeout(() => {
       const item = list.querySelector('[data-id="' + String(intent.threadId).split('"').join('') + '"]');
-      const control = item && item.querySelector(intent.selector);
+      const preserved = item && intent.preserveSelectionSelector && item.querySelector(intent.preserveSelectionSelector);
+      if (preserved && intent.preserveSelectionStart !== null && typeof preserved.setSelectionRange === 'function') preserved.setSelectionRange(intent.preserveSelectionStart, intent.preserveSelectionEnd);
+      const control = item && (item.querySelector(intent.selector) || (intent.fallbackSelector && item.querySelector(intent.fallbackSelector)));
       if (!control) { focusAfterReplyCollapse(intent.threadId); return; }
       control.focus();
       if (intent.selectionStart !== null && typeof control.setSelectionRange === 'function') control.setSelectionRange(intent.selectionStart, intent.selectionEnd);
@@ -909,11 +1005,11 @@ function injectCommentsUI(html: string, config: {
     const body = (draft.body || '').trim();
     if (!name) { draft.identityEditing = true; render(); focusReplyControl(threadId, '.replyName'); return; }
     if (!body) { focusReplyControl(threadId, '.replyInput'); return; }
-    const snapshot = { threadId: threadId, name: draft.name, body: draft.body, kind: draft.kind, identityEditing: draft.identityEditing, identityEditorValue: draft.identityEditorValue, priorIdentity: draft.priorIdentity };
+    const snapshot = { threadId: threadId, name: draft.name, body: draft.body, kind: draft.kind, labelPickerOpen: draft.labelPickerOpen, labelSearch: draft.labelSearch, labelActive: draft.labelActive, identityEditing: draft.identityEditing, identityEditorValue: draft.identityEditorValue, priorIdentity: draft.priorIdentity };
     state.replySubmitting = threadId;
     render();
     try {
-      await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify({ name: snapshot.name, body: snapshot.body, kind: snapshot.kind }) });
+      await api('/comment-threads/' + threadId + '/messages', { method: 'POST', body: JSON.stringify(withOptionalKind({ name: snapshot.name, body: snapshot.body }, snapshot.kind)) });
       delete state.replyDrafts[threadId];
       state.expandedThreadId = null;
       state.replySubmitting = null;
@@ -947,14 +1043,37 @@ function injectCommentsUI(html: string, config: {
     return JSON.stringify((threads || []).map((thread) => ({
       id: thread.id, status: thread.status || 'open', updated_at: thread.updated_at || null, deleted_at: thread.deleted_at || null,
       resolved_by_label: thread.resolved_by_label || '', resolved_at: thread.resolved_at || null,
-      messages: (thread.messages || []).map((message) => ({ id: message.id, author_label: message.author_label || '', body: message.body || '', kind: message.kind || 'note', updated_at: message.updated_at || null, deleted_at: message.deleted_at || null })),
+      messages: (thread.messages || []).map((message) => ({ id: message.id, author_label: message.author_label || '', body: message.body || '', kind: message.kind == null ? null : message.kind, updated_at: message.updated_at || null, deleted_at: message.deleted_at || null })),
     })));
   }
-  function applyThreads(threads) {
+  function labelsDigest(labels) { return JSON.stringify((labels || []).map((label) => [label.key, label.label, label.description || '', label.color || '', !!label.enabled, label.position])); }
+  function applyThreads(threads, labels, revision) {
     reconcileReplyDrafts(threads);
-    const sig = threadsDigest(threads);
+    const enabledKeys = {};
+    (labels || []).forEach((label) => { if (label.enabled && label.key !== 'resolution') enabledKeys[label.key] = true; });
+    const notices = [];
+    if (state.kindFilter !== 'all' && !enabledKeys[state.kindFilter]) { notices.push('Label filter reset to All labels — “' + labelName(state.kindFilter) + '” is no longer available.'); state.kindFilter = 'all'; }
+    if (state.kind && !enabledKeys[state.kind]) {
+      notices.push('Comment label “' + labelName(state.kind) + '” is no longer available; selection removed.');
+      state.kind = null; state.rootLabelPickerOpen = false; state.rootLabelSearch = ''; state.rootLabelActive = 0;
+      if (!composer.hidden) state.rootLabelFocusAfterRender = true;
+    }
+    Object.keys(state.replyDrafts).forEach((threadId) => {
+      const draft = state.replyDrafts[threadId];
+      if (draft.kind && !enabledKeys[draft.kind]) {
+        const priorFocus = state.expandedThreadId === threadId ? captureReplyFocus() : null;
+        notices.push('Reply label “' + labelName(draft.kind) + '” is no longer available; selection removed.');
+        draft.kind = null; draft.labelPickerOpen = false; draft.labelSearch = ''; draft.labelActive = 0;
+        // Prefer the replacement Add label opener; if no labels remain, the
+        // documented fallback is the preserved reply body field.
+        if (state.expandedThreadId === threadId) state.replyFocusAfterRender = { threadId: threadId, selector: '.typeAdd', fallbackSelector: '.replyInput', selectionStart: null, selectionEnd: null, preserveSelectionSelector: priorFocus && priorFocus.selector === '.replyInput' ? '.replyInput' : null, preserveSelectionStart: priorFocus ? priorFocus.selectionStart : null, preserveSelectionEnd: priorFocus ? priorFocus.selectionEnd : null };
+      }
+    });
+    const sig = threadsDigest(threads) + '|' + labelsDigest(labels) + '|' + String(revision || 0);
     if (sig === state.sig) return;
-    state.sig = sig; state.threads = threads; render(true);
+    state.sig = sig; state.threads = threads; state.commentLabels = labels || []; state.commentLabelRevision = revision || 0;
+    if (notices.length) setStatus(notices.join(' '));
+    render(true); renderRootLabelZone();
   }
   function beginThreadLoad() { state.threadLoadGeneration += 1; return state.threadLoadGeneration; }
   function isLatestThreadLoad(generation) { return generation === state.threadLoadGeneration; }
@@ -963,7 +1082,7 @@ function injectCommentsUI(html: string, config: {
     try {
       const data = await api('/artifacts/' + cfg.artifactId + '/comment-threads?pagePath=' + encodeURIComponent(PAGE) + '&includeActivity=1');
       if (!isLatestThreadLoad(generation)) return;
-      state.loaded = true; setStatus(''); applyThreads((data && data.threads) || []);
+      state.loaded = true; setStatus(''); applyThreads((data && data.threads) || [], (data && data.commentLabels) || [], data && data.commentLabelRevision);
     } catch (e) { if (isLatestThreadLoad(generation) && !state.loaded) setStatus(e.message || 'Failed to load.'); }
   }
 
@@ -974,12 +1093,12 @@ function injectCommentsUI(html: string, config: {
   function openResolve(threadId, btn) {
     const thread = state.threads.filter((item) => item.id === threadId)[0] || {};
     const first = (thread.messages || [])[0] || {};
-    const contextKind = first.kind || 'note';
+    const contextKind = first.kind;
     state.resolving = { threadId: threadId };
     resolveName.value = state.name || '';
     resolveText.value = '';
-    resolveContext.className = 'kindBadge resolveContext ' + contextKind;
-    resolveContext.textContent = kindLabel(contextKind);
+    resolveContext.className = 'kindBadge resolveContext';
+    resolveContext.innerHTML = contextKind ? labelDot(labelForKey(contextKind)) + '<span class="bl">' + esc(labelName(contextKind)) + '</span>' : 'Untyped';
     updateResolveAttribution();
     resolveDialog.hidden = false;
     setTimeout(() => { (resolveName.value ? resolveText : resolveName).focus(); }, 30);
@@ -1029,14 +1148,91 @@ function injectCommentsUI(html: string, config: {
   }
 
   // ---- render ----
-  const kindLabel = (kind) => (kind || 'note').charAt(0).toUpperCase() + (kind || 'note').slice(1);
-  const kindBadge = (kind) => '<span class="kindBadge ' + esc(kind || 'note') + '">' + esc(kindLabel(kind)) + '</span>';
+  const enabledLabels = () => state.commentLabels.filter((label) => label.enabled && label.key !== 'resolution');
+  const labelForKey = (key) => state.commentLabels.filter((label) => label.key === key)[0] || null;
+  const labelName = (key) => { const label = labelForKey(key); return label ? label.label : key; };
+  const labelDot = (label) => label ? '<span class="tdot" aria-hidden="true" style="background:' + esc(label.color || '#667085') + '"></span>' : '';
+  const kindBadge = (kind) => kind == null || kind === 'resolution' ? '' : '<span class="kindBadge">' + labelDot(labelForKey(kind)) + '<span class="bl">' + esc(labelName(kind)) + '</span></span>';
   const visibleMessages = (thread) => (thread.messages || []).filter((message) => !message.deleted_at);
-  const readinessCount = (threads, kind) => threads.reduce((total, thread) => total + (thread.status === 'resolved' ? 0 : visibleMessages(thread).filter((message) => (message.kind || 'note') === kind).length), 0);
-  const threadMatchesKind = (thread, kind) => kind === 'all' || visibleMessages(thread).some((message) => (message.kind || 'note') === kind);
+  const labelCount = (threads, kind) => threads.reduce((total, thread) => total + (thread.status === 'resolved' ? 0 : visibleMessages(thread).filter((message) => message.kind === kind).length), 0);
+  const threadMatchesKind = (thread, kind) => kind === 'all' || visibleMessages(thread).some((message) => message.kind === kind);
+  const filteredPickerLabels = (search) => { const query = (search || '').trim().toLowerCase(); return enabledLabels().filter((label) => !query || (label.key + ' ' + label.label + ' ' + (label.description || '')).toLowerCase().indexOf(query) >= 0); };
+  function labelPickerHtml(scope, selected, open, search, active) {
+    const labels = filteredPickerLabels(search), many = enabledLabels().length > 6, safeActive = labels.length ? Math.max(0, Math.min(active || 0, labels.length - 1)) : -1;
+    if (!open) {
+      if (!selected) return '<button type="button" class="typeAdd' + (scope === 'root' ? ' large' : '') + '" aria-expanded="false" aria-haspopup="listbox"><span aria-hidden="true">+</span>Add label</button>';
+      const label = labelForKey(selected);
+      return '<span class="typeChip' + (scope === 'root' ? ' large' : '') + '">' + labelDot(label) + '<button type="button" class="typeChipLabel" aria-haspopup="listbox" aria-expanded="false" aria-label="Change comment label, currently ' + esc(labelName(selected)) + '">' + esc(labelName(selected)) + '</button><button type="button" class="typeChipRemove" aria-label="Remove comment label">&times;</button></span>';
+    }
+    const listId = 'label-picker-' + scope, helpId = listId + '-help', activeId = safeActive >= 0 ? listId + '-option-' + safeActive : null;
+    const searchBox = many ? '<div id="' + helpId + '" class="srOnly">Searches label key, label, and description. Arrow keys, Home, and End update the active option.</div><input class="typeSearch" type="text" role="combobox" placeholder="Search labels…" aria-label="Search comment labels" aria-expanded="true" aria-controls="' + listId + '" aria-autocomplete="list"' + (activeId ? ' aria-activedescendant="' + activeId + '"' : '') + ' aria-describedby="' + helpId + '" value="' + esc(search || '') + '">' : '';
+    const options = labels.map((label, index) => '<button id="' + listId + '-option-' + index + '" type="button" class="typeOption' + (index === safeActive ? ' active' : '') + '" role="option" aria-selected="' + String(selected === label.key) + '" tabindex="' + (many || index !== safeActive ? '-1' : '0') + '" data-label-key="' + esc(label.key) + '" data-option-index="' + index + '">' + labelDot(label) + '<span class="tlabel">' + esc(label.label) + '</span></button>').join('');
+    return '<button type="button" class="typeAdd' + (scope === 'root' ? ' large' : '') + '" aria-expanded="true" aria-haspopup="listbox" aria-controls="' + listId + '"><span aria-hidden="true">+</span>' + (selected ? 'Change label' : 'Add label') + '</button><div class="typePicker">' + searchBox + '<div id="' + listId + '" class="typePickerList' + (many ? ' many' : '') + '" role="listbox" aria-label="Comment label"' + (activeId ? ' aria-activedescendant="' + activeId + '"' : '') + '>' + options + (!labels.length ? '<div class="typeEmpty" role="status" aria-live="polite">No labels match your search.</div>' : '') + '</div></div>';
+  }
+  function bindLabelPicker(zone, scope, draft) {
+    const rerender = () => scope === 'root' ? renderRootLabelZone() : render();
+    const currentZone = () => scope === 'root' ? rootLabelZone : list.querySelector('.replyForm:not([hidden]) .typeZone');
+    const liveControl = (selector) => { const liveZone = currentZone(); return liveZone && liveZone.querySelector(selector); };
+    const focusOpener = () => setTimeout(() => { const opener = liveControl('.typeAdd,.typeChipLabel'); if (opener) opener.focus(); }, 0);
+    const focusActive = (preferSearch) => setTimeout(() => { const target = preferSearch ? liveControl('.typeSearch') : (liveControl('.typeOption.active') || liveControl('.typeSearch')); if (target) { target.focus(); if (preferSearch && typeof target.setSelectionRange === 'function') target.setSelectionRange(draft.labelSearch.length, draft.labelSearch.length); } }, 0);
+    const closePicker = () => { draft.labelPickerOpen = false; draft.labelSearch = ''; draft.labelActive = 0; rerender(); focusOpener(); };
+    const selectActive = () => { const labels = filteredPickerLabels(draft.labelSearch); if (!labels.length) return; draft.kind = labels[Math.max(0, Math.min(draft.labelActive, labels.length - 1))].key; draft.labelPickerOpen = false; draft.labelSearch = ''; draft.labelActive = 0; rerender(); focusOpener(); };
+    const moveActive = (key, preferSearch) => {
+      const labels = filteredPickerLabels(draft.labelSearch); if (!labels.length) return;
+      if (key === 'Home') draft.labelActive = 0;
+      else if (key === 'End') draft.labelActive = labels.length - 1;
+      else draft.labelActive = (draft.labelActive + (key === 'ArrowDown' ? 1 : -1) + labels.length) % labels.length;
+      rerender(); focusActive(preferSearch);
+    };
+    const handlePickerKey = (event, preferSearch) => {
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closePicker(); return true; }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Home' || event.key === 'End') { event.preventDefault(); moveActive(event.key, preferSearch); return true; }
+      // The approved combobox contract reserves Space for selecting the active
+      // descendant while search retains focus. Consequently literal spaces
+      // cannot be entered in this label-search field; label/key/description
+      // matching remains available through contiguous query terms.
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectActive(); return true; }
+      return false;
+    };
+    const add = zone.querySelector('.typeAdd'); if (add) add.addEventListener('click', () => { draft.labelPickerOpen = !draft.labelPickerOpen; draft.labelActive = 0; rerender(); if (draft.labelPickerOpen) focusActive(enabledLabels().length > 6); });
+    const change = zone.querySelector('.typeChipLabel'); if (change) change.addEventListener('click', () => { draft.labelPickerOpen = true; rerender(); focusActive(enabledLabels().length > 6); });
+    const remove = zone.querySelector('.typeChipRemove'); if (remove) remove.addEventListener('click', () => { draft.kind = null; draft.labelPickerOpen = false; draft.labelSearch = ''; rerender(); });
+    Array.prototype.forEach.call(zone.querySelectorAll('.typeOption'), (option) => {
+      option.addEventListener('click', () => { draft.labelActive = Number(option.getAttribute('data-option-index')) || 0; selectActive(); });
+      option.addEventListener('keydown', (event) => handlePickerKey(event, false));
+    });
+    const search = zone.querySelector('.typeSearch'); if (search) {
+      search.addEventListener('input', () => { draft.labelSearch = search.value; draft.labelActive = 0; rerender(); focusActive(true); });
+      search.addEventListener('keydown', (event) => handlePickerKey(event, true));
+    }
+  }
+  function renderRootLabelZone() {
+    const labels = enabledLabels(); rootLabelZone.hidden = !labels.length;
+    if (!labels.length) {
+      rootLabelZone.innerHTML = '';
+      if (state.rootLabelFocusAfterRender) { state.rootLabelFocusAfterRender = false; setTimeout(() => cText.focus(), 0); }
+      return;
+    }
+    const draft = { get kind() { return state.kind; }, set kind(value) { state.kind = value; }, get labelPickerOpen() { return state.rootLabelPickerOpen; }, set labelPickerOpen(value) { state.rootLabelPickerOpen = value; }, get labelSearch() { return state.rootLabelSearch; }, set labelSearch(value) { state.rootLabelSearch = value; }, get labelActive() { return state.rootLabelActive; }, set labelActive(value) { state.rootLabelActive = value; } };
+    rootLabelZone.innerHTML = labelPickerHtml('root', state.kind, state.rootLabelPickerOpen, state.rootLabelSearch, state.rootLabelActive); bindLabelPicker(rootLabelZone, 'root', draft);
+    if (state.rootLabelFocusAfterRender) { state.rootLabelFocusAfterRender = false; setTimeout(() => { const opener = rootLabelZone.querySelector('.typeAdd,.typeChipLabel'); if (opener) opener.focus(); else cText.focus(); }, 0); }
+  }
+  function renderLabelChrome() {
+    const restoreToggleFocus = state.labelSummaryFocusAfterRender || (sr.activeElement && sr.activeElement.id === 'labelSummaryToggle');
+    const labels = enabledLabels(); labelFilterWrap.hidden = !labels.length; filters.classList.toggle('single', !labels.length);
+    kindFilter.innerHTML = '<option value="all">All labels</option>' + labels.map((label) => '<option value="' + esc(label.key) + '">' + esc(label.label) + '</option>').join(''); kindFilter.value = state.kindFilter;
+    const counts = labels.map((label) => ({ label: label, count: labelCount(state.threads, label.key) })).filter((item) => item.count > 0), total = counts.reduce((sum, item) => sum + item.count, 0);
+    if (!counts.length) { state.labelSummaryFocusAfterRender = false; labelSummary.innerHTML = ''; labelSummary.className = ''; labelScrim.hidden = true; return; }
+    const preview = counts.slice(0, 2).map((item) => '<span class="previewItem">' + labelDot(item.label) + '<span class="name">' + esc(item.label.label) + '</span><b>' + item.count + '</b></span>').join('');
+    const rows = counts.map((item) => '<div class="countRow">' + labelDot(item.label) + '<span class="labelName">' + esc(item.label.label) + '</span><b>' + item.count + '</b></div>').join('');
+    labelSummary.className = 'labelSummary'; labelSummary.innerHTML = '<button id="labelSummaryToggle" class="summaryToggle" type="button" aria-expanded="' + String(state.labelSummaryExpanded) + '" aria-controls="label-summary-popover"><span class="summaryLead">Labels <span class="summaryTotal" aria-label="' + total + ' labeled open messages">' + total + '</span></span><span class="summaryDivider" aria-hidden="true"></span><span class="summaryPreview" aria-hidden="true">' + preview + '</span>' + (counts.length > 2 ? '<span class="summaryMore">+' + (counts.length - 2) + '</span>' : '') + '<span class="chevron" aria-hidden="true"></span></button><div id="label-summary-popover" class="summaryPopover" role="region" aria-label="All comment label counts"' + (state.labelSummaryExpanded ? '' : ' hidden') + '><div class="popoverHead"><strong>All labels</strong><span>' + total + ' total</span></div><div class="allCounts" tabindex="0">' + rows + '</div></div>';
+    labelScrim.hidden = !state.labelSummaryExpanded;
+    $('#labelSummaryToggle').addEventListener('click', () => { state.labelSummaryFocusAfterRender = true; state.labelSummaryExpanded = !state.labelSummaryExpanded; safeStorageSet(LABEL_SUMMARY_KEY, String(state.labelSummaryExpanded)); renderLabelChrome(); });
+    if (restoreToggleFocus) { state.labelSummaryFocusAfterRender = false; setTimeout(() => { const replacement = $('#labelSummaryToggle'); if (replacement) replacement.focus(); }, 0); }
+  }
   function render(preserveReplyFocus) {
     countEl.textContent = state.threads.length;
-    $('#readyStats').innerHTML = '<div class="readyStat"><span>Blockers</span><b>' + readinessCount(state.threads, 'blocker') + '</b></div><div class="readyStat"><span>Questions</span><b>' + readinessCount(state.threads, 'question') + '</b></div><div class="readyStat"><span>Actions</span><b>' + readinessCount(state.threads, 'action') + '</b></div>';
+    renderLabelChrome();
     const visible = state.threads.filter((th) => {
       if (state.statusFilter !== 'all' && (th.status || 'open') !== state.statusFilter) return false;
       return threadMatchesKind(th, state.kindFilter);
@@ -1053,7 +1249,7 @@ function injectCommentsUI(html: string, config: {
         ? '<span class="badge resolved"><span class="badgeText">resolved' + (who ? ' by ' + esc(who) : '') + (th.resolved_at ? ' \u00b7 ' + ago(th.resolved_at) : '') + '</span></span>'
         : '<span class="badge open"><span class="badgeText">open</span></span>';
       const key = Array.from(String(th.id)).map((char) => char.codePointAt(0).toString(16)).join('-');
-      const composerId = 'reply-composer-' + key, editorId = 'reply-identity-editor-' + key, nameId = 'reply-name-' + key, replyId = 'reply-body-' + key, kindsId = 'reply-kinds-' + key;
+      const composerId = 'reply-composer-' + key, editorId = 'reply-identity-editor-' + key, nameId = 'reply-name-' + key, replyId = 'reply-body-' + key;
       const draft = resolved ? null : replyDraft(th.id);
       const expanded = !resolved && state.expandedThreadId === th.id;
       let html = '<div class="item" data-id="' + esc(th.id) + '">' +
@@ -1074,7 +1270,7 @@ function injectCommentsUI(html: string, config: {
           '<div class="replyIdentity" aria-label="Reply identity"><div class="identitySummary"' + (summaryHidden ? ' hidden' : '') + '><span class="identityAvatar" aria-hidden="true">' + esc(initials(draft.name)) + '</span><span>Replying as <strong>' + esc(draft.name) + '</strong></span><button type="button" class="identityChange" aria-controls="' + editorId + '" aria-expanded="' + String(!editorHidden) + '">Change</button></div>' +
           '<div id="' + editorId + '" class="identityEditor"' + (editorHidden ? ' hidden' : '') + '><label for="' + nameId + '">Your name <span class="required">*</span></label><input id="' + nameId + '" class="replyName" type="text" autocomplete="name" maxlength="80" required value="' + esc(draft.identityEditorValue) + '"><div class="identityActions"><button type="button" class="btn ghost identityCancel">Cancel</button><button type="button" class="btn primary identitySave">Save</button></div></div></div>' +
           '<div class="replyField"><label for="' + replyId + '">Reply</label><textarea id="' + replyId + '" class="replyInput" placeholder="Write a reply…" required>' + esc(draft.body) + '</textarea></div>' +
-          '<div class="replyKinds"><span id="' + kindsId + '" class="replyKindsLabel">Reply type</span><div class="replyKindChips" role="group" aria-labelledby="' + kindsId + '">' + ['note','blocker','concern','question','action','nit'].map((kind) => '<button type="button" class="replyKindChip" data-kind="' + kind + '" aria-pressed="' + String(draft.kind === kind) + '">' + kindLabel(kind) + '</button>').join('') + '</div></div>' +
+          (enabledLabels().length ? '<div class="typeZone">' + labelPickerHtml('reply-' + key, draft.kind, draft.labelPickerOpen, draft.labelSearch, draft.labelActive) + '</div>' : '') +
           '<div class="replyActions"><button type="button" class="btn ghost replyCancel">Cancel</button><button type="button" class="replyBtn"' + (state.replySubmitting === th.id ? ' disabled' : '') + '>Reply</button></div></div>';
       }
       return html + '<div class="orphan" hidden></div></div>';
@@ -1089,11 +1285,7 @@ function injectCommentsUI(html: string, config: {
     Array.prototype.forEach.call(list.querySelectorAll('.identityCancel'), (btn) => btn.addEventListener('click', () => cancelIdentity(btn.closest('.item').getAttribute('data-id'), true)));
     Array.prototype.forEach.call(list.querySelectorAll('.replyCancel'), (btn) => btn.addEventListener('click', () => collapseReply(btn.closest('.item').getAttribute('data-id'), true)));
     Array.prototype.forEach.call(list.querySelectorAll('.replyBtn'), (btn) => btn.addEventListener('click', () => postReply(btn.closest('.item').getAttribute('data-id'))));
-    Array.prototype.forEach.call(list.querySelectorAll('.replyKindChip'), (chip) => {
-      const selectChip = () => { const id = chip.closest('.item').getAttribute('data-id'), draft = replyDraft(id); draft.kind = chip.getAttribute('data-kind'); Array.prototype.forEach.call(chip.parentElement.querySelectorAll('.replyKindChip'), (candidate) => candidate.setAttribute('aria-pressed', String(candidate === chip))); };
-      chip.addEventListener('click', selectChip);
-      chip.addEventListener('keydown', (event) => { if (event.key !== 'ArrowRight' && event.key !== 'ArrowDown' && event.key !== 'ArrowLeft' && event.key !== 'ArrowUp') return; event.preventDefault(); const chips = Array.prototype.slice.call(chip.parentElement.querySelectorAll('.replyKindChip')); const delta = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1; const next = chips[(chips.indexOf(chip) + delta + chips.length) % chips.length]; next.click(); next.focus(); });
-    });
+    Array.prototype.forEach.call(list.querySelectorAll('.replyForm .typeZone'), (zone) => { const id = zone.closest('.item').getAttribute('data-id'); bindLabelPicker(zone, 'reply-' + id, replyDraft(id)); });
     restoreQueuedReplyFocus();
   }
 
@@ -1197,6 +1389,9 @@ async function serveArtifact(
         origin: new URL(request.url).origin,
         artifactBasePath: routeConfig.artifactBasePath,
         currentPagePath: filePath,
+        // VERCEL_PROJECT_ID is stable across deployments, artifact versions, and
+        // custom domains. The hostname is only a local/non-Vercel fallback.
+        instanceScope: process.env.VERCEL_PROJECT_ID || new URL(request.url).hostname,
       }),
       { status: 200, headers }
     );
@@ -1272,6 +1467,297 @@ function instancePage(origin: string, multiTenant: boolean): string {
 </body></html>`;
 }
 
+async function readOwnerCommentLabels(sql: any): Promise<{ revision: number; commentLabels: Array<CommentLabel & { usageCount: number }> }> {
+  const rows = await sql`
+    SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position,
+      (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count
+    FROM comment_label_registry_state state
+    LEFT JOIN comment_labels label ON label.key <> 'resolution'
+    WHERE state.singleton = true
+    ORDER BY label.position ASC, label.key ASC
+  `;
+  return ownerCommentLabelListFromRows(rows);
+}
+
+function ownerCommentLabelListFromRows(rows: any[]): { revision: number; commentLabels: Array<CommentLabel & { usageCount: number }> } {
+  return {
+    revision: Number(rows[0]?.revision || 0),
+    commentLabels: rows.filter((row: any) => row.key).map((row: any) => ({
+      key: row.key, label: row.label, description: row.description, color: row.color,
+      enabled: row.enabled === true, position: Number(row.position), usageCount: Number(row.usage_count),
+    })),
+  };
+}
+
+function staleCommentLabelRevision(expectedRevision: number, actualRevision: number): Response {
+  return commentLabelError(409, 'stale_comment_label_registry', 'The comment label registry changed.', {
+    expectedRevision, actualRevision, hint: 'Read or preview the registry again.',
+  });
+}
+
+function normalizeCommentLabelDocument(value: unknown): { $schema: string; version: 1; commentLabels: CommentLabel[] } | Response {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return commentLabelError(400, 'comment_label_document_invalid', 'Document must be an object.', { field: 'document' });
+  const input = value as Record<string, unknown>;
+  const unknown = Object.keys(input).find((key) => !['$schema', 'version', 'commentLabels'].includes(key));
+  if (unknown) return commentLabelError(400, 'comment_label_document_invalid', 'Unknown document field.', { field: unknown });
+  if (input.$schema !== 'toss/comment-labels@v1') return commentLabelError(400, 'comment_label_document_invalid', 'Unsupported comment label schema.', { field: '$schema' });
+  if (input.version !== 1) return commentLabelError(400, 'comment_label_document_invalid', 'Unsupported comment label document version.', { field: 'version' });
+  if (!Array.isArray(input.commentLabels)) return commentLabelError(400, 'comment_label_document_invalid', 'commentLabels must be an array.', { field: 'commentLabels' });
+  const labels: CommentLabel[] = [];
+  const keys = new Set<string>();
+  const positions = new Set<number>();
+  for (let index = 0; index < input.commentLabels.length; index++) {
+    const parsed = normalizeCommentLabel(input.commentLabels[index], `commentLabels[${index}]`);
+    if (parsed instanceof Response) return parsed;
+    if (parsed.position < 1) return commentLabelError(400, 'comment_label_document_invalid', 'Position must be positive.', { field: `commentLabels[${index}].position` });
+    if (keys.has(parsed.key)) return commentLabelError(400, 'comment_label_document_invalid', 'Comment label keys must be unique.', { field: `commentLabels[${index}].key` });
+    if (positions.has(parsed.position)) return commentLabelError(400, 'comment_label_document_invalid', 'Included positions must be unique.', { field: `commentLabels[${index}].position` });
+    keys.add(parsed.key); positions.add(parsed.position); labels.push(parsed);
+  }
+  return { $schema: 'toss/comment-labels@v1', version: 1, commentLabels: labels };
+}
+
+type OwnerCommentLabel = CommentLabel & { usageCount: number };
+
+type CommentLabelApplyPreview = {
+  creates: string[];
+  updates: string[];
+  reorders: string[];
+  unchanged: string[];
+  result: OwnerCommentLabel[];
+  invalidPositionField?: string;
+};
+
+export function computeCommentLabelApply(current: OwnerCommentLabel[], included: CommentLabel[]): CommentLabelApplyPreview {
+  const currentByKey = new Map(current.map((label) => [label.key, label]));
+  const includedByKey = new Map(included.map((label) => [label.key, label]));
+  const finalCount = current.length + included.filter((label) => !currentByKey.has(label.key)).length;
+  const invalidIndex = included.findIndex((label) => label.position > finalCount);
+  if (invalidIndex !== -1) {
+    return { creates: [], updates: [], reorders: [], unchanged: [], result: [], invalidPositionField: `commentLabels[${invalidIndex}].position` };
+  }
+  const result: Array<OwnerCommentLabel | undefined> = new Array(finalCount);
+  for (const label of included) {
+    result[label.position - 1] = { ...label, usageCount: currentByKey.get(label.key)?.usageCount || 0 };
+  }
+  const omitted = current.filter((label) => !includedByKey.has(label.key));
+  for (const label of omitted) {
+    let slot = result.findIndex((value) => value === undefined);
+    if (slot === -1) { slot = result.length; result.push(undefined); }
+    result[slot] = { ...label };
+  }
+  const finalResult = result.filter((label): label is OwnerCommentLabel => Boolean(label)).map((label, index) => ({ ...label, position: index + 1 }));
+  const creates = included.filter((label) => !currentByKey.has(label.key)).map((label) => label.key);
+  const updates = included.filter((label) => {
+    const before = currentByKey.get(label.key);
+    return before && (before.label !== label.label || before.description !== label.description || before.color !== label.color || before.enabled !== label.enabled);
+  }).map((label) => label.key);
+  const reorders = finalResult.filter((label) => currentByKey.has(label.key) && currentByKey.get(label.key)!.position !== label.position).map((label) => label.key);
+  const changed = new Set([...creates, ...updates, ...reorders]);
+  const unchanged = finalResult.filter((label) => currentByKey.has(label.key) && !changed.has(label.key)).map((label) => label.key);
+  return { creates, updates, reorders, unchanged, result: finalResult };
+}
+
+export function computeCommentLabelClear(current: OwnerCommentLabel[]): { deletes: string[]; disables: string[]; result: OwnerCommentLabel[] } {
+  const deletes = current.filter((label) => label.usageCount === 0).map((label) => label.key);
+  const disables = current.filter((label) => label.usageCount > 0 && label.enabled).map((label) => label.key);
+  const result = current
+    .filter((label) => label.usageCount > 0)
+    .map((label, index) => ({ ...label, enabled: false, position: index + 1 }));
+  return { deletes, disables, result };
+}
+
+async function handleCommentLabelRoutes(request: Request, url: URL): Promise<Response | null> {
+  if (!url.pathname.startsWith('/comment-labels')) return null;
+  const validRoute = url.pathname === '/comment-labels'
+    || url.pathname === '/comment-labels/order'
+    || url.pathname === '/comment-labels/apply'
+    || url.pathname === '/comment-labels/clear'
+    || /^\/comment-labels\/[a-z0-9][a-z0-9-]{0,31}$/.test(url.pathname);
+  if (!validRoute) return new Response('Not found', { status: 404 });
+  const auth = await requireAdmin(request);
+  if (auth instanceof Response) return auth;
+  const sql = getSQL();
+  if (request.method === 'GET' && url.pathname === '/comment-labels') return authJson(await readOwnerCommentLabels(sql));
+  const body = request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT' || request.method === 'DELETE'
+    ? await request.json().catch(() => null) : null;
+
+  if (request.method === 'POST' && url.pathname === '/comment-labels') {
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const parsed = normalizeCommentLabel(body && typeof body === 'object' ? (body as any).commentLabel : null);
+    if (parsed instanceof Response) return parsed;
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`WITH current AS (SELECT COUNT(*)::int AS count, EXISTS (SELECT 1 FROM comment_labels WHERE key = ${parsed.key}) AS exists FROM comment_labels WHERE key <> 'resolution'), decision AS (SELECT count, exists, CASE WHEN ${parsed.position} = 0 THEN count + 1 ELSE ${parsed.position} END AS position, ${parsed.position} = 0 OR ${parsed.position} BETWEEN 1 AND count + 1 AS position_valid FROM current), allowed AS (SELECT * FROM decision WHERE (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} AND NOT exists AND position_valid), shifted AS (UPDATE comment_labels SET position = position + 1 WHERE key <> 'resolution' AND position >= (SELECT position FROM allowed) RETURNING key), inserted AS (INSERT INTO comment_labels (key, label, description, color, enabled, position) SELECT ${parsed.key}, ${parsed.label}, ${parsed.description}, ${parsed.color}, ${parsed.enabled}, position FROM allowed WHERE (SELECT COUNT(*) FROM shifted) >= 0 RETURNING key), bumped AS (UPDATE comment_label_registry_state SET revision = revision + 1 WHERE singleton = true AND EXISTS (SELECT 1 FROM inserted) RETURNING revision) SELECT decision.exists, decision.position_valid, inserted.key, bumped.revision FROM decision LEFT JOIN inserted ON true LEFT JOIN bumped ON true`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0);
+    if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    if (results[1]?.[0]?.exists) return commentLabelError(409, 'comment_label_exists', 'A comment label with this key already exists.', { key: parsed.key });
+    if (!results[1]?.[0]?.position_valid) return commentLabelError(400, 'comment_label_invalid', 'Position is outside the registry.', { field: 'commentLabel.position' });
+    const list = results[2];
+    return authJson(ownerCommentLabelListFromRows(list), { status: 201 });
+  }
+
+  const keyMatch = url.pathname.match(/^\/comment-labels\/([a-z0-9][a-z0-9-]{0,31})$/);
+  if (keyMatch && request.method === 'PATCH') {
+    const key = keyMatch[1];
+    if (key === 'resolution') return commentLabelError(400, 'reserved_comment_label', 'The resolution key is reserved.', { key });
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const changes = normalizeCommentLabelChanges(body && typeof body === 'object' ? (body as any).changes : null); if (changes instanceof Response) return changes;
+    const patch = JSON.stringify(changes);
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`WITH current AS MATERIALIZED (SELECT *, COUNT(*) OVER ()::int AS count FROM comment_labels WHERE key <> 'resolution'), target AS MATERIALIZED (SELECT *, COALESCE((${patch}::jsonb->>'position')::int, position) AS new_position FROM current WHERE key = ${key}), decision AS MATERIALIZED (SELECT EXISTS (SELECT 1 FROM target) AS exists, COALESCE((SELECT new_position BETWEEN 1 AND count FROM target), false) AS position_valid, COALESCE((SELECT (${patch}::jsonb ? 'label' AND label IS DISTINCT FROM ${patch}::jsonb->>'label') OR (${patch}::jsonb ? 'description' AND description IS DISTINCT FROM ${patch}::jsonb->>'description') OR (${patch}::jsonb ? 'color' AND color IS DISTINCT FROM ${patch}::jsonb->>'color') OR (${patch}::jsonb ? 'enabled' AND enabled IS DISTINCT FROM (${patch}::jsonb->>'enabled')::boolean) OR (${patch}::jsonb ? 'position' AND position IS DISTINCT FROM new_position) FROM target), false) AS changed), moved AS (UPDATE comment_labels row SET position = CASE WHEN target.position < target.new_position THEN row.position - 1 WHEN target.new_position < target.position THEN row.position + 1 ELSE row.position END FROM target, decision WHERE row.key <> 'resolution' AND row.key <> ${key} AND decision.exists AND decision.position_valid AND decision.changed AND (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} AND ((target.position < target.new_position AND row.position > target.position AND row.position <= target.new_position) OR (target.new_position < target.position AND row.position >= target.new_position AND row.position < target.position)) RETURNING row.key), patched AS (UPDATE comment_labels row SET label = COALESCE(${patch}::jsonb->>'label', row.label), description = COALESCE(${patch}::jsonb->>'description', row.description), color = COALESCE(${patch}::jsonb->>'color', row.color), enabled = COALESCE((${patch}::jsonb->>'enabled')::boolean, row.enabled), position = target.new_position FROM target, decision WHERE row.key = ${key} AND decision.exists AND decision.position_valid AND decision.changed AND (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} AND (SELECT COUNT(*) FROM moved) >= 0 RETURNING row.key), bumped AS (UPDATE comment_label_registry_state SET revision = revision + 1 WHERE singleton = true AND EXISTS (SELECT 1 FROM patched) RETURNING revision) SELECT decision.*, bumped.revision FROM decision LEFT JOIN bumped ON true`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0); if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    if (!results[1]?.[0]?.exists) return commentLabelError(404, 'comment_label_not_found', 'Comment label not found.', { key });
+    if (!results[1]?.[0]?.position_valid) return commentLabelError(400, 'comment_label_invalid', 'Position is outside the registry.', { field: 'changes.position' });
+    return authJson(ownerCommentLabelListFromRows(results[2]));
+  }
+
+  if (keyMatch && request.method === 'DELETE') {
+    const key = keyMatch[1];
+    if (key === 'resolution') return commentLabelError(400, 'reserved_comment_label', 'The resolution key is reserved.', { key });
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`SELECT key, (SELECT COUNT(*)::int FROM comment_messages WHERE kind = ${key}) AS usage_count FROM comment_labels WHERE key = ${key} AND key <> 'resolution'`,
+      tx`WITH removed AS (DELETE FROM comment_labels WHERE key = ${key} AND key <> 'resolution' AND (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} AND NOT EXISTS (SELECT 1 FROM comment_messages WHERE kind = ${key}) RETURNING position), repacked AS (UPDATE comment_labels SET position = position - 1 WHERE key <> 'resolution' AND position > (SELECT position FROM removed) RETURNING key), bumped AS (UPDATE comment_label_registry_state SET revision = revision + 1 WHERE singleton = true AND EXISTS (SELECT 1 FROM removed) AND (SELECT COUNT(*) FROM repacked) >= 0 RETURNING revision) SELECT removed.position, bumped.revision FROM removed, bumped`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0); if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    if (!results[1]?.[0]) return commentLabelError(404, 'comment_label_not_found', 'Comment label not found.', { key });
+    const usageCount = Number(results[1][0].usage_count); if (usageCount) return commentLabelError(409, 'comment_label_in_use', 'The comment label is used by existing messages.', { key, usageCount, hint: 'Disable the label to preserve historical comments.' });
+    return authJson(ownerCommentLabelListFromRows(results[3]));
+  }
+
+  if (request.method === 'PUT' && url.pathname === '/comment-labels/order') {
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const keys = body && typeof body === 'object' ? (body as any).keys : null;
+    if (!Array.isArray(keys) || keys.some((key) => typeof key !== 'string') || new Set(keys).size !== keys.length) return commentLabelError(400, 'comment_label_order_invalid', 'keys must be an array of unique strings.', { field: 'keys' });
+    const desired = keys.map((key: string, index: number) => ({ key, position: index + 1 }));
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`WITH requested AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(desired)}::jsonb) AS row(key text, position integer)), current AS (SELECT key, position FROM comment_labels WHERE key <> 'resolution'), decision AS (SELECT (SELECT COUNT(*) FROM requested) = (SELECT COUNT(*) FROM current) AND NOT EXISTS (SELECT key FROM requested EXCEPT SELECT key FROM current) AND NOT EXISTS (SELECT key FROM current EXCEPT SELECT key FROM requested) AS complete, EXISTS (SELECT 1 FROM requested JOIN current USING (key) WHERE requested.position <> current.position) AS changed), moved AS (UPDATE comment_labels target SET position = requested.position FROM requested, decision WHERE target.key = requested.key AND decision.complete AND decision.changed AND (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} RETURNING target.key), bumped AS (UPDATE comment_label_registry_state SET revision = revision + 1 WHERE singleton = true AND EXISTS (SELECT 1 FROM moved) RETURNING revision) SELECT decision.*, bumped.revision FROM decision LEFT JOIN bumped ON true`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0); if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    if (!results[1]?.[0]?.complete) return commentLabelError(400, 'comment_label_order_invalid', 'keys must contain every configurable comment label exactly once.', { field: 'keys' });
+    return authJson(ownerCommentLabelListFromRows(results[2]));
+  }
+
+  if (request.method === 'POST' && url.pathname === '/comment-labels/apply') {
+    const document = normalizeCommentLabelDocument(body && typeof body === 'object' ? (body as any).document : null); if (document instanceof Response) return document;
+    const before = await readOwnerCommentLabels(sql);
+    const preview = computeCommentLabelApply(before.commentLabels, document.commentLabels);
+    if (url.searchParams.get('dryRun') === '1') {
+      if (preview.invalidPositionField) return commentLabelError(400, 'comment_label_document_invalid', 'Position is outside the merged registry.', { field: preview.invalidPositionField });
+      return authJson({ revision: before.revision, creates: preview.creates, updates: preview.updates, reorders: preview.reorders, unchanged: preview.unchanged, result: preview.result });
+    }
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const desired = JSON.stringify(preview.result);
+    const changed = preview.creates.length > 0 || preview.updates.length > 0 || preview.reorders.length > 0;
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`WITH desired AS (SELECT * FROM jsonb_to_recordset(${desired}::jsonb) AS row(key text, label text, description text, color text, enabled boolean, position integer)), written AS (INSERT INTO comment_labels (key,label,description,color,enabled,position) SELECT key,label,description,color,enabled,position FROM desired WHERE ${changed} AND (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected} ON CONFLICT (key) DO UPDATE SET label=EXCLUDED.label,description=EXCLUDED.description,color=EXCLUDED.color,enabled=EXCLUDED.enabled,position=EXCLUDED.position RETURNING key), bumped AS (UPDATE comment_label_registry_state SET revision=revision+1 WHERE singleton=true AND EXISTS (SELECT 1 FROM written) RETURNING revision) SELECT ${changed} AS changed, bumped.revision FROM bumped RIGHT JOIN (SELECT 1) one ON true`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0); if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    if (preview.invalidPositionField) return commentLabelError(400, 'comment_label_document_invalid', 'Position is outside the merged registry.', { field: preview.invalidPositionField });
+    return authJson(ownerCommentLabelListFromRows(results[2]));
+  }
+
+  if (request.method === 'POST' && url.pathname === '/comment-labels/clear') {
+    const before = await readOwnerCommentLabels(sql);
+    const preview = computeCommentLabelClear(before.commentLabels);
+    if (url.searchParams.get('dryRun') === '1') {
+      return authJson({ revision: before.revision, deletes: preview.deletes, disables: preview.disables, result: preview.result });
+    }
+    const expected = expectedCommentLabelRevision(body); if (expected instanceof Response) return expected;
+    const results = await sql.transaction((tx: any) => [
+      tx`SELECT revision FROM comment_label_registry_state WHERE singleton = true FOR UPDATE`,
+      tx`WITH usage AS MATERIALIZED (SELECT label.key, EXISTS (SELECT 1 FROM comment_messages message WHERE message.kind = label.key) AS in_use FROM comment_labels label WHERE label.key <> 'resolution'), allowed AS MATERIALIZED (SELECT 1 WHERE (SELECT revision FROM comment_label_registry_state WHERE singleton = true) = ${expected}), removed AS (DELETE FROM comment_labels target USING usage, allowed WHERE target.key = usage.key AND NOT usage.in_use RETURNING target.key), survivors AS MATERIALIZED (SELECT label.key, row_number() OVER (ORDER BY label.position, label.key)::int AS position FROM comment_labels label JOIN usage ON usage.key = label.key AND usage.in_use), changed AS (UPDATE comment_labels target SET enabled = false, position = survivors.position FROM survivors, allowed WHERE target.key = survivors.key AND (target.enabled OR target.position <> survivors.position) RETURNING target.key), bumped AS (UPDATE comment_label_registry_state SET revision = revision + 1 WHERE singleton = true AND (EXISTS (SELECT 1 FROM removed) OR EXISTS (SELECT 1 FROM changed)) RETURNING revision) SELECT (SELECT COUNT(*) FROM removed)::int AS deletes, (SELECT COUNT(*) FROM changed)::int AS changes, bumped.revision FROM bumped RIGHT JOIN (SELECT 1) one ON true`,
+      tx`SELECT state.revision, label.key, label.label, label.description, label.color, label.enabled, label.position, (SELECT COUNT(*)::int FROM comment_messages message WHERE message.kind = label.key) AS usage_count FROM comment_label_registry_state state LEFT JOIN comment_labels label ON label.key <> 'resolution' WHERE state.singleton = true ORDER BY label.position, label.key`,
+    ]);
+    const actual = Number(results[0]?.[0]?.revision || 0); if (actual !== expected) return staleCommentLabelRevision(expected, actual);
+    return authJson(ownerCommentLabelListFromRows(results[2]));
+  }
+
+  return new Response('Method not allowed', { status: 405 });
+}
+
+export async function insertCommentReply(sql: any, params: { threadId: string; messageId: string; name: string; message: string; kind: string | null; now: number }) {
+  const { threadId, messageId, name, message, kind, now } = params;
+  return sql`
+        WITH locked_state AS MATERIALIZED (
+          SELECT contract_ready FROM comment_label_registry_state WHERE singleton = true FOR UPDATE
+        ), target_thread AS MATERIALIZED (
+          SELECT status FROM comment_threads
+          WHERE id = ${threadId} AND deleted_at IS NULL
+          FOR UPDATE
+        ), valid_kind AS MATERIALIZED (
+          SELECT 1 FROM locked_state
+          WHERE ${kind}::text IS NULL OR (contract_ready AND EXISTS (SELECT 1 FROM comment_labels WHERE key = ${kind} AND enabled AND key <> 'resolution'))
+        ), inserted_message AS (
+          INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at)
+          SELECT ${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${kind}, ${now}, ${now}
+          FROM valid_kind, target_thread WHERE target_thread.status <> 'resolved'
+          RETURNING id
+        ), touched AS (
+          UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId} AND EXISTS (SELECT 1 FROM inserted_message) RETURNING id
+        ) SELECT
+          EXISTS (SELECT 1 FROM target_thread) AS thread_exists,
+          (SELECT status FROM target_thread) AS thread_status,
+          EXISTS (SELECT 1 FROM valid_kind) AS kind_valid,
+          EXISTS (SELECT 1 FROM inserted_message, touched) AS inserted
+      `;
+}
+
+export async function readCommentSnapshot(sql: any, params: { artifactId: string; requestedVersion: number | null; pagePath: string; includeActivity: boolean }) {
+  const { artifactId, requestedVersion, pagePath, includeActivity } = params;
+  return sql`
+        WITH registry AS MATERIALIZED (
+          SELECT revision, contract_ready FROM comment_label_registry_state WHERE singleton = true
+        ), artifact_context AS MATERIALIZED (
+          SELECT current_version_id FROM artifacts WHERE id = ${artifactId}
+        ), selected_version AS MATERIALIZED (
+          SELECT ${requestedVersion}::int AS requested_seq,
+            CASE WHEN ${requestedVersion}::int IS NULL THEN (SELECT current_version_id FROM artifact_context) ELSE (SELECT id FROM artifact_versions WHERE artifact_id = ${artifactId} AND seq = ${requestedVersion}) END AS version_id,
+            CASE WHEN ${requestedVersion}::int IS NULL THEN true ELSE EXISTS (SELECT 1 FROM artifact_versions WHERE artifact_id = ${artifactId} AND seq = ${requestedVersion}) END AS found
+        ), selected_threads AS MATERIALIZED (
+          SELECT thread.* FROM comment_threads thread, selected_version selected
+          WHERE thread.artifact_id = ${artifactId} AND thread.deleted_at IS NULL
+            AND (CASE WHEN selected.requested_seq IS NULL AND selected.version_id IS NULL THEN true ELSE thread.version_id = selected.version_id END)
+        ), hydrated AS MATERIALIZED (
+          SELECT thread.id, thread.page_path, thread.created_at,
+            (to_jsonb(thread) - 'created_by_token_hash' - 'anchor_json') || jsonb_build_object(
+              'anchor', CASE WHEN thread.anchor_json IS NULL THEN NULL ELSE thread.anchor_json::jsonb END,
+              'can_delete', true, 'can_resolve', true,
+              'messages', COALESCE((
+                SELECT jsonb_agg((to_jsonb(message) - 'author_token_hash') || jsonb_build_object(
+                  'can_edit', message.deleted_at IS NULL AND thread.status <> 'resolved',
+                  'can_delete', message.deleted_at IS NULL AND NOT (message.kind = 'resolution' AND thread.status = 'resolved')
+                ) ORDER BY message.created_at ASC)
+                FROM comment_messages message WHERE message.thread_id = thread.id
+              ), '[]'::jsonb)
+            ) AS value
+          FROM selected_threads thread
+        ), labels AS MATERIALIZED (
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('key', label.key, 'label', label.label, 'description', label.description, 'color', label.color, 'enabled', label.enabled, 'position', label.position) ORDER BY label.position, label.key), '[]'::jsonb) AS value
+          FROM comment_labels label, registry WHERE registry.contract_ready AND label.key <> 'resolution'
+        )
+        SELECT registry.revision, selected.found, selected.version_id,
+          (SELECT COALESCE(MAX(seq), 0) FROM artifact_versions WHERE artifact_id = ${artifactId}) AS max_version,
+          labels.value AS comment_labels,
+          COALESCE(jsonb_agg(hydrated.value ORDER BY hydrated.created_at DESC) FILTER (WHERE hydrated.id IS NOT NULL AND (${requestedVersion}::int IS NOT NULL OR hydrated.page_path = ${pagePath})), '[]'::jsonb) AS threads,
+          COALESCE(jsonb_agg(hydrated.value ORDER BY hydrated.created_at DESC) FILTER (WHERE hydrated.id IS NOT NULL AND (${requestedVersion}::int IS NOT NULL OR ${includeActivity} OR hydrated.page_path = ${pagePath})), '[]'::jsonb) AS activity_threads
+        FROM registry CROSS JOIN selected_version selected CROSS JOIN labels LEFT JOIN hydrated ON true
+        GROUP BY registry.revision, selected.found, selected.version_id, labels.value
+      `;
+}
+
 // --- Main handler ---
 
 export default async function handler(request: Request): Promise<Response> {
@@ -1286,8 +1772,11 @@ export default async function handler(request: Request): Promise<Response> {
       });
     }
 
+    const commentLabelResponse = await handleCommentLabelRoutes(request, url);
+    if (commentLabelResponse) return commentLabelResponse;
+
     // Seed admin user in multi-tenant mode if table is empty
-    if (MULTI_TENANT) {
+    if (MULTI_TENANT && OWNER_TOKEN) {
       const sql = getSQL();
       const rows = await sql`SELECT COUNT(*)::int as c FROM users`;
       if (rows[0]?.c === 0) {
@@ -1591,75 +2080,25 @@ export default async function handler(request: Request): Promise<Response> {
       const pagePath = normalizePagePath(url.searchParams.get('pagePath') || 'index.html');
       if (pagePath instanceof Response) return pagePath;
       const includeActivity = url.searchParams.get('includeActivity') === '1';
-
       const sql = getSQL();
-
-      // Explore a specific version: ?version=<seq>. Returns the whole version's
-      // threads across every page (page_path per thread), matched strictly by
-      // version_id (no legacy-NULL fallback). Omitted => latest-only, below.
       const versionParam = url.searchParams.get('version');
-      if (versionParam !== null) {
-        const seq = Number(versionParam);
-        if (!Number.isInteger(seq) || seq < 1) return new Response('version must be a positive integer', { status: 400 });
-        const vrow = await sql`SELECT id FROM artifact_versions WHERE artifact_id = ${artifactId} AND seq = ${seq}`;
-        if (!vrow[0]) {
-          const maxRow = await sql`SELECT MAX(seq) AS max FROM artifact_versions WHERE artifact_id = ${artifactId}`;
-          const max = maxRow[0] && maxRow[0].max ? Number(maxRow[0].max) : 0;
-          return new Response(JSON.stringify({ error: 'version_not_found', seq, hint: max ? `this share has versions 1-${max}` : 'this share has no versions yet' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-        }
-        const vid = vrow[0].id;
-        const vThreads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND version_id = ${vid} AND deleted_at IS NULL ORDER BY created_at DESC`;
-        const vMessages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.version_id = ${vid} AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
-        const vHydrated = hydrateCommentThreads(vThreads, vMessages);
-        return authJson({ version: seq, versionId: vid, viewer: { authenticated: true, label: null }, threads: vHydrated, activityThreads: vHydrated });
+      const requestedVersion = versionParam === null ? null : Number(versionParam);
+      if (requestedVersion !== null && (!Number.isInteger(requestedVersion) || requestedVersion < 1)) return new Response('version must be a positive integer', { status: 400 });
+      // The complete revision/labels/threads envelope is intentionally assembled by
+      // one SQL statement, giving every response one PostgreSQL MVCC snapshot.
+      const snapshotRows = await readCommentSnapshot(sql, { artifactId, requestedVersion, pagePath, includeActivity });
+      const snapshot = snapshotRows[0];
+      if (requestedVersion !== null && !snapshot.found) {
+        const max = Number(snapshot.max_version || 0);
+        return authJson({ error: 'version_not_found', seq: requestedVersion, hint: max ? `this share has versions 1-${max}` : 'this share has no versions yet' }, { status: 404 });
       }
-
-      // Latest-only: filter to the artifact's current version. NULL current
-      // (legacy artifact, no version minted yet) => show all (no version filter).
-      const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
-      const curVid = curVerRow[0] ? curVerRow[0].vid : null;
-      const threads = await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND page_path = ${pagePath} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`;
-      const messages = await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND t.page_path = ${pagePath} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`;
-      const activityThreads = includeActivity
-        ? await sql`SELECT id, artifact_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, resolved_by_label, resolved_at, deleted_at, created_at, updated_at FROM comment_threads WHERE artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR version_id = ${curVid}) AND deleted_at IS NULL ORDER BY created_at DESC`
-        : threads;
-      const activityMessages = includeActivity
-        ? await sql`SELECT m.id, m.thread_id, m.author_token_hash, m.author_label, m.body, m.kind, m.created_at, m.updated_at, m.deleted_at, t.status as thread_status FROM comment_messages m INNER JOIN comment_threads t ON t.id = m.thread_id WHERE t.artifact_id = ${artifactId} AND (${curVid}::text IS NULL OR t.version_id = ${curVid}) AND t.deleted_at IS NULL ORDER BY m.created_at ASC`
-        : messages;
-
-      // Access is already proven (grant or owner); anyone may edit/delete/resolve.
-      const hydrateThreads = (threadRows: any[], messageRows: any[]) => {
-        const grouped = new Map();
-        for (const row of messageRows) {
-          const items = grouped.get(row.thread_id) || [];
-          const out = {
-            ...row,
-            can_edit: !row.deleted_at && row.thread_status !== 'resolved',
-            can_delete: !row.deleted_at && !(row.kind === 'resolution' && row.thread_status === 'resolved'),
-          };
-          delete out.author_token_hash; // never expose the legacy author token hash
-          items.push(out);
-          grouped.set(row.thread_id, items);
-        }
-
-        return threadRows.map((thread) => {
-          const out = {
-            ...thread,
-            anchor: thread.anchor_json ? JSON.parse(thread.anchor_json) : null,
-            can_delete: true,
-            can_resolve: true,
-            messages: grouped.get(thread.id) || [],
-          };
-          delete out.created_by_token_hash;
-          return out;
-        });
-      };
-
       return authJson({
-        pagePath,
+        ...(requestedVersion === null ? { pagePath } : { version: requestedVersion, versionId: snapshot.version_id }),
         viewer: { authenticated: true, label: null },
-        threads: hydrateThreads(threads, messages),
-        activityThreads: hydrateThreads(activityThreads, activityMessages),
+        commentLabelRevision: Number(snapshot.revision),
+        commentLabels: snapshot.comment_labels || [],
+        threads: snapshot.threads || [],
+        activityThreads: snapshot.activity_threads || [],
       });
     }
 
@@ -1680,12 +2119,22 @@ export default async function handler(request: Request): Promise<Response> {
       const now = Math.floor(Date.now() / 1000);
       const threadId = generateId();
       const messageId = generateId();
-      const curVerRow = await sql`SELECT current_version_id AS vid FROM artifacts WHERE id = ${artifactId}`;
-      const versionId = curVerRow[0] ? curVerRow[0].vid : null;
-      await sql.transaction((tx) => [
-        tx`INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at) VALUES (${threadId}, ${artifactId}, ${versionId}, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now})`,
-        tx`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${normalized.body}, ${kind}, ${now}, ${now})`,
-      ]);
+      const inserted = await sql`
+        WITH locked_state AS MATERIALIZED (
+          SELECT contract_ready FROM comment_label_registry_state WHERE singleton = true FOR UPDATE
+        ), valid_kind AS MATERIALIZED (
+          SELECT 1 FROM locked_state
+          WHERE ${kind}::text IS NULL OR (contract_ready AND EXISTS (SELECT 1 FROM comment_labels WHERE key = ${kind} AND enabled AND key <> 'resolution'))
+        ), inserted_thread AS (
+          INSERT INTO comment_threads (id, artifact_id, version_id, page_path, created_by_token_hash, created_by_label, scope_type, anchor_json, status, created_at, updated_at)
+          SELECT ${threadId}, ${artifactId}, artifact.current_version_id, ${normalized.pagePath}, ${NO_TOKEN}, ${name}, ${normalized.scopeType}, ${normalized.anchorJson}, 'open', ${now}, ${now}
+          FROM artifacts artifact, valid_kind WHERE artifact.id = ${artifactId} RETURNING id
+        ), inserted_message AS (
+          INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at)
+          SELECT ${messageId}, id, ${NO_TOKEN}, ${name}, ${normalized.body}, ${kind}, ${now}, ${now} FROM inserted_thread RETURNING id
+        ) SELECT inserted_thread.id, inserted_message.id AS message_id FROM inserted_thread, inserted_message
+      `;
+      if (!inserted[0]) return new Response('Invalid comment kind', { status: 400 });
       return authJson({
         id: threadId,
         messageId,
@@ -1740,10 +2189,10 @@ export default async function handler(request: Request): Promise<Response> {
 
       const now = Math.floor(Date.now() / 1000);
       const messageId = generateId();
-      await sql.transaction((tx) => [
-        tx`INSERT INTO comment_messages (id, thread_id, author_token_hash, author_label, body, kind, created_at, updated_at) VALUES (${messageId}, ${threadId}, ${NO_TOKEN}, ${name}, ${message}, ${kind}, ${now}, ${now})`,
-        tx`UPDATE comment_threads SET updated_at = ${now} WHERE id = ${threadId}`,
-      ]);
+      const inserted = await insertCommentReply(sql, { threadId, messageId, name, message, kind, now });
+      if (!inserted[0]?.thread_exists) return new Response('Not found', { status: 404 });
+      if (inserted[0].thread_status === 'resolved') return new Response('Resolved comments cannot receive replies', { status: 409 });
+      if (!inserted[0].kind_valid || !inserted[0].inserted) return new Response('Invalid comment kind', { status: 400 });
       return authJson({
         id: messageId,
         threadId,

@@ -128,4 +128,50 @@ describe('TossAPI', () => {
       })
     );
   });
+
+  it('lists comment labels from /comment-labels and normalizes the label envelope', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ commentLabelRevision: 3, commentLabels: [{ key: 'risk' }] }),
+    } as Response);
+    await expect(api.getCommentLabels()).resolves.toEqual({ revision: 3, labels: [{ key: 'risk' }] });
+    expect(fetch).toHaveBeenCalledWith('https://toss-test.workers.dev/comment-labels', expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: `Bearer ${TEST_CONFIG.token}` }),
+    }));
+  });
+
+  it('sends expectedRevision on every focused comment-label mutation', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '{"commentLabelRevision":8,"commentLabels":[]}' } as Response);
+    const label = { key: 'risk', label: 'Risk', description: '', color: '#AABBCC', enabled: true };
+    await api.createCommentLabel(7, label);
+    await api.updateCommentLabel('risk', 8, { enabled: false });
+    await api.deleteCommentLabel('risk', 9);
+    await api.reorderCommentLabels(10, ['question', 'risk']);
+    expect(fetch).toHaveBeenNthCalledWith(1, 'https://toss-test.workers.dev/comment-labels', expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedRevision: 7, commentLabel: label }) }));
+    expect(fetch).toHaveBeenNthCalledWith(2, 'https://toss-test.workers.dev/comment-labels/risk', expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ expectedRevision: 8, changes: { enabled: false } }) }));
+    expect(fetch).toHaveBeenNthCalledWith(3, 'https://toss-test.workers.dev/comment-labels/risk', expect.objectContaining({ method: 'DELETE', body: JSON.stringify({ expectedRevision: 9 }) }));
+    expect(fetch).toHaveBeenNthCalledWith(4, 'https://toss-test.workers.dev/comment-labels/order', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ expectedRevision: 10, keys: ['question', 'risk'] }) }));
+  });
+
+  it('previews then revision-binds apply and clear', async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '{"commentLabelRevision":4,"commentLabels":[]}' } as Response);
+    const document = { $schema: 'toss/comment-labels@v1' as const, version: 1 as const, commentLabels: [] };
+    await api.previewCommentLabelApply(document);
+    await api.applyCommentLabels(4, document);
+    await api.previewCommentLabelClear();
+    await api.clearCommentLabels(5);
+    expect(fetch).toHaveBeenNthCalledWith(1, 'https://toss-test.workers.dev/comment-labels/apply?dryRun=1', expect.objectContaining({ body: JSON.stringify({ document }) }));
+    expect(fetch).toHaveBeenNthCalledWith(2, 'https://toss-test.workers.dev/comment-labels/apply', expect.objectContaining({ body: JSON.stringify({ expectedRevision: 4, document }) }));
+    expect(fetch).toHaveBeenNthCalledWith(3, 'https://toss-test.workers.dev/comment-labels/clear?dryRun=1', expect.objectContaining({ method: 'POST' }));
+    expect(fetch).toHaveBeenNthCalledWith(4, 'https://toss-test.workers.dev/comment-labels/clear', expect.objectContaining({ body: JSON.stringify({ expectedRevision: 5 }) }));
+  });
+
+  it('retains structured comment-label API errors and rejects malformed success JSON', async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce({
+      ok: false, status: 409, text: async () => JSON.stringify({ error: 'stale_comment_label_registry', hint: 'Read again.' }),
+    } as Response).mockResolvedValueOnce({ ok: true, status: 200, text: async () => 'not json' } as Response);
+    await expect(api.getCommentLabels()).rejects.toMatchObject({ status: 409, details: { error: 'stale_comment_label_registry', hint: 'Read again.' } });
+    await expect(api.getCommentLabels()).rejects.toThrow('returned invalid JSON');
+  });
 });

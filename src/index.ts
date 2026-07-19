@@ -18,6 +18,18 @@ import { getCommandOptions } from './lib/cli-options.js';
 import { whoamiCommand } from './commands/whoami.js';
 import { membersListCommand } from './commands/members.js';
 import { cleanupCommand } from './commands/cleanup.js';
+import {
+  commentLabelsApplyCommand,
+  commentLabelsClearCommand,
+  commentLabelsCreateCommand,
+  commentLabelsDeleteCommand,
+  commentLabelsEditCommand,
+  commentLabelsExportCommand,
+  commentLabelsListCommand,
+  commentLabelsReorderCommand,
+  commentLabelsSetEnabledCommand,
+  commentLabelsTemplateCommand,
+} from './commands/comment-labels.js';
 import { BackendValidationError, getBackendHandler, resolveBackendForCommand, resolveBackendForSetup } from './lib/backend-router.js';
 
 async function withBackendErrors<T>(fn: () => Promise<T>): Promise<T | void> {
@@ -162,12 +174,12 @@ program
   .description('List a share\'s comments (no state), or enable/disable them (state: on|off)')
   .option('-j, --json', 'Output comments as JSON (list mode)')
   .option('--seq <n>', 'List comments on a specific version, by its seq from `toss versions` (default: latest)')
-  .option('--type <kind>', 'Only show messages of kind: note|blocker|concern|question|action|nit|resolution')
+  .option('--label <key>', 'Only show messages with this configured comment-label key')
+  .option('--unlabeled', 'Only show messages without a comment label')
   .option('--status <status>', 'Only show threads with status: open|resolved')
-  .option('--check', 'Set exit status 1 if any open thread contains a non-deleted blocker (ignores filters)')
   .option('--password-env <key>', 'For a doc you don\'t own: read its password from this env var / .env key (value never in args)')
   .option('--profile <name>', 'Use a specific profile')
-  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'seq', 'type', 'status', 'check', 'passwordEnv', 'profile'])));
+  .action((slug, state, ...args) => commentsCommand(slug, state, getCommandOptions(args, ['json', 'seq', 'label', 'unlabeled', 'status', 'passwordEnv', 'profile'])));
 
 program
   .command('versions <slug>')
@@ -275,6 +287,88 @@ admin
   .option('--profile <name>', 'Use a specific owner profile')
   .option('-y, --yes', 'Skip confirmation')
   .action((...args) => cleanupCommand(getCommandOptions(args, ['profile', 'yes'])));
+
+const commentLabels = admin
+  .command('comment-labels')
+  .description('Manage instance comment labels (Vercel owner profiles only)');
+
+commentLabels.command('list')
+  .description('List configured comment labels and the current revision')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-j, --json', 'Output one JSON envelope')
+  .action((...args) => commentLabelsListCommand(getCommandOptions(args, ['profile', 'json'])));
+
+commentLabels.command('create')
+  .description('Create a comment label')
+  .option('--key <key>', 'Stable lowercase key')
+  .option('--label <label>', 'Human-readable label')
+  .option('--description <text>', 'Description (may be empty)')
+  .option('--color <hex>', 'Decorative color (#RRGGBB)')
+  .option('--enabled <boolean>', 'Whether the label is selectable')
+  .option('--position <n>', 'Picker position (defaults to append)')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-j, --json', 'Output one JSON envelope; requires complete non-interactive field flags')
+  .action((...args) => commentLabelsCreateCommand(getCommandOptions(args, ['key', 'label', 'description', 'color', 'enabled', 'position', 'profile', 'json'])));
+
+commentLabels.command('edit <key>')
+  .description('Edit a comment label (keys are immutable)')
+  .option('--label <label>', 'Human-readable label')
+  .option('--description <text>', 'Description (may be empty)')
+  .option('--color <hex>', 'Decorative color (#RRGGBB)')
+  .option('--enabled <boolean>', 'Whether the label is selectable')
+  .option('--position <n>', 'Picker position')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-j, --json', 'Output one JSON envelope; requires at least one non-interactive change flag')
+  .action((key, ...args) => commentLabelsEditCommand(key, getCommandOptions(args, ['label', 'description', 'color', 'enabled', 'position', 'profile', 'json'])));
+
+for (const enabled of [true, false]) {
+  const name = enabled ? 'enable' : 'disable';
+  commentLabels.command(`${name} <key>`)
+    .description(`${enabled ? 'Enable' : 'Disable'} a comment label`)
+    .option('--profile <name>', 'Use a specific owner profile')
+    .option('-j, --json', 'Output one JSON envelope')
+    .action((key, ...args) => commentLabelsSetEnabledCommand(key, enabled, getCommandOptions(args, ['profile', 'json'])));
+}
+
+commentLabels.command('delete <key>')
+  .description('Delete an unused comment label')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-y, --yes', 'Skip confirmation')
+  .option('-j, --json', 'Output one JSON envelope; requires --yes')
+  .action((key, ...args) => commentLabelsDeleteCommand(key, getCommandOptions(args, ['profile', 'yes', 'json'])));
+
+commentLabels.command('reorder [keys...]')
+  .description('Set the complete comment-label order')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-j, --json', 'Output one JSON envelope; requires every key as an argument')
+  .action((keys, ...args) => commentLabelsReorderCommand(keys || [], getCommandOptions(args, ['profile', 'json'])));
+
+commentLabels.command('template [file]')
+  .description('Write an empty toss/comment-labels@v1 template')
+  .option('-f, --force', 'Overwrite an existing file')
+  .action((file, ...args) => commentLabelsTemplateCommand(file, getCommandOptions(args, ['force'])));
+
+commentLabels.command('export [file]')
+  .description('Export the complete comment-label registry')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('-f, --force', 'Overwrite an existing file')
+  .action((file, ...args) => commentLabelsExportCommand(file, getCommandOptions(args, ['profile', 'force'])));
+
+commentLabels.command('apply <file>')
+  .description('Preview or apply a merge-only comment-label document (use - for stdin)')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('--dry-run', 'Preview without mutation')
+  .option('-y, --yes', 'Apply without prompting')
+  .option('-j, --json', 'Output one JSON object; requires --dry-run or --yes')
+  .action((file, ...args) => commentLabelsApplyCommand(file, getCommandOptions(args, ['profile', 'dryRun', 'yes', 'json'])));
+
+commentLabels.command('clear')
+  .description('Safely empty selectable labels (delete unused, disable in-use)')
+  .option('--profile <name>', 'Use a specific owner profile')
+  .option('--dry-run', 'Preview without mutation')
+  .option('-y, --yes', 'Clear without prompting')
+  .option('-j, --json', 'Output one JSON object; requires --dry-run or --yes')
+  .action((...args) => commentLabelsClearCommand(getCommandOptions(args, ['profile', 'dryRun', 'yes', 'json'])));
 
 const token = admin
   .command('token')

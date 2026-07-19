@@ -74,18 +74,53 @@ describe('comments argument name (CLI)', () => {
     expect(stderr).not.toContain("missing required argument 'id'");
   }, 20000);
 
-  it('registers feedback filtering and check options in help', () => {
+  it('registers dynamic label filtering without hard-coded review semantics', () => {
     try {
       const stdout = execFileSync(resolve(REPO_ROOT, 'node_modules/.bin/tsx'), [resolve(REPO_ROOT, 'src/index.ts'), 'comments', '--help'], {
         cwd: REPO_ROOT,
         stdio: ['ignore', 'pipe', 'pipe'],
         encoding: 'utf-8',
       });
-      expect(stdout).toContain('--type <kind>');
+      expect(stdout).toContain('--label <key>');
+      expect(stdout).toContain('--unlabeled');
       expect(stdout).toContain('--status <status>');
-      expect(stdout).toContain('--check');
+      expect(stdout).not.toContain('--type');
+      expect(stdout).not.toContain('--check');
     } catch (err) {
       throw new Error(`comments --help failed: ${String(err)}`);
     }
+  }, 20000);
+});
+
+describe('comment-label command tree (CLI)', () => {
+  function help(args: string[]): string {
+    return execFileSync(resolve(REPO_ROOT, 'node_modules/.bin/tsx'), [resolve(REPO_ROOT, 'src/index.ts'), ...args, '--help'], {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+  }
+
+  it('registers the complete owner workflow with label terminology', () => {
+    const stdout = help(['admin', 'comment-labels']);
+    for (const command of ['list', 'create', 'edit', 'enable', 'disable', 'delete', 'reorder', 'template', 'export', 'apply', 'clear']) {
+      expect(stdout).toContain(command);
+    }
+    expect(stdout).not.toMatch(/\breset\b/);
+    expect(stdout).not.toMatch(/\breplace\b/);
+    expect(stdout).not.toMatch(/\breassign/);
+    expect(stdout).not.toContain('comment-types');
+  }, 20000);
+
+  it('documents merge apply modes and does not register replace', () => {
+    const stdout = help(['admin', 'comment-labels', 'apply']);
+    expect(stdout).toContain('--dry-run');
+    expect(stdout).toContain('--yes');
+    expect(stdout).toContain('--json');
+    expect(stdout).not.toContain('--replace');
+  }, 20000);
+
+  it('uses toss/comment-labels@v1 in template help', () => {
+    expect(help(['admin', 'comment-labels', 'template'])).toContain('toss/comment-labels@v1');
   }, 20000);
 });

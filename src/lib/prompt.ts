@@ -80,6 +80,24 @@ export async function promptConfirm(q: string, defaultYes = true): Promise<boole
   return answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes';
 }
 
+export async function promptDefault(q: string, defaultValue: string): Promise<string> {
+  const answer = await prompt(`${q}${defaultValue ? ` [${defaultValue}]` : ''}: `);
+  return answer || defaultValue;
+}
+
+export async function promptValidated(
+  q: string,
+  validate: (value: string) => string,
+  defaultValue = ''
+): Promise<string> {
+  try {
+    return validate(await promptDefault(q, defaultValue));
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    return promptValidated(q, validate, defaultValue);
+  }
+}
+
 export async function promptSelect<T extends string>(q: string, choices: { label: string; value: T }[]): Promise<T> {
   console.log();
   console.log(q);

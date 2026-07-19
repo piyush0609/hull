@@ -105,6 +105,60 @@ toss profile list
 toss profile show
 ```
 
+### Comments and comment labels
+
+Comment labels are optional, instance-configured metadata. Comments are unlabeled by
+default; there are no built-in review labels or blocker semantics. Comment-label
+management is available only to owners of Vercel-backed profiles.
+
+```bash
+# Read comments and filter using the target instance's current label keys
+toss comments <id-or-slug>
+toss comments <id-or-slug> --label release-risk
+toss comments <id-or-slug> --unlabeled
+toss comments <id-or-slug> --status open --json
+
+# Owner management
+toss admin comment-labels list --profile owner
+toss admin comment-labels create --profile owner
+toss admin comment-labels edit release-risk --profile owner
+toss admin comment-labels disable release-risk --profile owner
+toss admin comment-labels enable release-risk --profile owner
+toss admin comment-labels reorder release-risk question --profile owner
+```
+
+Every mutation reads and submits the current registry revision. If another owner
+changes the registry first, the command stops with a stale-revision conflict instead
+of retrying against data you did not review. Colors accept case-insensitive six-digit
+hex and are stored/exported as canonical uppercase `#RRGGBB`.
+
+For version-controlled or automated configuration, use the
+`toss/comment-labels@v1` JSON format:
+
+```bash
+toss admin comment-labels template toss.comment-labels.json
+# Edit the initially empty "commentLabels" array.
+toss admin comment-labels apply toss.comment-labels.json --dry-run
+toss admin comment-labels apply toss.comment-labels.json --yes
+toss admin comment-labels export current-labels.json --profile owner
+cat toss.comment-labels.json | toss admin comment-labels apply - --json --dry-run
+```
+
+Apply is merge-only: included keys are created or updated and omitted keys remain
+untouched. There is no replace/reset/reassignment mode. `delete` works only for an
+unused label; disable an in-use label to preserve historical display. `clear` safely
+deletes unused labels and disables in-use labels, leaving comment history intact:
+
+```bash
+toss admin comment-labels clear --profile owner --dry-run
+toss admin comment-labels clear --profile owner --yes
+```
+
+`comments --json` preserves the complete server envelope, including
+`commentLabels`, `commentLabelRevision`, nullable message `kind` values, and future
+top-level fields. On Cloudflare or older servers without label metadata, filtering
+uses exact raw stored keys and does not invent labels or policy.
+
 ## Setup
 
 If you are the owner, setup is a two-step flow:
@@ -258,6 +312,42 @@ It sets up or reuses:
 - Postgres wiring
 - Blob storage wiring
 - deployed endpoint
+
+Vercel deploys install the committed template dependencies with `npm ci`, apply the
+database expansion before promotion, then apply the contract migration after the
+compatible deployment is promoted. The migration runner pins `pg` 8.22.0. Do not run
+the contract phase before promotion. `--skip-migrate` is accepted only after the
+schema probe proves expansion is already present, and it never skips the post-promotion
+contract/probe sequence.
+
+Migration TLS preserves certificate verification for `sslmode=require`,
+`verify-ca`, and `verify-full`; `disable` explicitly turns TLS off. The explicit
+`no-verify` mode is the only mode mapped to `rejectUnauthorized: false`, while
+`allow`/`prefer` are left to the pinned `pg` connection-string parser rather than
+being collapsed into a boolean override. With the current pinned parser they retain
+its documented secure alias behavior; callers that intentionally want libpq fallback
+semantics must opt into those URL semantics explicitly.
+
+### Dedicated PostgreSQL migration tests
+
+The comment-label migration suite is gated and must run only against a dedicated,
+non-production PostgreSQL database. It never falls back to `DATABASE_URL` or
+`POSTGRES_URL`. Set all three matching designations:
+
+```bash
+export TOSS_TEST_DATABASE_URL='postgresql://.../toss_migration_test?sslmode=verify-full'
+export TOSS_TEST_DATABASE_HOST='the-exact-host-from-the-url'
+export TOSS_TEST_DATABASE_NAME='toss_migration_test'
+npm run test:postgres:comment-labels
+```
+
+The command runs the one integration file sequentially with fork isolation, one
+worker, and no file parallelism. The harness first verifies the exact URL host and
+database name, rejects production-like designations, fingerprints `public` read-only,
+creates one unique test schema, uses only transaction-local search paths, and drops
+only that schema in `finally`. It then reconnects and proves the original search path
+and `public` fingerprint are unchanged. Never point these variables at a deployed or
+production database, and never substitute general application database variables.
 
 ### If you already have Vercel ready
 
