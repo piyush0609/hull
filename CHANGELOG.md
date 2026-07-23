@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.2](https://github.com/piyush0609/toss/compare/v0.4.1...v0.4.2) (2026-07-23)
+
+### Features
+
+* **comments:** add attributed review types ([#19](https://github.com/piyush0609/toss/issues/19)) ([2a2bcae](https://github.com/piyush0609/toss/commit/2a2bcaed8d0c15136720509393ecc237ab639e6d))
+* **comments:** configure optional comment labels ([#20](https://github.com/piyush0609/toss/issues/20)) ([bf10d2e](https://github.com/piyush0609/toss/commit/bf10d2e31caa79b61a2a1c61114245aa4bb91814))
+
+### Bug Fixes
+
+* harden password-protected share sessions ([#21](https://github.com/piyush0609/toss/issues/21)) ([74f30fa](https://github.com/piyush0609/toss/commit/74f30fa8d56df5bfcf59601968ecc876aa42bd39))
 ## [0.4.1](https://github.com/piyush0609/toss/compare/v0.4.0...v0.4.1) (2026-07-16)
 
 
