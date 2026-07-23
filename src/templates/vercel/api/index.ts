@@ -30,10 +30,19 @@ async function signJWT(payload: Record<string, unknown>, secret: string): Promis
 async function verifyJWT(token: string, secret: string): Promise<Record<string, unknown>> {
   const [h, b, s] = token.split('.');
   if (!h || !b || !s) throw new Error('Invalid token format');
-  let payload: string, sigData: string;
+  let payload: string, sigData: string, header: string;
   try {
+    header = b64urlDecode(h);
     payload = b64urlDecode(b);
     sigData = b64urlDecode(s);
+  } catch { throw new Error('Invalid token format'); }
+  // Pin the algorithm: we only ever issue HS256. Asserting it here rejects any
+  // token whose header claims a different alg (e.g. "none" or "HS512"), so the
+  // verifier can never be tricked into skipping or mismatching the HMAC check.
+  try {
+    if ((JSON.parse(header) as { alg?: string }).alg !== 'HS256') {
+      throw new Error('Unexpected token algorithm');
+    }
   } catch { throw new Error('Invalid token format'); }
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -103,6 +112,70 @@ function readArtifactJWT(payload: Record<string, unknown>, now = nowSeconds()): 
     return { expiresAt: payload.exp };
   }
   return null;
+}
+
+// --- Password-session primitives ---
+// A password-session cookie replaces the legacy forgeable `toss_pwd_<slug>=1`
+// value with a signed JWT. Sessions live at most 24h and never past the
+// artifact's own expiry; pwd_epoch ties them to the current password so a
+// re-share invalidates outstanding sessions.
+const PASSWORD_SESSION_MAX_AGE = 24 * 3600;
+
+// Cap the session lifetime like issueCommentGrant. Returns exp given a fixed now.
+function passwordSessionExp(expiresAt: number, now: number): number {
+  const cap = now + PASSWORD_SESSION_MAX_AGE;
+  return expiresAt === PERMANENT ? cap : Math.min(cap, expiresAt);
+}
+
+// Issue the signed session token AND the matching cookie Max-Age from ONE now/exp
+// pair, so token exp and cookie lifetime can never diverge across a second tick.
+async function issuePasswordSession(
+  artifactId: string, expiresAt: number, secret: string, epoch: number,
+): Promise<{ token: string; maxAge: number }> {
+  const now = nowSeconds();
+  const exp = passwordSessionExp(expiresAt, now);
+  const token = await signJWT({ sub: artifactId, aud: 'password-session', pwd_epoch: epoch, iat: now, exp }, secret);
+  return { token, maxAge: Math.max(0, exp - now) };
+}
+
+// Exact-name cookie parse. Split on ';', trim each segment, exact-key compare.
+function readCookie(header: string | null, name: string): string | null {
+  if (!header) return null;
+  for (const raw of header.split(';')) {
+    const part = raw.trim();
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq) === name) return part.slice(eq + 1);
+  }
+  return null;
+}
+
+// Strict claim check against the current DB row.
+function isSafeInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v);
+}
+async function verifyPasswordSession(
+  token: string, artifactId: string, epoch: number, secret: string,
+): Promise<boolean> {
+  try {
+    const payload = await verifyJWT(token, secret);
+    if (payload.aud !== 'password-session') return false;
+    if (payload.sub !== artifactId) return false;
+    if (!isSafeInt(payload.iat)) return false;
+    if (!isSafeInt(payload.exp) || payload.exp <= nowSeconds()) return false; // reject exp === now
+    if (!isSafeInt(payload.pwd_epoch) || payload.pwd_epoch !== epoch) return false; // exact equality, no ||0
+    return true;
+  } catch {
+    return false;
+  }
+}
+// Exported for tests: assert a session token's validity against a specific epoch,
+// and mint one, without going through the full HTTP route.
+export { verifyPasswordSession as verifyPasswordSessionForTests, issuePasswordSession as issuePasswordSessionForTests };
+
+// A signing key shorter than 32 UTF-8 bytes is too weak to trust; protected
+// shares fail closed with a 500 rather than issuing a forgeable session.
+function passwordSessionSecretUsable(secret: string | undefined): boolean {
+  return !!secret && new TextEncoder().encode(secret).byteLength >= 32;
 }
 
 // --- Config from env ---
@@ -643,7 +716,7 @@ async function mintVersion(
       FROM inserted_version
     `,
     artifactUpdate
-      ? tx`UPDATE artifacts SET name = ${artifactUpdate.name}, size_bytes = ${artifactUpdate.sizeBytes}, expires_at = ${artifactUpdate.expiresAt}, password_hash = ${artifactUpdate.passwordHash}, current_version_id = ${versionId} WHERE id = ${artifactId} AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ${versionId}) RETURNING id`
+      ? tx`UPDATE artifacts SET name = ${artifactUpdate.name}, size_bytes = ${artifactUpdate.sizeBytes}, expires_at = ${artifactUpdate.expiresAt}, password_epoch = password_epoch + CASE WHEN password_hash IS DISTINCT FROM ${artifactUpdate.passwordHash} THEN 1 ELSE 0 END, password_hash = ${artifactUpdate.passwordHash}, current_version_id = ${versionId} WHERE id = ${artifactId} AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ${versionId}) RETURNING id`
       : tx`UPDATE artifacts SET current_version_id = ${versionId} WHERE id = ${artifactId} AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ${versionId}) RETURNING id`,
   ]);
   if (!results[0]?.[0] || !results[1]?.[0] || !results[2]?.[0]) {
@@ -1889,7 +1962,7 @@ export default async function handler(request: Request): Promise<Response> {
               throw error;
             }
           } else {
-            await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${sizeBytes}, expires_at = ${newExpiresAt}, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
+            await sql`UPDATE artifacts SET name = ${name}, size_bytes = ${sizeBytes}, expires_at = ${newExpiresAt}, password_epoch = password_epoch + CASE WHEN password_hash IS DISTINCT FROM ${newPasswordHash} THEN 1 ELSE 0 END, password_hash = ${newPasswordHash} WHERE id = ${existingId}`;
           }
           const shortUrl = `${url.origin}/s/${requestedId}`;
           return new Response(JSON.stringify({ id: existingId, slug: requestedId, url: shortUrl, legacyUrl: '', updated: true }), {
@@ -2360,7 +2433,7 @@ export default async function handler(request: Request): Promise<Response> {
     if (slugMatch) {
       const slug = slugMatch[1];
       const sql = getSQL();
-      const rows = await sql`SELECT id, expires_at, password_hash FROM artifacts WHERE slug = ${slug}`;
+      const rows = await sql`SELECT id, expires_at, password_hash, password_epoch FROM artifacts WHERE slug = ${slug}`;
 
       if (!rows[0]) return new Response('Not found', { status: 404 });
 
@@ -2377,9 +2450,16 @@ export default async function handler(request: Request): Promise<Response> {
       }
 
       if (rows[0].password_hash) {
+        // Fail closed if the signing key is too weak to issue a session.
+        if (!passwordSessionSecretUsable(JWT_SECRET)) {
+          return new Response('Server misconfigured', { status: 500 });
+        }
         const cookieName = `toss_pwd_${slug}`;
-        const cookies = request.headers.get('Cookie') || '';
-        const hasSession = cookies.includes(`${cookieName}=1`);
+        const sessionCookie = readCookie(request.headers.get('Cookie'), cookieName);
+        const rowEpoch = Number.isSafeInteger(Number(rows[0].password_epoch)) ? Number(rows[0].password_epoch) : 0;
+        const hasSession = sessionCookie
+          ? await verifyPasswordSession(sessionCookie, rows[0].id, rowEpoch, JWT_SECRET)
+          : false;
 
         if (!hasSession) {
           if (request.method === 'POST') {
@@ -2388,14 +2468,14 @@ export default async function handler(request: Request): Promise<Response> {
             const providedHash = password ? await sha256(password + rows[0].id) : '';
 
             if (constantTimeEqual(providedHash, rows[0].password_hash)) {
-              // Correct password: redirect with a session cookie scoped to
-              // this share's lifetime (capped at 30d for permanent shares).
-              const maxAge = artifactCookieMaxAge(rows[0].expires_at);
+              // Correct password: redirect with a signed session cookie scoped
+              // to this share's lifetime (capped at 24h; never past expiry).
+              const { token, maxAge } = await issuePasswordSession(rows[0].id, rows[0].expires_at, JWT_SECRET, rowEpoch);
               return new Response(null, {
                 status: 302,
                 headers: {
                   Location: `${url.origin}/s/${slug}/`,
-                  'Set-Cookie': `${cookieName}=1; Path=/s/${slug}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`,
+                  'Set-Cookie': `${cookieName}=${token}; Path=/s/${slug}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`,
                 },
               });
             }
