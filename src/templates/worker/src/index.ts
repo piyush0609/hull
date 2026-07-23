@@ -67,6 +67,69 @@ function readArtifactJWT(payload: Record<string, unknown>, now = nowSeconds()): 
   return null;
 }
 
+// --- Password-session primitives ---
+// A password-session cookie replaces the legacy forgeable `toss_pwd_<slug>=1`
+// value with a signed JWT. Sessions live at most 24h and never past the
+// artifact's own expiry; pwd_epoch ties them to the current password so a
+// re-share invalidates outstanding sessions.
+const PASSWORD_SESSION_MAX_AGE = 24 * 3600;
+
+// Cap the session lifetime like issueCommentGrant. Returns exp given a fixed now.
+function passwordSessionExp(expiresAt: number, now: number): number {
+  const cap = now + PASSWORD_SESSION_MAX_AGE;
+  return expiresAt === PERMANENT ? cap : Math.min(cap, expiresAt);
+}
+
+// Issue the signed session token AND the matching cookie Max-Age from ONE now/exp
+// pair, so token exp and cookie lifetime can never diverge across a second tick.
+async function issuePasswordSession(
+  artifactId: string, expiresAt: number, secret: string, epoch: number,
+): Promise<{ token: string; maxAge: number }> {
+  const now = nowSeconds();
+  const exp = passwordSessionExp(expiresAt, now);
+  const token = await signJWT({ sub: artifactId, aud: 'password-session', pwd_epoch: epoch, iat: now, exp }, secret);
+  return { token, maxAge: Math.max(0, exp - now) };
+}
+
+// Exact-name cookie parse. Split on ';', trim each segment, exact-key compare.
+function readCookie(header: string | null, name: string): string | null {
+  if (!header) return null;
+  for (const raw of header.split(';')) {
+    const part = raw.trim();
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq) === name) return part.slice(eq + 1);
+  }
+  return null;
+}
+
+// Strict claim check against the current DB row.
+function isSafeInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v);
+}
+async function verifyPasswordSession(
+  token: string, artifactId: string, epoch: number, secret: string,
+): Promise<boolean> {
+  try {
+    const payload = await verifyJWT(token, secret);
+    if (payload.aud !== 'password-session') return false;
+    if (payload.sub !== artifactId) return false;
+    if (!isSafeInt(payload.iat)) return false;
+    if (!isSafeInt(payload.exp) || payload.exp <= nowSeconds()) return false; // reject exp === now
+    if (!isSafeInt(payload.pwd_epoch) || payload.pwd_epoch !== epoch) return false; // exact equality, no ||0
+    return true;
+  } catch {
+    return false;
+  }
+}
+// Exported for tests: assert a session token's validity against a specific epoch.
+export { verifyPasswordSession as verifyPasswordSessionForTests };
+
+// A signing key shorter than 32 UTF-8 bytes is too weak to trust; protected
+// shares fail closed with a 500 rather than issuing a forgeable session.
+function passwordSessionSecretUsable(secret: string | undefined): boolean {
+  return !!secret && new TextEncoder().encode(secret).byteLength >= 32;
+}
+
 // --- Crypto helpers ---
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -428,10 +491,20 @@ async function mintVersion(
     ).bind(versionId, artifactId, versionId, artifactId, seq));
   }
   publishStatements.push(env.TOSS_DB.prepare(
-    'UPDATE artifacts SET current_version_id = ?, name = ?, size_bytes = ?, expires_at = ?, password_hash = ? WHERE id = ? AND ((current_version_id = ?) OR (current_version_id IS NULL AND ? IS NULL)) AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ? AND artifact_id = ? AND seq = ?)'
+    'UPDATE artifacts SET current_version_id = ?, name = ?, size_bytes = ?, expires_at = ?, password_epoch = password_epoch + CASE WHEN password_hash IS ? THEN 0 ELSE 1 END, password_hash = ? WHERE id = ? AND ((current_version_id = ?) OR (current_version_id IS NULL AND ? IS NULL)) AND EXISTS (SELECT 1 FROM artifact_versions WHERE id = ? AND artifact_id = ? AND seq = ?)'
   ).bind(
-    versionId, metadata.name, metadata.sizeBytes, metadata.expiresAt, metadata.passwordHash,
-    artifactId, previousVersionId, previousVersionId, versionId, artifactId, seq,
+    versionId,               // 0: current_version_id = ?
+    metadata.name,           // 1: name = ?
+    metadata.sizeBytes,      // 2: size_bytes = ?
+    metadata.expiresAt,      // 3: expires_at = ?
+    metadata.passwordHash,   // 4: CASE WHEN password_hash IS ?  (comparison hash)
+    metadata.passwordHash,   // 5: password_hash = ?             (assignment hash)
+    artifactId,              // 6: WHERE id = ?
+    previousVersionId,       // 7: (current_version_id = ?)
+    previousVersionId,       // 8: (current_version_id IS NULL AND ? IS NULL)
+    versionId,               // 9: EXISTS ... id = ?
+    artifactId,              // 10: EXISTS ... artifact_id = ?
+    seq,                     // 11: EXISTS ... seq = ?
   ));
 
   try {
@@ -3076,12 +3149,15 @@ export default {
       const slugMatch = url.pathname.match(/^\/s\/([a-zA-Z0-9-]+)(?:\/(.*))?$/);
       if (slugMatch) {
         const slug = slugMatch[1];
-        if (!url.pathname.endsWith('/') && slugMatch[2] === undefined) {
+        // Only GET/HEAD redirect to the canonical trailing-slash form; the
+        // bare-path password form POST must reach validation below (matches Vercel).
+        if (!url.pathname.endsWith('/') && slugMatch[2] === undefined
+          && (request.method === 'GET' || request.method === 'HEAD')) {
           return Response.redirect(`${url.origin}${url.pathname}/`, 302);
         }
         const row = await env.TOSS_DB.prepare(
-          'SELECT id, expires_at, password_hash, current_version_id FROM artifacts WHERE slug = ?'
-        ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null; current_version_id: string | null }>();
+          'SELECT id, expires_at, password_hash, current_version_id, password_epoch FROM artifacts WHERE slug = ?'
+        ).bind(slug).first<{ id: string; expires_at: number; password_hash: string | null; current_version_id: string | null; password_epoch: number | null }>();
 
         if (!row) return new Response('Not found', { status: 404 });
 
@@ -3091,9 +3167,16 @@ export default {
 
         // Password check
         if (row.password_hash) {
+          // Fail closed if the signing key is too weak to issue a session.
+          if (!passwordSessionSecretUsable(env.JWT_SECRET)) {
+            return new Response('Server misconfigured', { status: 500 });
+          }
           const cookieName = `toss_pwd_${slug}`;
-          const cookies = request.headers.get('Cookie') || '';
-          const hasSession = cookies.includes(`${cookieName}=1`);
+          const sessionCookie = readCookie(request.headers.get('Cookie'), cookieName);
+          const rowEpoch = Number.isSafeInteger(Number(row.password_epoch)) ? Number(row.password_epoch) : 0;
+          const hasSession = sessionCookie
+            ? await verifyPasswordSession(sessionCookie, row.id, rowEpoch, env.JWT_SECRET)
+            : false;
 
           if (!hasSession) {
             if (request.method === 'POST') {
@@ -3102,14 +3185,14 @@ export default {
               const providedHash = password ? await sha256(password + row.id) : '';
 
               if (constantTimeEqual(providedHash, row.password_hash)) {
-                // Correct password: redirect with a session cookie scoped to
-                // this share's lifetime (capped at 30d for permanent shares).
-                const maxAge = artifactCookieMaxAge(row.expires_at);
+                // Correct password: redirect with a signed session cookie scoped
+                // to this share's lifetime (capped at 24h; never past expiry).
+                const { token, maxAge } = await issuePasswordSession(row.id, row.expires_at, env.JWT_SECRET, rowEpoch);
                 return new Response(null, {
                   status: 302,
                   headers: {
                     Location: `${url.origin}/s/${slug}/`,
-                    'Set-Cookie': `${cookieName}=1; Path=/s/${slug}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`,
+                    'Set-Cookie': `${cookieName}=${token}; Path=/s/${slug}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`,
                   },
                 });
               }

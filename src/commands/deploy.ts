@@ -7,7 +7,7 @@ import { promisify } from 'util';
 import { homedir } from 'os';
 import { saveConfig, loadConfig, listProfiles } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
-import { resolveSecret } from '../lib/deploy-secrets.js';
+import { resolveSecret, assertStrongJwtSecret } from '../lib/deploy-secrets.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -335,6 +335,41 @@ database_id = "${databaseId}"
     process.exit(1);
   }
 
+  // Worker secrets persist across deploys, so reuse them — re-minting JWT_SECRET
+  // would invalidate every signed link. Decide by existence (secret list shows
+  // names only, never values); local config is the source of truth + backup.
+  //
+  // Resolve + validate the signing key BEFORE `wrangler deploy` so we never
+  // promote hardened code with a weak/missing JWT_SECRET. cloudflareSecretExists
+  // and resolveSecret have no ordering dependency on the deploy, so they move up
+  // safely; the actual `setSecret` writes stay after deploy (they push to the
+  // live worker).
+  let ownerToken = '';
+  let jwtForConfig: string | undefined = profileConfig?.jwtSecret || undefined;
+  let owner!: ReturnType<typeof resolveSecret>;
+  let jwt!: ReturnType<typeof resolveSecret>;
+  try {
+    const ownerExists = await cloudflareSecretExists(workerDir, 'OWNER_TOKEN', wranglerEnvBase);
+    const jwtExists = await cloudflareSecretExists(workerDir, 'JWT_SECRET', wranglerEnvBase);
+    owner = resolveSecret(profileConfig?.token, ownerExists, generateToken, { mustHaveValue: true });
+    jwt = resolveSecret(profileConfig?.jwtSecret, jwtExists, generateToken);
+    // Validate EVERY locally known secret (first-deploy write:true AND reused
+    // write:false), not just ones being written — a reused weak local secret
+    // must fail the deploy too.
+    //
+    // Sealed-backend case: resolveSecret returns { value: undefined, write:false,
+    // known:false } when the secret exists on the worker but the local value is
+    // unknown. Strength can't be verified at deploy, so we do NOT throw; the
+    // runtime passwordSessionSecretUsable guard is the backstop (a protected
+    // share fails closed with 500 if that worker secret is weak/missing).
+    if (jwt.known && jwt.value) assertStrongJwtSecret(jwt.value);
+    ownerToken = owner.value as string;
+    if (jwt.known) jwtForConfig = jwt.value;
+  } catch (err: any) {
+    console.error('Failed to resolve secrets:', err.message);
+    process.exit(1);
+  }
+
   console.log('Deploying worker...');
   try {
     await execAsync('wrangler deploy', { cwd: workerDir });
@@ -347,21 +382,14 @@ database_id = "${databaseId}"
     ? `https://${customDomain}`
     : `https://${workerName}.${workersDevSubdomain}.workers.dev`;
 
-  // Worker secrets persist across deploys, so reuse them — re-minting JWT_SECRET
-  // would invalidate every signed link. Decide by existence (secret list shows
-  // names only, never values); local config is the source of truth + backup.
   console.log('Setting secrets...');
-  let ownerToken = '';
-  let jwtForConfig: string | undefined = profileConfig?.jwtSecret || undefined;
   try {
-    const ownerExists = await cloudflareSecretExists(workerDir, 'OWNER_TOKEN', wranglerEnvBase);
-    const jwtExists = await cloudflareSecretExists(workerDir, 'JWT_SECRET', wranglerEnvBase);
-    const owner = resolveSecret(profileConfig?.token, ownerExists, generateToken, { mustHaveValue: true });
-    const jwt = resolveSecret(profileConfig?.jwtSecret, jwtExists, generateToken);
-    ownerToken = owner.value as string;
-    if (jwt.known) jwtForConfig = jwt.value;
     if (owner.write && owner.value) await setSecret(workerDir, 'OWNER_TOKEN', owner.value);
-    if (jwt.write && jwt.value) await setSecret(workerDir, 'JWT_SECRET', jwt.value);
+    if (jwt.write && jwt.value) {
+      // Defense in depth: re-validate immediately before writing the signing key.
+      assertStrongJwtSecret(jwt.value);
+      await setSecret(workerDir, 'JWT_SECRET', jwt.value);
+    }
   } catch (err: any) {
     console.error('Failed to set secrets:', err.message);
     process.exit(1);

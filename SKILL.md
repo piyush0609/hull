@@ -288,7 +288,7 @@ slug **you already own** is *not* an error — that's the in-place update / new-
 - Use `--password` (no value) for an interactive prompt — characters hidden with `*`.
 - Passing `--password <value>` works but exposes the password in shell history.
 - Passwords are SHA-256 hashed with the artifact ID as salt before storage.
-- Recipients enter the password on a web form; a session cookie grants access for the link's lifetime.
+- Recipients enter the password on a web form; a signed session cookie grants access for up to 24 hours (never past the link's expiry), after which the password must be re-entered. Changing or clearing the password immediately invalidates existing sessions.
 
 ## Manage
 

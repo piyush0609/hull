@@ -7,7 +7,7 @@ import { promisify } from 'util';
 import { homedir } from 'os';
 import { saveConfig, loadConfig, listProfiles } from '../lib/config.js';
 import { prompt, promptConfirm, promptSelect } from '../lib/prompt.js';
-import { resolveSecret } from '../lib/deploy-secrets.js';
+import { resolveSecret, assertStrongJwtSecret } from '../lib/deploy-secrets.js';
 
 const execAsync = promisify(exec);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -396,6 +396,14 @@ export async function deployVercelCommand(options: {
   const jwt = resolveSecret(profileConfig?.jwtSecret, jwtExists, generateToken);
   const owner = resolveSecret(profileConfig?.token, ownerExists, generateToken, { mustHaveValue: true });
   const ownerToken = owner.value as string;
+  // Fail closed on a weak/missing signing key before writing it. Validate EVERY
+  // locally known secret (first-deploy write:true AND reused write:false).
+  //
+  // Sealed-backend case: resolveSecret returns { value: undefined, write:false,
+  // known:false } when the env var exists on the project but the local value is
+  // unknown. Strength can't be verified at deploy, so we do NOT throw; the
+  // runtime passwordSessionSecretUsable guard is the backstop.
+  if (jwt.known && jwt.value) assertStrongJwtSecret(jwt.value);
   if (jwt.write && jwt.value) await setVercelEnv(deployDir, 'JWT_SECRET', jwt.value);
   if (owner.write && owner.value) await setVercelEnv(deployDir, 'OWNER_TOKEN', owner.value);
   if (multiTenant) {

@@ -100,11 +100,11 @@ export class MockD1 {
 export const SECRET = 'a3f7c9e1d2b4a6085c7e9f1023456789abcdef0123456789abcdef0123456789';
 export const OWNER = 'deadbeef0123456789abcdef01234567';
 
-export function createEnv(kv: MockKV, db: MockD1) {
+export function createEnv(kv: MockKV, db: MockD1, overrides: Partial<{ JWT_SECRET: string }> = {}) {
   return {
     TOSS_KV: kv as unknown as KVNamespace,
     TOSS_DB: db as unknown as D1Database,
-    JWT_SECRET: SECRET,
+    JWT_SECRET: overrides.JWT_SECRET ?? SECRET,
     OWNER_TOKEN: OWNER,
   };
 }
