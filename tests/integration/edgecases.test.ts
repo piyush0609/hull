@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import worker from '../../src/templates/worker/src/index.js';
 import { signJWT } from '../../src/templates/worker/src/jwt.js';
 import { MockKV, MockD1, SECRET, OWNER, createEnv } from './helpers.js';
@@ -251,7 +251,13 @@ describe('Worker Edge Cases', () => {
       });
       const correctRes = await worker.fetch(correctReq, createEnv(kv, db));
       expect(correctRes.status).toBe(302);
-      expect(correctRes.headers.get('Set-Cookie')).toContain(`toss_pwd_${slug}=1`);
+      const setCookie = correctRes.headers.get('Set-Cookie') || '';
+      // Cookie value must be a signed JWT (three dot-separated segments), NOT the
+      // legacy forgeable `=1` sentinel.
+      expect(setCookie).toContain(`toss_pwd_${slug}=`);
+      expect(setCookie).not.toContain(`toss_pwd_${slug}=1;`);
+      const cookieValue = setCookie.slice(setCookie.indexOf(`toss_pwd_${slug}=`) + `toss_pwd_${slug}=`.length).split(';')[0];
+      expect(cookieValue.split('.').length).toBe(3);
     });
 
     it('should mark the password gate no-store so it cannot be cached against asset URLs', async () => {
@@ -384,7 +390,7 @@ describe('Worker Edge Cases', () => {
       expect(await res.text()).toBe('<html>perm</html>');
     });
 
-    it('should set 30d cookie on permanent password-protected share', async () => {
+    it('should set 24h-capped cookie on permanent password-protected share', async () => {
       const id = 'abc12345-1234-1234-1234-123456789abc';
       const slug = 'perm-pwd';
       const passwordHash = await sha256Hex('pwd' + id);
@@ -398,8 +404,8 @@ describe('Worker Edge Cases', () => {
       });
       const res = await worker.fetch(req, createEnv(kv, db));
       expect(res.status).toBe(302);
-      // 30 days = 2592000s, not 100y.
-      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=2592000');
+      // Password sessions are capped at 24h (86400s), not the artifact-cookie 30d.
+      expect(res.headers.get('Set-Cookie')).toContain('Max-Age=86400');
     });
 
     it('should serve permanent JWT (permanent:true payload) without 410', async () => {
@@ -458,6 +464,287 @@ describe('Worker Edge Cases', () => {
       });
       const res = await worker.fetch(req, env);
       expect(res.status).not.toBe(410);
+    });
+  });
+
+  describe('Signed password sessions', () => {
+    const id = 'sess1234-1234-1234-1234-123456789abc';
+    const otherId = 'othr1234-1234-1234-1234-123456789abc';
+    const slug = 'signed-share';
+    let now: number;
+    let passwordHash: string;
+
+    async function pwdHash(pw: string, artifactId: string): Promise<string> {
+      return sha256Hex(pw + artifactId);
+    }
+
+    async function mintSession(overrides: Record<string, unknown> = {}, subject = id, epoch = 0): Promise<string> {
+      const iat = Math.floor(Date.now() / 1000);
+      const payload: Record<string, unknown> = {
+        sub: subject,
+        aud: 'password-session',
+        pwd_epoch: epoch,
+        iat,
+        exp: iat + 3600,
+        ...overrides,
+      };
+      return signJWT(payload, SECRET);
+    }
+
+    beforeEach(async () => {
+      now = Math.floor(Date.now() / 1000);
+      passwordHash = await pwdHash('mypassword', id);
+      db.setRows([{
+        id, slug, name: 'secret.html', size_bytes: 100, created_at: now,
+        expires_at: now + 3600, token_hash: 'any', password_hash: passwordHash, password_epoch: 0,
+      }]);
+      await kv.put(`artifacts/${id}/files/index.html`, '<html>secret</html>');
+      await kv.put(`artifacts/${id}/files/config.js`, 'console.log(1)');
+    });
+
+    // Invalid cookies (forged `=1`, unsigned garbage, tampered signature) must be
+    // rejected on BOTH the HTML entry (/s/<slug>/) AND sub-assets
+    // (/s/<slug>/config.js): the asset request must show the password gate and
+    // must NEVER leak the protected asset body.
+    it.each([`/s/${slug}/`, `/s/${slug}/config.js`])(
+      'rejects a forged toss_pwd_<slug>=1 cookie on %s (shows the gate, no asset leak)',
+      async (path) => {
+        const req = new Request(`http://localhost${path}`, {
+          headers: { Cookie: `toss_pwd_${slug}=1` },
+        });
+        const res = await worker.fetch(req, createEnv(kv, db));
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain('Password Required');
+        expect(body).not.toContain('console.log(1)');
+      }
+    );
+
+    it.each([`/s/${slug}/`, `/s/${slug}/config.js`])(
+      'rejects an unsigned/garbage cookie on %s (shows the gate, no asset leak)',
+      async (path) => {
+        const req = new Request(`http://localhost${path}`, {
+          headers: { Cookie: `toss_pwd_${slug}=not-a-jwt` },
+        });
+        const res = await worker.fetch(req, createEnv(kv, db));
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain('Password Required');
+        expect(body).not.toContain('console.log(1)');
+      }
+    );
+
+    it('bare-path form POST returns 302 with a signed Set-Cookie (not a bare redirect)', async () => {
+      const req = new Request(`http://localhost/s/${slug}`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'mypassword' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(302);
+      const setCookie = res.headers.get('Set-Cookie') || '';
+      expect(setCookie).toContain(`toss_pwd_${slug}=`);
+      const value = setCookie.slice(setCookie.indexOf('=') + 1).split(';')[0];
+      expect(value.split('.').length).toBe(3);
+      expect(value).not.toBe('1');
+    });
+
+    it('trailing-slash form POST also issues a signed cookie', async () => {
+      const req = new Request(`http://localhost/s/${slug}/`, {
+        method: 'POST',
+        body: new URLSearchParams({ password: 'mypassword' }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      const res = await worker.fetch(req, createEnv(kv, db));
+      expect(res.status).toBe(302);
+      const value = (res.headers.get('Set-Cookie') || '').slice(`toss_pwd_${slug}=`.length).split(';')[0];
+      expect(value.split('.').length).toBe(3);
+    });
+
+    it('a valid signed cookie permits the HTML entry and a sub-asset', async () => {
+      const token = await mintSession();
+      const htmlRes = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(htmlRes.status).toBe(200);
+      expect(await htmlRes.text()).toContain('<html>secret</html>');
+
+      const assetRes = await worker.fetch(new Request(`http://localhost/s/${slug}/config.js`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(assetRes.status).toBe(200);
+      expect(await assetRes.text()).toContain('console.log(1)');
+    });
+
+    it.each([`/s/${slug}/`, `/s/${slug}/config.js`])(
+      'rejects a tampered signature on %s (shows the gate, no asset leak)',
+      async (path) => {
+        const token = await mintSession();
+        const tampered = token.slice(0, -3) + (token.slice(-3) === 'AAA' ? 'BBB' : 'AAA');
+        const res = await worker.fetch(new Request(`http://localhost${path}`, {
+          headers: { Cookie: `toss_pwd_${slug}=${tampered}` },
+        }), createEnv(kv, db));
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain('Password Required');
+        expect(body).not.toContain('console.log(1)');
+      }
+    );
+
+    it('rejects a token scoped to another artifact', async () => {
+      const token = await mintSession({}, otherId);
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Password Required');
+    });
+
+    it('rejects an expired token', async () => {
+      const token = await mintSession({ exp: now - 10 });
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Password Required');
+    });
+
+    it('rejects exp === now (boundary) with fake timers', async () => {
+      vi.useFakeTimers();
+      try {
+        const fixed = 1_800_000_000;
+        vi.setSystemTime(fixed * 1000);
+        db.setRows([{ id, slug, expires_at: fixed + 3600, password_hash: passwordHash, password_epoch: 0 }]);
+        const token = await mintSession({ iat: fixed - 10, exp: fixed });
+        const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+          headers: { Cookie: `toss_pwd_${slug}=${token}` },
+        }), createEnv(kv, db));
+        expect(res.status).toBe(200);
+        expect(await res.text()).toContain('Password Required');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('rejects a stale pwd_epoch', async () => {
+      db.setRows([{
+        id, slug, expires_at: now + 3600, password_hash: passwordHash, password_epoch: 2,
+      }]);
+      const token = await mintSession({}, id, 1);
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Password Required');
+    });
+
+    it('rejects a token missing a numeric iat', async () => {
+      const token = await mintSession({ iat: undefined });
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Password Required');
+    });
+
+    it('rejects a token whose pwd_epoch is non-integer / missing / false', async () => {
+      for (const bad of [{ pwd_epoch: 0.5 }, { pwd_epoch: undefined }, { pwd_epoch: false }, { pwd_epoch: '0' }]) {
+        const token = await mintSession(bad as Record<string, unknown>);
+        const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+          headers: { Cookie: `toss_pwd_${slug}=${token}` },
+        }), createEnv(kv, db));
+        expect(res.status).toBe(200);
+        expect(await res.text()).toContain('Password Required');
+      }
+    });
+
+    it('caps a temporary-share session Max-Age to the remaining time with token exp <= expiry', async () => {
+      vi.useFakeTimers();
+      try {
+        const fixed = 1_800_000_000;
+        vi.setSystemTime(fixed * 1000);
+        const expiresAt = fixed + 3600; // 1h remaining, < 24h cap
+        db.setRows([{ id, slug, expires_at: expiresAt, password_hash: passwordHash, password_epoch: 0 }]);
+        const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+          method: 'POST',
+          body: new URLSearchParams({ password: 'mypassword' }),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        }), createEnv(kv, db));
+        expect(res.status).toBe(302);
+        const setCookie = res.headers.get('Set-Cookie') || '';
+        expect(setCookie).toContain('Max-Age=3600');
+        // token exp derives from the same now, so exp === expiresAt <= artifact expiry.
+        const value = setCookie.slice(`toss_pwd_${slug}=`.length).split(';')[0];
+        const payload = JSON.parse(atob(value.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        expect(payload.exp).toBe(expiresAt);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('derives token exp and cookie Max-Age from one now (no second-tick split)', async () => {
+      vi.useFakeTimers();
+      try {
+        const fixed = 1_800_000_000;
+        vi.setSystemTime(fixed * 1000);
+        db.setRows([{ id, slug, expires_at: 0, password_hash: passwordHash, password_epoch: 0 }]);
+        const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+          method: 'POST',
+          body: new URLSearchParams({ password: 'mypassword' }),
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        }), createEnv(kv, db));
+        const setCookie = res.headers.get('Set-Cookie') || '';
+        const value = setCookie.slice(`toss_pwd_${slug}=`.length).split(';')[0];
+        const payload = JSON.parse(atob(value.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        const maxAge = Number(setCookie.match(/Max-Age=(\d+)/)?.[1]);
+        expect(payload.exp - payload.iat).toBe(maxAge);
+        expect(maxAge).toBe(86400);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('parses the cookie by exact name (superstring name fails)', async () => {
+      const token = await mintSession();
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `nottoss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Password Required');
+    });
+
+    it('parses a no-space cookie header (other=1;toss_pwd_<slug>=<token>)', async () => {
+      const token = await mintSession();
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `other=1;toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('<html>secret</html>');
+    });
+
+    it('parses a cookie with multiple spaces/tabs after the semicolon', async () => {
+      const token = await mintSession();
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`, {
+        headers: { Cookie: `a=1; \t  b=2;   toss_pwd_${slug}=${token}` },
+      }), createEnv(kv, db));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('<html>secret</html>');
+    });
+
+    it('fails closed with 500 (no cookie) when JWT_SECRET is weak, but unprotected still 200', async () => {
+      const weakEnv = createEnv(kv, db, { JWT_SECRET: 'short' });
+      const res = await worker.fetch(new Request(`http://localhost/s/${slug}/`), weakEnv);
+      expect(res.status).toBe(500);
+      expect(res.headers.get('Set-Cookie')).toBeNull();
+
+      // Unprotected share under a weak secret still serves.
+      const openId = 'open1234-1234-1234-1234-123456789abc';
+      const openSlug = 'open-share';
+      db.setRows([{ id: openId, slug: openSlug, expires_at: now + 3600, password_hash: null, password_epoch: 0 }]);
+      await kv.put(`artifacts/${openId}/files/index.html`, '<html>open</html>');
+      const openRes = await worker.fetch(new Request(`http://localhost/s/${openSlug}/`), weakEnv);
+      expect(openRes.status).toBe(200);
+      expect(await openRes.text()).toContain('<html>open</html>');
     });
   });
 });
