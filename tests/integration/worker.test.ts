@@ -58,6 +58,7 @@ class StatefulMockD1 {
     token_hash: string;
     password_hash: string | null;
     comments_enabled: number;
+    password_epoch: number;
     current_version_id?: string | null;
   }> = [];
   artifactVersions: Array<{ id: string; artifact_id: string; seq: number; content_hash: string; created_at: number }> = [];
@@ -150,6 +151,7 @@ class StatefulMockD1 {
         token_hash: String(values[6]),
         password_hash: values[7] == null ? null : String(values[7]),
         comments_enabled: values[8] == null ? 0 : Number(values[8]),
+        password_epoch: 0,
         current_version_id: null,
       });
       return { success: true, meta: { changes: 1 } };
@@ -184,18 +186,24 @@ class StatefulMockD1 {
       return { success: true, meta: { changes: 1 } };
     }
 
-    if (query.includes('UPDATE artifacts SET current_version_id = ?, name = ?, size_bytes = ?, expires_at = ?, password_hash = ?') && query.includes('EXISTS (SELECT 1 FROM artifact_versions')) {
-      const artifact = this.artifacts.find((item) => item.id === String(values[5]));
-      const expectedCurrent = values[6] == null ? null : String(values[6]);
-      const expectedCurrentAgain = values[7] == null ? null : String(values[7]);
-      const version = this.artifactVersions.find((item) => item.id === String(values[8]) && item.artifact_id === String(values[9]) && item.seq === Number(values[10]));
+    if (query.includes('UPDATE artifacts SET current_version_id = ?, name = ?, size_bytes = ?, expires_at = ?, password_epoch = password_epoch + CASE WHEN password_hash IS ?') && query.includes('EXISTS (SELECT 1 FROM artifact_versions')) {
+      const artifact = this.artifacts.find((item) => item.id === String(values[6]));
+      const expectedCurrent = values[7] == null ? null : String(values[7]);
+      const expectedCurrentAgain = values[8] == null ? null : String(values[8]);
+      const version = this.artifactVersions.find((item) => item.id === String(values[9]) && item.artifact_id === String(values[10]) && item.seq === Number(values[11]));
       const canPublish = !!artifact && !!version && (artifact.current_version_id || null) === expectedCurrent && (artifact.current_version_id || null) === expectedCurrentAgain;
       if (canPublish) {
+        const compareHash = values[4] == null ? null : String(values[4]);   // 4: CASE comparison hash
+        const assignHash = values[5] == null ? null : String(values[5]);    // 5: assignment hash
+        // Increment based on the OLD stored hash, null-safe, BEFORE assigning values[5].
+        if ((artifact.password_hash ?? null) !== compareHash) {
+          artifact.password_epoch = (artifact.password_epoch ?? 0) + 1;
+        }
         artifact.current_version_id = String(values[0]);
         artifact.name = String(values[1]);
         artifact.size_bytes = Number(values[2]);
         artifact.expires_at = Number(values[3]);
-        artifact.password_hash = values[4] == null ? null : String(values[4]);
+        artifact.password_hash = assignHash;
       }
       return { success: true, meta: { changes: canPublish ? 1 : 0 } };
     }
@@ -597,12 +605,12 @@ class StatefulMockD1 {
 
     if (query.includes('SELECT comments_enabled, expires_at, password_epoch FROM artifacts WHERE id = ?')) {
       const a = this.artifacts.find((x) => x.id === String(values[0]));
-      return (a ? { comments_enabled: a.comments_enabled, expires_at: a.expires_at, password_epoch: 0 } : null) as T | null;
+      return (a ? { comments_enabled: a.comments_enabled, expires_at: a.expires_at, password_epoch: a.password_epoch ?? 0 } : null) as T | null;
     }
 
     if (query.includes('SELECT comments_enabled, password_epoch FROM artifacts WHERE id = ?')) {
       const a = this.artifacts.find((x) => x.id === String(values[0]));
-      return (a ? { comments_enabled: a.comments_enabled, password_epoch: 0 } : null) as T | null;
+      return (a ? { comments_enabled: a.comments_enabled, password_epoch: a.password_epoch ?? 0 } : null) as T | null;
     }
 
     if (query.includes('SELECT comments_enabled FROM artifacts WHERE id = ?')) {
@@ -611,12 +619,12 @@ class StatefulMockD1 {
       return (artifact ? { comments_enabled: artifact.comments_enabled } : null) as T | null;
     }
 
-    if (query.includes('SELECT id, expires_at, password_hash, current_version_id FROM artifacts WHERE slug = ?')) {
+    if (query.includes('SELECT id, expires_at, password_hash, current_version_id, password_epoch FROM artifacts WHERE slug = ?')) {
       const slug = String(values[0]);
       const artifact = this.artifacts.find((a) => a.slug === slug);
       return (
         artifact
-          ? { id: artifact.id, expires_at: artifact.expires_at, password_hash: artifact.password_hash, current_version_id: artifact.current_version_id || null }
+          ? { id: artifact.id, expires_at: artifact.expires_at, password_hash: artifact.password_hash, current_version_id: artifact.current_version_id || null, password_epoch: artifact.password_epoch ?? 0 }
           : null
       ) as T | null;
     }
@@ -2006,6 +2014,113 @@ describe('Worker Routes', () => {
         headers: { 'X-Toss-Viewer': plainViewer },
       }), env);
       expect(res.status).toBe(403);
+    });
+  });
+
+  describe('Race-safe password_epoch bump on re-share', () => {
+    async function makeEnv() {
+      const statefulDb = new StatefulMockD1();
+      statefulDb.users.push({ token_hash: await sha256(OWNER), label: 'admin', created_at: 1, is_admin: 1 });
+      const localKv = new MockKV();
+      const env = { ...createEnv(localKv, statefulDb as unknown as MockD1), MULTI_TENANT: 'true' };
+      return { statefulDb, env };
+    }
+
+    async function reshare(env: any, slug: string, html: string, opts: { password?: string; comments?: boolean } = {}) {
+      const params = new URLSearchParams({ name: 'v.html', id: slug, expires: '3600' });
+      if (opts.password !== undefined) params.set('password', opts.password);
+      if (opts.comments) params.set('comments', '1');
+      return worker.fetch(new Request(`http://localhost/artifacts?${params.toString()}`, {
+        method: 'POST', headers: { Authorization: `Bearer ${OWNER}` }, body: html,
+      }), env);
+    }
+
+    async function session(id: string, epoch: number) {
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      return signJWT({ sub: id, aud: 'password-session', pwd_epoch: epoch, iat: now, exp: now + 3600 }, SECRET);
+    }
+
+    async function grant(id: string, epoch: number) {
+      const { signJWT } = await import('../../src/templates/worker/src/jwt.js');
+      const now = Math.floor(Date.now() / 1000);
+      return signJWT({ sub: id, aud: 'comment', pwd_epoch: epoch, iat: now, exp: now + 3600 }, SECRET);
+    }
+
+    it('does NOT bump the epoch when the same password is re-shared', async () => {
+      const { statefulDb, env } = await makeEnv();
+      const first = await reshare(env, 'epoch-same', '<html>a</html>', { password: 'pw' });
+      expect(first.status).toBe(200);
+      const id = (await first.json() as { id: string }).id;
+
+      await reshare(env, 'epoch-same', '<html>b</html>', { password: 'pw' });
+      expect(statefulDb.artifacts.find((a) => a.id === id)?.password_epoch).toBe(0);
+
+      // An epoch-0 session still authenticates.
+      const res = await worker.fetch(new Request(`http://localhost/s/epoch-same/`, {
+        headers: { Cookie: `toss_pwd_epoch-same=${await session(id, 0)}` },
+      }), env);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('<html>b</html>');
+    });
+
+    it('bumps the epoch on null -> hash and hash -> different (old session + grant fail)', async () => {
+      const { statefulDb, env } = await makeEnv();
+      const first = await reshare(env, 'epoch-set', '<html>a</html>', { comments: true });
+      const id = (await first.json() as { id: string }).id;
+      const oldGrant = await grant(id, 0);
+
+      // null -> hash: epoch -> 1.
+      await reshare(env, 'epoch-set', '<html>b</html>', { password: 'pw1', comments: true });
+      expect(statefulDb.artifacts.find((a) => a.id === id)?.password_epoch).toBe(1);
+
+      const gate1 = await worker.fetch(new Request(`http://localhost/s/epoch-set/`, {
+        headers: { Cookie: `toss_pwd_epoch-set=${await session(id, 0)}` },
+      }), env);
+      expect(gate1.status).toBe(200);
+      expect(await gate1.text()).toContain('Password Required');
+
+      const comment1 = await worker.fetch(new Request(`http://localhost/artifacts/${id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': oldGrant },
+      }), env);
+      expect(comment1.status).toBe(401);
+
+      // hash -> different: epoch -> 2.
+      await reshare(env, 'epoch-set', '<html>c</html>', { password: 'pw2', comments: true });
+      expect(statefulDb.artifacts.find((a) => a.id === id)?.password_epoch).toBe(2);
+
+      const gate2 = await worker.fetch(new Request(`http://localhost/s/epoch-set/`, {
+        headers: { Cookie: `toss_pwd_epoch-set=${await session(id, 1)}` },
+      }), env);
+      expect(gate2.status).toBe(200);
+      expect(await gate2.text()).toContain('Password Required');
+    });
+
+    it('bumps on hash -> null (old grant fails; helper verifies old session false)', async () => {
+      const { verifyPasswordSessionForTests } = await import('../../src/templates/worker/src/index.js');
+      const { statefulDb, env } = await makeEnv();
+      const first = await reshare(env, 'epoch-clear', '<html>a</html>', { password: 'pw', comments: true });
+      const id = (await first.json() as { id: string }).id;
+      const oldGrant = await grant(id, 0);
+      const oldSession = await session(id, 0);
+
+      // hash -> null: epoch -> 1.
+      await reshare(env, 'epoch-clear', '<html>b</html>', { comments: true });
+      expect(statefulDb.artifacts.find((a) => a.id === id)?.password_epoch).toBe(1);
+
+      // Share is now unprotected: serve route does not inspect the cookie.
+      const comment1 = await worker.fetch(new Request(`http://localhost/artifacts/${id}/comment-threads?pagePath=index.html`, {
+        headers: { 'X-Toss-Viewer': oldGrant },
+      }), env);
+      expect(comment1.status).toBe(401);
+
+      // Verify the old session token directly against the new epoch (helper-level).
+      expect(await verifyPasswordSessionForTests(oldSession, id, 1, SECRET)).toBe(false);
+
+      // Optional second bump: set a password again -> epoch 2; older token invalid.
+      await reshare(env, 'epoch-clear', '<html>c</html>', { password: 'again', comments: true });
+      expect(statefulDb.artifacts.find((a) => a.id === id)?.password_epoch).toBe(2);
+      expect(await verifyPasswordSessionForTests(oldSession, id, 2, SECRET)).toBe(false);
     });
   });
 });

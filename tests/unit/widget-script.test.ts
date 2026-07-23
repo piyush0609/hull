@@ -368,7 +368,7 @@ describe('Vercel comment widget script', () => {
     expect(source).toContain("await blobPut(stagedPath, html, 'text/html')");
     expect(source).toContain('await blobDelete(stagedPath).catch(() => {})');
     expect(source).toContain('contentPath = versionEntryBlobPath(meta.id, String(currentVersionId))');
-    expect(source).toContain('password_hash = ${artifactUpdate.passwordHash}, current_version_id = ${versionId}');
+    expect(source).toContain('password_epoch = password_epoch + CASE WHEN password_hash IS DISTINCT FROM ${artifactUpdate.passwordHash} THEN 1 ELSE 0 END, password_hash = ${artifactUpdate.passwordHash}, current_version_id = ${versionId}');
     expect(source.indexOf('await blobPut(stagedPath, html')).toBeLessThan(source.indexOf('await mintVersion(existingId, newHash'));
     expect(source).not.toContain("blobPut(`artifacts/${existingId}/files/index.html`");
   });
