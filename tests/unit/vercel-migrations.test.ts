@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -115,12 +116,13 @@ describe('Vercel migration runner', () => {
       description_check_ok: true, color_check_ok: true, resolution_check_ok: true,
       hidden_resolution_ok: true, one_hidden_resolution: true, position_constraint_ok: true, label_unique_count_ok: true,
       old_kind_check_absent: true, kind_fk_count: 0, exact_fk: false, expand_marker: true, contract_marker: false,
+      epoch_rollout_marker: true,
     };
     let calls = 0;
     const expanded = fakeClient(() => ({ rows: [calls++ === 0 ? { has_state: true, has_labels: true, has_messages: true, has_ledger: true } : expandedRow], rowCount: 1 }));
     await expect(migrations.probeSchema(expanded)).resolves.toEqual({ valid: true, state: 'expanded' });
 
-    for (const field of ['state_columns_ok', 'state_defaults_ok', 'label_columns_ok', 'ledger_columns_ok', 'singleton_check_ok', 'key_check_ok', 'description_check_ok', 'color_check_ok', 'resolution_check_ok', 'position_constraint_ok', 'hidden_resolution_ok']) {
+    for (const field of ['state_columns_ok', 'state_defaults_ok', 'label_columns_ok', 'ledger_columns_ok', 'singleton_check_ok', 'key_check_ok', 'description_check_ok', 'color_check_ok', 'resolution_check_ok', 'position_constraint_ok', 'hidden_resolution_ok', 'epoch_rollout_marker']) {
       calls = 0;
       const malformed = fakeClient(() => ({ rows: [calls++ === 0 ? { has_state: true, has_labels: true, has_messages: true, has_ledger: true } : { ...expandedRow, [field]: false }], rowCount: 1 }));
       await expect(migrations.probeSchema(malformed), field).resolves.toMatchObject({ valid: false, state: 'inconsistent' });
@@ -129,6 +131,52 @@ describe('Vercel migration runner', () => {
     calls = 0;
     const inconsistent = fakeClient(() => ({ rows: [calls++ === 0 ? { has_state: true, has_labels: true, has_messages: true, has_ledger: true } : { ...expandedRow, ready: true, revision: 1, kind_fk_count: 1, exact_fk: false, contract_marker: true }], rowCount: 1 }));
     await expect(migrations.probeSchema(inconsistent)).resolves.toMatchObject({ valid: false, state: 'inconsistent' });
+  });
+
+  it('gates the epoch rollout marker in the contracted state so a missing 0012 aborts --skip-migrate', async () => {
+    const contractedRow = {
+      rows: 1, singleton_ok: true, revision_ok: true, revision: 1, ready: true, kind_expanded: true,
+      state_columns_ok: true, state_defaults_ok: true, label_columns_ok: true, ledger_columns_ok: true, ledger_default_ok: true,
+      state_check_count_ok: true, state_pk_ok: true, ledger_pk_ok: true, singleton_check_ok: true, revision_check_ok: true,
+      label_check_count_ok: true, label_pk_ok: true, key_check_ok: true, label_check_ok: true,
+      description_check_ok: true, color_check_ok: true, resolution_check_ok: true,
+      hidden_resolution_ok: true, one_hidden_resolution: true, position_constraint_ok: true, label_unique_count_ok: true,
+      old_kind_check_absent: true, kind_fk_count: 1, exact_fk: true, expand_marker: true, contract_marker: true,
+    };
+
+    let calls = 0;
+    const withoutRollout = fakeClient(() => ({ rows: [calls++ === 0 ? { has_state: true, has_labels: true, has_messages: true, has_ledger: true } : { ...contractedRow, epoch_rollout_marker: false }], rowCount: 1 }));
+    await expect(migrations.probeSchema(withoutRollout)).resolves.toMatchObject({ valid: false, state: 'inconsistent' });
+
+    calls = 0;
+    const withRollout = fakeClient(() => ({ rows: [calls++ === 0 ? { has_state: true, has_labels: true, has_messages: true, has_ledger: true } : { ...contractedRow, epoch_rollout_marker: true }], rowCount: 1 }));
+    await expect(migrations.probeSchema(withRollout)).resolves.toEqual({ valid: true, state: 'contracted' });
+  });
+
+  it('applies the real 0012 epoch rollout file once and short-circuits on the ledger marker', async () => {
+    const migrationsDir = fileURLToPath(new URL('../../src/templates/vercel/migrations/', import.meta.url));
+    const filename = '0012_password_session_epoch_rollout.sql';
+
+    let markerPresent = false;
+    const client = fakeClient((text) => {
+      if (text.includes('.schema_migrations WHERE filename')) return markerPresent ? { rows: [{ '?column?': 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      if (text.includes('INSERT INTO') && text.includes('schema_migrations')) { markerPresent = true; return undefined; }
+      return undefined;
+    });
+
+    await expect(migrations.applyMigration(client, migrationsDir, filename)).resolves.toBe(true);
+    const updates = client.queries.filter((query) => /UPDATE artifacts SET password_epoch = password_epoch \+ 1 WHERE password_hash IS NOT NULL/.test(query.text));
+    expect(updates).toHaveLength(1);
+    const inserts = client.queries.filter((query) => query.text.includes('INSERT INTO') && query.text.includes('schema_migrations'));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].values).toEqual([filename]);
+
+    const before = client.queries.length;
+    await expect(migrations.applyMigration(client, migrationsDir, filename)).resolves.toBe(false);
+    const secondRun = client.queries.slice(before);
+    expect(secondRun.some((query) => query.text.includes('UPDATE artifacts'))).toBe(false);
+    expect(secondRun.some((query) => query.text.includes('INSERT INTO') && query.text.includes('schema_migrations'))).toBe(false);
+    expect(secondRun.at(-1)?.text).toBe('COMMIT');
   });
 
   it('pins production to public and isolated tests to a transaction-local schema', async () => {

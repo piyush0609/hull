@@ -127,7 +127,11 @@ describe.skipIf(!RUN)('Vercel comment labels PostgreSQL migrations', () => {
       const kind = (await inspector.query(`SELECT is_nullable, column_default FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'comment_messages' AND column_name = 'kind'`, [schema])).rows[0];
       expect(kind).toEqual({ is_nullable: 'YES', column_default: null });
       const markers = await inspector.query(`SELECT filename FROM "${schema}".schema_migrations WHERE filename LIKE '001%' ORDER BY filename`);
-      expect(markers.rows.map((row: any) => row.filename)).toEqual(['0010_configurable_comment_labels_expand.sql', '0011_configurable_comment_labels_contract.post.sql']);
+      expect(markers.rows.map((row: any) => row.filename)).toEqual(['0010_configurable_comment_labels_expand.sql', '0011_configurable_comment_labels_contract.post.sql', '0012_password_session_epoch_rollout.sql']);
+
+      const probeClient = new Client({ connectionString: databaseUrl, ssl: migrations.databaseSsl(databaseUrl) });
+      const probe = await migrations.run({ databaseUrl, phase: 'probe', schema, client: probeClient });
+      expect(probe).toEqual({ valid: true, state: 'contracted' });
     } finally {
       await inspector.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => undefined);
       await inspector.end();

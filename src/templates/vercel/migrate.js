@@ -152,7 +152,8 @@ WITH state_shape AS (
     EXISTS (SELECT 1 FROM comment_labels WHERE key = 'resolution' AND label = 'Resolution' AND description = 'System-generated resolution note' AND color = '#667085' AND enabled = false AND position = 0) AS hidden_resolution_ok,
     (SELECT COUNT(*) FROM comment_labels WHERE key = 'resolution') = 1 AS one_hidden_resolution,
     EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '0010_configurable_comment_labels_expand.sql') AS expand_marker,
-    EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '0011_configurable_comment_labels_contract.post.sql') AS contract_marker
+    EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '0011_configurable_comment_labels_contract.post.sql') AS contract_marker,
+    EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '0012_password_session_epoch_rollout.sql') AS epoch_rollout_marker
 )
 SELECT state_shape.*, columns.*, constraints.*, catalog.* FROM state_shape, columns, constraints, catalog`;
 
@@ -165,7 +166,8 @@ async function probeSchema(client) {
     && result.state_check_count_ok && result.state_pk_ok && result.ledger_pk_ok && result.singleton_check_ok && result.revision_check_ok
     && result.label_check_count_ok && result.label_pk_ok && result.key_check_ok && result.label_check_ok
     && result.description_check_ok && result.color_check_ok && result.resolution_check_ok && result.position_constraint_ok && result.label_unique_count_ok
-    && result.hidden_resolution_ok && result.one_hidden_resolution && result.old_kind_check_absent && result.expand_marker;
+    && result.hidden_resolution_ok && result.one_hidden_resolution && result.old_kind_check_absent && result.expand_marker
+    && result.epoch_rollout_marker;
   if (expanded && result.ready && Number(result.revision) >= 1 && Number(result.kind_fk_count) === 1 && result.exact_fk && result.contract_marker) return { valid: true, state: 'contracted' };
   if (expanded && !result.ready && Number(result.kind_fk_count) === 0 && !result.contract_marker) return { valid: true, state: 'expanded' };
   return { valid: false, state: 'inconsistent', reason: 'comment label migration markers, readiness, and foreign key do not agree' };
