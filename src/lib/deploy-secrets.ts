@@ -41,3 +41,16 @@ export function resolveSecret(
   // True first deploy, or we must (re)establish a usable value we don't have.
   return { value: generate(), write: true, known: true };
 }
+
+// Fail closed on a weak/missing JWT_SECRET at deploy time. Signed password
+// sessions depend on JWT_SECRET, so a secret shorter than 32 UTF-8 bytes must be
+// rejected before it is used/written — bad config should fail the deploy, not
+// live traffic. Measured in bytes (not UTF-16 code units) because that's the
+// keying material's real entropy budget. `generateToken()` mints 32 random bytes
+// → 64 hex chars, which passes.
+export function assertStrongJwtSecret(value: string | undefined): void {
+  const bytes = value ? new TextEncoder().encode(value).byteLength : 0;
+  if (bytes < 32) {
+    throw new Error('JWT_SECRET must be at least 32 bytes; refusing to deploy with a weak signing key.');
+  }
+}

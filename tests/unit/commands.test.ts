@@ -1,4 +1,60 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Shared, mutable state driving the mocked child_process for the Cloudflare
+// deploy tests below. Declared via vi.hoisted so the vi.mock factory (hoisted
+// above the imports) can close over it.
+const cfState = vi.hoisted(() => ({
+  execCalls: [] as string[],
+  secretPuts: [] as string[],
+  jwtExistsOnBackend: false,
+  ownerExistsOnBackend: false,
+}));
+
+// deployCommand shells out via promisify(exec) and spawn; mock the whole module
+// so no wrangler binary is invoked. The other commands in this file exit before
+// touching child_process, so this is inert for them.
+vi.mock('child_process', () => ({
+  exec: (...args: any[]) => {
+    const cmd = String(args[0]);
+    const cb = args[args.length - 1];
+    cfState.execCalls.push(cmd);
+    let stdout = '';
+    if (cmd.includes('kv namespace create')) stdout = '{"id":"0123456789abcdef0123456789abcdef"}';
+    else if (cmd.includes('d1 create')) stdout = '{"database_id":"11111111-2222-3333-4444-555555555555"}';
+    else if (cmd.includes('secret list')) {
+      const names: string[] = [];
+      if (cfState.jwtExistsOnBackend) names.push('"JWT_SECRET"');
+      if (cfState.ownerExistsOnBackend) names.push('"OWNER_TOKEN"');
+      stdout = names.join('\n');
+    }
+    if (typeof cb === 'function') cb(null, { stdout, stderr: '' });
+  },
+  spawn: (_cmd: string, spawnArgs: string[] = []) => {
+    const handlers: Record<string, Array<(...a: any[]) => void>> = {};
+    const proc: any = {
+      stdin: { write: () => {}, end: () => {} },
+      on: (ev: string, cb: (...a: any[]) => void) => { (handlers[ev] ||= []).push(cb); return proc; },
+    };
+    cfState.secretPuts.push(Array.isArray(spawnArgs) ? spawnArgs.join(' ') : '');
+    setImmediate(() => (handlers['exit'] || []).forEach((cb) => cb(0)));
+    return proc;
+  },
+}));
+
+vi.mock('fs/promises', () => ({
+  mkdir: vi.fn().mockResolvedValue(undefined),
+  writeFile: vi.fn().mockResolvedValue(undefined),
+  rm: vi.fn().mockResolvedValue(undefined),
+  readdir: vi.fn().mockResolvedValue([]),
+  copyFile: vi.fn().mockResolvedValue(undefined),
+  readFile: vi.fn().mockResolvedValue(''),
+  chmod: vi.fn().mockResolvedValue(undefined),
+  access: vi.fn().mockResolvedValue(undefined),
+  rename: vi.fn().mockResolvedValue(undefined),
+  stat: vi.fn().mockResolvedValue({ isDirectory: () => false, size: 0 }),
+  lstat: vi.fn().mockResolvedValue({ isDirectory: () => false, size: 0 }),
+}));
+
 import { shareCommand } from '../../src/commands/share.js';
 import { listCommand } from '../../src/commands/list.js';
 import { revokeCommand } from '../../src/commands/revoke.js';
@@ -10,6 +66,8 @@ import { infoCommand } from '../../src/commands/info.js';
 import { whoamiCommand } from '../../src/commands/whoami.js';
 import { commentsCommand } from '../../src/commands/comments.js';
 import { versionsCommand } from '../../src/commands/versions.js';
+import { deployCommand } from '../../src/commands/deploy.js';
+import * as fsp from 'fs/promises';
 import * as config from '../../src/lib/config.js';
 
 describe('CLI Commands', () => {
@@ -411,5 +469,100 @@ describe('dynamic comment labels and filters', () => {
     const parsed = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
     expect(parsed.cloudflareField).toBe(true);
     expect(parsed.threads).toHaveLength(1);
+  });
+});
+
+describe('deployCommand — fail closed on weak JWT_SECRET (Cloudflare)', () => {
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  const ACCOUNT_ID = 'abcdef0123456789abcdef0123456789';
+
+  beforeEach(() => {
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation((code?: number | string | null) => {
+      throw new Error(`process.exit(${code})`);
+    });
+    cfState.execCalls = [];
+    cfState.secretPuts = [];
+    cfState.jwtExistsOnBackend = false;
+    cfState.ownerExistsOnBackend = false;
+    // vi.restoreAllMocks() in sibling suites clears the fs/promises mock return
+    // values, so re-seed the ones deployCommand relies on.
+    (fsp.readdir as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (fsp.mkdir as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (fsp.rm as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (fsp.writeFile as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (fsp.copyFile as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (fsp.readFile as unknown as ReturnType<typeof vi.fn>).mockResolvedValue('');
+    vi.spyOn(config, 'saveConfig').mockResolvedValue(undefined);
+    // apiToken present → deploy uses the fetch-based subdomain lookup (no wrangler
+    // whoami), which we stub below.
+    global.fetch = vi.fn().mockImplementation(async (url: any) => {
+      const u = String(url);
+      if (u.includes('/tokens/verify')) return { json: async () => ({ success: true }) } as Response;
+      if (u.includes('/workers/subdomain')) {
+        return { json: async () => ({ success: true, result: { subdomain: 'testsub' } }) } as Response;
+      }
+      return { json: async () => ({ success: true, result: [] }) } as Response;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mockProfile(over: Partial<config.TossConfig> = {}) {
+    vi.spyOn(config, 'loadConfig').mockResolvedValue({
+      endpoint: 'https://old.example.com',
+      token: 'owner-token',
+      subdomain: 'testsub',
+      role: 'owner',
+      backend: 'cloudflare',
+      apiToken: 'cf-api-token',
+      accountId: ACCOUNT_ID,
+      ...over,
+    } as never);
+  }
+
+  it('aborts BEFORE `wrangler deploy` when a reused local secret (write:false) is weak', async () => {
+    // Secret already on the worker → resolveSecret returns known:true, write:false.
+    cfState.jwtExistsOnBackend = true;
+    mockProfile({ jwtSecret: 'too-short' });
+
+    await expect(deployCommand({ profile: 'default', multiTenant: false, subdomain: 'testsub' }))
+      .rejects.toThrow('process.exit(1)');
+
+    // The deploy must not have been spawned before validation failed.
+    expect(cfState.execCalls).not.toContain('wrangler deploy');
+    expect(cfState.secretPuts.some((a) => a.includes('JWT_SECRET'))).toBe(false);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      'Failed to resolve secrets:',
+      expect.stringContaining('at least 32 bytes')
+    );
+  });
+
+  it('aborts BEFORE `wrangler deploy` when a first-deploy weak local secret (write:true) is set', async () => {
+    // Not on backend + weak local value → known:true, write:true.
+    cfState.jwtExistsOnBackend = false;
+    mockProfile({ jwtSecret: 'short-weak-secret' });
+
+    await expect(deployCommand({ profile: 'default', multiTenant: false, subdomain: 'testsub' }))
+      .rejects.toThrow('process.exit(1)');
+
+    expect(cfState.execCalls).not.toContain('wrangler deploy');
+  });
+
+  it('deploys on the auto-generated-secret happy path (no local secret, none on backend)', async () => {
+    // No local jwtSecret and none on backend → resolveSecret generates a 64-hex
+    // value (32 bytes) that passes assertStrongJwtSecret.
+    cfState.jwtExistsOnBackend = false;
+    mockProfile({ jwtSecret: undefined });
+
+    await deployCommand({ profile: 'default', multiTenant: false, subdomain: 'testsub' });
+
+    expect(cfState.execCalls).toContain('wrangler deploy');
+    // A generated JWT_SECRET (write:true) was pushed after the deploy.
+    expect(cfState.secretPuts.some((a) => a.includes('JWT_SECRET'))).toBe(true);
+    expect(config.saveConfig).toHaveBeenCalled();
   });
 });

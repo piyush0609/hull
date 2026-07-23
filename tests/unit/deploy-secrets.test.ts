@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { resolveSecret } from '../../src/lib/deploy-secrets.js';
+import { resolveSecret, assertStrongJwtSecret } from '../../src/lib/deploy-secrets.js';
+
+// Mirrors generateToken() in the deploy commands: 32 random bytes -> 64 hex chars.
+function generateToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 describe('resolveSecret', () => {
   it('reuses the local config value and does NOT rewrite when the backend already has it', () => {
@@ -41,5 +49,49 @@ describe('resolveSecret', () => {
     const r = resolveSecret('', false, () => 'GEN');
     expect(r.value).toBe('GEN');
     expect(r.write).toBe(true);
+  });
+});
+
+describe('assertStrongJwtSecret', () => {
+  const MSG = /at least 32 bytes/;
+
+  it('throws on an empty string', () => {
+    expect(() => assertStrongJwtSecret('')).toThrow(MSG);
+  });
+
+  it('throws on undefined', () => {
+    expect(() => assertStrongJwtSecret(undefined)).toThrow(MSG);
+  });
+
+  it('throws on a 31-char ASCII string (31 bytes, just under the boundary)', () => {
+    const s = 'a'.repeat(31);
+    expect(s.length).toBe(31);
+    expect(() => assertStrongJwtSecret(s)).toThrow(MSG);
+  });
+
+  it('accepts a 32-char ASCII string (32 bytes, exactly at the boundary)', () => {
+    const s = 'a'.repeat(32);
+    expect(s.length).toBe(32);
+    expect(() => assertStrongJwtSecret(s)).not.toThrow();
+  });
+
+  it('accepts the 64-hex generateToken() output (32 random bytes -> 64 chars)', () => {
+    const s = generateToken();
+    expect(s.length).toBe(64);
+    expect(() => assertStrongJwtSecret(s)).not.toThrow();
+  });
+
+  it('measures BYTES not code units: accepts "é".repeat(16) (.length 16, byteLength 32)', () => {
+    const s = 'é'.repeat(16);
+    expect(s.length).toBe(16);
+    expect(new TextEncoder().encode(s).byteLength).toBe(32);
+    expect(() => assertStrongJwtSecret(s)).not.toThrow();
+  });
+
+  it('measures BYTES not code units: throws on "é".repeat(15)+"a" (.length 16, byteLength 31)', () => {
+    const s = 'é'.repeat(15) + 'a';
+    expect(s.length).toBe(16);
+    expect(new TextEncoder().encode(s).byteLength).toBe(31);
+    expect(() => assertStrongJwtSecret(s)).toThrow(MSG);
   });
 });
