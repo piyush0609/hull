@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [0.4.3](https://github.com/piyush0609/toss/compare/v0.4.2...v0.4.3) (2026-08-06)
+
+### Bug Fixes
+
+* **comments:** make a stale comment grant recoverable from the UI ([9428911](https://github.com/piyush0609/toss/commit/9428911a9b9a9da0aec6f212b4a3f2840c0094b2))
 ## [0.4.2](https://github.com/piyush0609/toss/compare/v0.4.1...v0.4.2) (2026-07-23)
 
 ### Features
