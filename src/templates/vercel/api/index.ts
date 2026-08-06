@@ -455,6 +455,30 @@ async function requireLiveArtifact(artifactId: string): Promise<true | Response>
   return true;
 }
 
+// A grant was presented but is no longer usable: it timed out, its pwd_epoch no
+// longer matches the artifact (password changed / epoch rollout), or it failed
+// verification. All three recover the same way — reload, which re-mints a grant
+// from the password session, or shows the password form if that session is gone
+// too. We cannot tell which: the password cookie is Path=/s/<slug> and is never
+// sent to the comment API, so the message must be true either way and must not
+// promise that the password will (or won't) be asked for again.
+//
+// JSON (not plain text) on purpose: the comment widget renders `data.error` and
+// falls back to "Request failed: 401" when the body will not parse — so a JSON
+// body is what reaches ALREADY-OPEN tabs running the old script, which cannot
+// receive any client-side fix.
+//
+// Only the widget sets X-Toss-Viewer, so every path below is browser-only and
+// "reload" is always the right remedy. Deliberately NOT used for the `!token`
+// case: a CLI call with a bad owner token falls through to it, and there is no
+// page to reload.
+function staleGrantResponse(): Response {
+  return new Response(
+    JSON.stringify({ error: 'This commenting session is no longer valid — reload the page to continue.' }),
+    { status: 401, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } },
+  );
+}
+
 // Comment-API contract: the artifact must have comments enabled (per-share
 // opt-in) AND still be live (not revoked/expired) AND the caller must present
 // either a valid comment grant (a distinct aud:"comment" token issued at serve
@@ -495,11 +519,11 @@ async function requireCommentAccess(request: Request, artifactId: string, opts: 
     const payload = await verifyJWT(token, JWT_SECRET);
     if (payload.aud !== 'comment') return new Response('Forbidden', { status: 403 });
     if (payload.sub !== artifactId) return new Response('Forbidden', { status: 403 });
-    if (typeof payload.exp !== 'number' || payload.exp < nowSeconds()) return new Response('Grant expired', { status: 401 });
-    if ((Number(payload.pwd_epoch) || 0) !== (Number(row.password_epoch) || 0)) return new Response('Grant expired', { status: 401 });
+    if (typeof payload.exp !== 'number' || payload.exp < nowSeconds()) return staleGrantResponse();
+    if ((Number(payload.pwd_epoch) || 0) !== (Number(row.password_epoch) || 0)) return staleGrantResponse();
     return true;
   } catch {
-    return new Response('Invalid comment grant', { status: 401 });
+    return staleGrantResponse();
   }
 }
 
