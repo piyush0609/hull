@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const now = Math.floor(Date.now() / 1000);
 const labels = [
@@ -368,4 +368,66 @@ test('contains the exact 390x844 document, reaches long-list actions, and bounds
   await lastResolve.focus();
   await expect(lastResolve).toBeFocused();
   expect(await root.locator('#panel').evaluate((panel) => panel.scrollWidth <= panel.clientWidth)).toBe(true);
+});
+
+async function seedReviewerIdentity(page: Page) {
+  await page.addInitScript(() => localStorage.setItem('toss-comment-name', 'Reviewer'));
+}
+
+async function spyOnHostPageShortcutKeys(page: Page) {
+  await page.addInitScript(() => {
+    (window as any).__hostShortcutKeys = [];
+    document.addEventListener('keydown', (event) => { (window as any).__hostShortcutKeys.push(event.key); });
+  });
+}
+
+function hostPageShortcutKeys(page: Page) {
+  return page.evaluate(() => (window as any).__hostShortcutKeys as string[]);
+}
+
+async function resetHostPageShortcutKeys(page: Page) {
+  await page.evaluate(() => { (window as any).__hostShortcutKeys = []; });
+}
+
+async function pressKeyOnHostPage(page: Page, key: string) {
+  await page.locator('#target').click();
+  await page.keyboard.press(key);
+}
+
+function openReplyComposer(root: Locator) {
+  return root.locator('.replyToggle').first().click();
+}
+
+function replyTextarea(root: Locator) {
+  return root.locator('.replyForm:visible .replyInput');
+}
+
+test('keystrokes typed into the widget never reach the host page keyboard shortcuts', async ({ page }) => {
+  await seedReviewerIdentity(page);
+  await spyOnHostPageShortcutKeys(page);
+  const root = await boot(page);
+
+  await pressKeyOnHostPage(page, 'ArrowRight');
+  await expect.poll(() => hostPageShortcutKeys(page)).toContain('ArrowRight');
+
+  await resetHostPageShortcutKeys(page);
+  await openReplyComposer(root);
+  const draft = replyTextarea(root);
+  await draft.click();
+  await draft.pressSequentially('a b');
+  await draft.press('ArrowLeft');
+  await draft.press('ArrowRight');
+
+  expect(await hostPageShortcutKeys(page)).toEqual([]);
+  await expect(draft).toHaveValue('a b');
+});
+
+test('Escape still dismisses the reply composer from inside its textarea', async ({ page }) => {
+  await seedReviewerIdentity(page);
+  const root = await boot(page);
+  await openReplyComposer(root);
+  const draft = replyTextarea(root);
+  await draft.click();
+  await draft.press('Escape');
+  await expect(root.locator('.replyForm:visible')).toHaveCount(0);
 });
