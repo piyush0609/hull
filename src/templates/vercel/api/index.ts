@@ -1404,6 +1404,24 @@ export function injectCommentsUI(html: string, config: VercelCommentWidgetConfig
     else collapseReply(threadId, false);
   });
 
+  // Stop keystrokes typed into the widget's own editable controls from
+  // bubbling out of the shadow root to the host document, where the page's
+  // global keyboard shortcuts (slide-deck arrow/space nav, vim-style hotkeys,
+  // etc.) would otherwise hijack them. Escape is left untouched so the
+  // sr-level handler above keeps its existing dismissal behaviour.
+  sr.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') return;
+    const target = event.target;
+    if (
+      target instanceof HTMLElement &&
+      (target.tagName === 'TEXTAREA' ||
+        target.tagName === 'INPUT' ||
+        target.isContentEditable)
+    ) {
+      event.stopPropagation();
+    }
+  });
+
   cName.value = state.name;
   setMode('browse');
   loadThreads();

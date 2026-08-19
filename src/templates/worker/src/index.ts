@@ -1760,6 +1760,24 @@ function injectCommentsUI(html: string, config: {
     next.focus();
   });
 
+  // Stop keystrokes typed into the widget's own editable controls from
+  // bubbling to the host document, where the page's global keyboard shortcuts
+  // (slide-deck arrow/space nav, vim-style hotkeys, etc.) would otherwise
+  // hijack them. Escape is intentionally allowed through so the widget's own
+  // document-level handler above can still dismiss dialogs and replies.
+  root.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') return;
+    const target = event.target;
+    if (
+      target instanceof HTMLElement &&
+      (target.tagName === 'TEXTAREA' ||
+        target.tagName === 'INPUT' ||
+        target.isContentEditable)
+    ) {
+      event.stopPropagation();
+    }
+  });
+
   root.addEventListener('click', async (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
